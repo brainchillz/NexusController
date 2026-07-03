@@ -1,0 +1,17 @@
+# Secrets & per-host state — NEVER commit
+controller-auth.json
+nodes.json
+audit.log
+certs/
+token
+github-token
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Editor / OS
+*.swp
+.DS_Store

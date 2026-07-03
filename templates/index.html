@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nexus Controller</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <!-- Login -->
+  <div id="login" class="login-wrap" style="display:none">
+    <form class="login-card" onsubmit="doLogin(event)">
+      <h1>Nexus <span>Controller</span></h1>
+      <p class="sub">Fleet console</p>
+      <input id="lg-user" placeholder="Username" autocomplete="username" autofocus>
+      <input id="lg-pass" type="password" placeholder="Password" autocomplete="current-password">
+      <button type="submit">Sign in</button>
+      <div id="lg-err" class="err"></div>
+    </form>
+  </div>
+
+  <!-- App -->
+  <div id="app" style="display:none">
+    <header>
+      <div class="brand">Nexus <span>Controller</span></div>
+      <nav class="tabs">
+        <button class="tab" data-tab="overview" onclick="setTab('overview')">Overview</button>
+        <button class="tab" data-tab="alerts" onclick="setTab('alerts')">Alerts</button>
+        <button class="tab" data-tab="storage" onclick="setTab('storage')">Storage</button>
+        <button class="tab" data-tab="services" onclick="setTab('services')">Services</button>
+      </nav>
+      <div class="spacer"></div>
+      <span id="updated" class="muted small"></span>
+      <span id="whoami" class="muted"></span>
+      <button class="ghost" onclick="openAdd()" id="addBtn">+ Add Node</button>
+      <button class="ghost" onclick="openCert()" id="certBtn" title="TLS certificate">🔒 Cert</button>
+      <button class="ghost" onclick="refresh()">Refresh</button>
+      <button class="ghost" onclick="doLogout()">Sign out</button>
+    </header>
+
+    <main>
+      <div id="rollup" class="rollup"></div>
+      <div id="view"></div>
+    </main>
+  </div>
+
+  <!-- Add-host dialog -->
+  <div id="addModal" class="modal" style="display:none">
+    <div class="modal-card">
+      <h2>Add Host</h2>
+      <label>Host type
+        <select id="nd-htype" onchange="updateAddFields()">
+          <option value="nexus">Nexus Dashboard node</option>
+          <option value="proxmox">Proxmox VE</option>
+          <option value="vcenter">VMware vCenter</option>
+          <option value="esxi">VMware ESXi (standalone)</option>
+          <option value="truenas">TrueNAS (SCALE / CORE)</option>
+        </select>
+      </label>
+      <label>Name <input id="nd-name" placeholder="silo"></label>
+      <label>Base URL <input id="nd-url" placeholder="https://192.168.1.10:8443"></label>
+      <label class="nd-token">API token <input id="nd-token" type="password" placeholder="sd_…"></label>
+      <label class="nd-key">API key <input id="nd-key" type="password" placeholder="1-…"></label>
+      <label class="nd-userpass">Username <input id="nd-user" placeholder="root@pam"></label>
+      <label class="nd-userpass">Password <input id="nd-pass" type="password" placeholder="host account password"></label>
+      <label class="nd-verify check"><input id="nd-verify" type="checkbox"> Verify the host's TLS certificate</label>
+      <label>Tags (comma-separated) <input id="nd-tags" placeholder="prod, storage"></label>
+      <div class="row">
+        <button class="ghost" onclick="testNode()">Test connection</button>
+        <span id="nd-test" class="muted"></span>
+      </div>
+      <div id="nd-err" class="err"></div>
+      <div class="row end">
+        <button class="ghost" onclick="closeAdd()">Cancel</button>
+        <button onclick="saveNode()">Enroll</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Edit-node dialog -->
+  <div id="editModal" class="modal" style="display:none">
+    <div class="modal-card">
+      <div class="row"><h2 style="margin:0;flex:1">Edit Node</h2><button class="x" onclick="closeEdit()">×</button></div>
+      <label>Name <input id="ed-name"></label>
+      <label>Base URL <input id="ed-url" placeholder="https://host:8443"></label>
+      <label>Tags (comma-separated) <input id="ed-tags"></label>
+      <label>Type
+        <select id="ed-type">
+          <option value="auto">Auto (follow detection)</option>
+          <option value="Storage">Storage</option>
+          <option value="AI">AI</option>
+          <option value="Mixed">Mixed</option>
+          <option value="Virtualization">Virtualization</option>
+          <option value="Unknown">Unknown</option>
+        </select>
+      </label>
+      <label class="ed-token">New API token <input id="ed-token" type="password" placeholder="leave blank to keep current token"></label>
+      <label class="ed-key">New API key <input id="ed-key" type="password" placeholder="leave blank to keep current key"></label>
+      <label class="ed-userpass">Username <input id="ed-user" placeholder="root@pam"></label>
+      <label class="ed-userpass">New password <input id="ed-pass" type="password" placeholder="leave blank to keep current password"></label>
+      <label class="ed-verify check"><input id="ed-verify" type="checkbox"> Verify the host's TLS certificate</label>
+      <div class="row">
+        <button class="ghost" onclick="testEdit()">Test connection</button>
+        <span id="ed-test" class="muted small"></span>
+      </div>
+      <div id="ed-err" class="err"></div>
+      <div class="row end">
+        <button class="ghost" onclick="closeEdit()">Cancel</button>
+        <button onclick="saveEdit()">Save changes</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Service action / logs dialog -->
+  <div id="svcModal" class="modal" style="display:none">
+    <div class="modal-card wide">
+      <div class="row"><h2 id="sv-title" style="margin:0;flex:1"></h2>
+        <button class="x" onclick="closeSvc()">×</button></div>
+      <div id="sv-state" class="muted small"></div>
+      <div id="sv-actions" class="row" style="flex-wrap:wrap;margin-top:10px"></div>
+      <div id="sv-msg" class="muted small"></div>
+      <div class="row" style="margin-top:8px"><button class="ghost" onclick="loadLogs()">View logs</button>
+        <span class="muted small">last 100 journal lines</span></div>
+      <pre id="sv-logs" class="logs" style="display:none"></pre>
+    </div>
+  </div>
+
+  <!-- TLS certificate dialog -->
+  <div id="certModal" class="modal" style="display:none">
+    <div class="modal-card wide">
+      <div class="row"><h2 style="margin:0;flex:1">TLS Certificate</h2>
+        <button class="x" onclick="closeCert()">×</button></div>
+      <div id="cert-current" class="muted small" style="margin:6px 0 12px"></div>
+      <p class="muted small">Replace the certificate with your own PEM (e.g. from Let's Encrypt).
+        The key must match the certificate. <b>Restart the controller to apply.</b></p>
+      <label>Certificate (PEM)<textarea id="cert-pem" rows="6" placeholder="-----BEGIN CERTIFICATE-----"></textarea></label>
+      <label>Private key (PEM)<textarea id="cert-key" rows="6" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></label>
+      <div id="cert-msg" class="small" style="min-height:18px"></div>
+      <div class="row end">
+        <button class="ghost" onclick="regenCert()">Regenerate self-signed</button>
+        <button onclick="uploadCert()">Install certificate</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+const API = {
+  async req(method, path, body) {
+    const opt = {method, headers: {}};
+    if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+    const r = await fetch('/api/' + path, opt);
+    if (r.status === 401 && path !== 'login') { showLogin(); throw new Error('unauth'); }
+    let data = {}; try { data = await r.json(); } catch (e) {}
+    if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+    return data;
+  },
+  get(p){return this.req('GET',p);},
+  post(p,b){return this.req('POST',p,b||{});},
+  put(p,b){return this.req('PUT',p,b||{});},
+  del(p){return this.req('DELETE',p);},
+};
+
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function show(id,on){document.getElementById(id).style.display = on ? '' : 'none';}
+function showLogin(){show('app',false);show('login',true);stopPoll();}
+function showApp(){show('login',false);show('app',true);}
+function hbytes(n){ n=Number(n)||0; const u=['B','K','M','G','T','P']; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;} return (i?n.toFixed(1):n)+u[i]; }
+
+let me = null, fleet = null, tab = 'overview', poller = null;
+
+async function boot(){
+  try { me = await API.get('me'); }
+  catch(e){ showLogin(); return; }
+  showApp();
+  document.getElementById('whoami').textContent = me.user + ' · ' + me.role;
+  const adminUI = me.role === 'admin' ? '' : 'none';
+  document.getElementById('addBtn').style.display = adminUI;
+  document.getElementById('certBtn').style.display = adminUI;
+  setTab(tab);
+  await refresh();
+  startPoll();
+}
+
+async function doLogin(e){
+  e.preventDefault();
+  const u = document.getElementById('lg-user').value, p = document.getElementById('lg-pass').value;
+  try { await API.post('login', {username:u, password:p}); document.getElementById('lg-err').textContent=''; boot(); }
+  catch(err){ document.getElementById('lg-err').textContent = err.message; }
+}
+async function doLogout(){ try{await API.post('logout');}catch(e){} showLogin(); }
+
+// ── Polling (pause when tab hidden) ──
+function startPoll(){ stopPoll(); poller = setInterval(()=>{ if(!document.hidden) loadFleet(false); }, 15000); }
+function stopPoll(){ if(poller){ clearInterval(poller); poller=null; } }
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden && me) loadFleet(false); });
+
+function refresh(){ return loadFleet(true); }   // manual → bypass cache
+async function loadFleet(fresh){
+  let data;
+  try { data = await API.get('fleet/summary' + (fresh ? '?fresh=1' : '')); }
+  catch(e){ if(e.message!=='unauth') document.getElementById('view').innerHTML='<div class="err">'+esc(e.message)+'</div>'; return; }
+  fleet = data;
+  const u = document.getElementById('updated');
+  u.textContent = 'updated ' + new Date().toLocaleTimeString() + (data.cached ? ' (cached '+data.cache_age+'s)' : '');
+  renderRollup(); render();
+}
+
+function renderRollup(){
+  const r = fleet.rollup;
+  let html = pill('Nodes', r.total) + pill('Healthy', r.healthy, 'ok')
+    + pill('Unreachable', r.unreachable, r.unreachable?'bad':'')
+    + pill('Degraded', r.degraded||0, r.degraded?'warn':'')
+    + pill('Alerts', r.alerts, r.alerts?'warn':'');
+  if (r.vms) html += pill('VMs', r.vms + (r.containers ? ' ('+r.containers+' CT)' : ''));
+  if (r.storage_size) html += pill('Storage', hbytes(r.storage_used)+' / '+hbytes(r.storage_size));
+  document.getElementById('rollup').innerHTML = html;
+}
+function pill(label,val,cls){return '<div class="pill '+(cls||'')+'"><b>'+esc(val)+'</b> '+esc(label)+'</div>';}
+
+// ── Tabs ──
+function setTab(t){
+  tab = t;
+  document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active', b.dataset.tab===t));
+  render();
+}
+function render(){
+  if(!fleet){ document.getElementById('view').innerHTML='<div class="muted">Loading fleet…</div>'; return; }
+  const v = document.getElementById('view');
+  if(!fleet.nodes.length){ v.innerHTML='<div class="muted">No nodes enrolled yet.</div>'; return; }
+  if(tab==='overview') v.innerHTML = overviewView();
+  else if(tab==='alerts') v.innerHTML = alertsView();
+  else if(tab==='storage') v.innerHTML = storageView();
+  else if(tab==='services') v.innerHTML = servicesView();
+}
+
+function caps(n){ return n.capabilities || []; }
+function has(n,c){ return caps(n).indexOf(c) >= 0; }
+
+// ── Overview: hosts grouped by category into compact horizontal rows ──
+const CAT_ORDER = ['Storage','Virtualization','AI','General'];
+function category(n){
+  if(n.type==='Storage') return 'Storage';
+  if(n.type==='Virtualization') return 'Virtualization';
+  if(n.type==='AI') return 'AI';
+  return 'General';   // Mixed, Unknown, or anything unclassified
+}
+function overviewView(){
+  const groups={};
+  fleet.nodes.forEach(n=>{ const c=category(n); (groups[c]=groups[c]||[]).push(n); });
+  let html='';
+  CAT_ORDER.forEach(c=>{
+    const list=groups[c]; if(!list||!list.length) return;
+    html += '<div class="hgroup"><div class="hgroup-h">'+c+' <span class="muted">('+list.length+')</span></div>'
+          + list.map(nodeRow).join('') + '</div>';
+  });
+  return html || '<div class="muted">No hosts enrolled yet.</div>';
+}
+function urlHost(u){ try{ return new URL(u).hostname; }catch(e){ return (u||'').replace(/^[a-z]+:\/\//,'').split(/[:\/]/)[0]; } }
+function chip(k,v,cls,title){ return '<span class="ck '+(cls||'')+'"'+(title?' title="'+esc(title)+'"':'')+'>'+esc(k)+' <b>'+esc(v)+'</b></span>'; }
+function miniMeter(label,pct){ pct=Math.max(0,Math.min(100,Math.round(pct)));
+  const cls = pct>=90?'bad':pct>=75?'warn':'ok';
+  return '<span class="mm"><span class="mm-l">'+label+'</span>'
+    + '<span class="mm-bar"><i class="'+cls+'" style="width:'+pct+'%"></i></span>'
+    + '<span class="mm-v">'+pct+'%</span></span>';
+}
+// One host as a horizontal row: status · name/ip · CPU/Mem/Store bars · type chips · actions.
+// The IP shown is the enrolled base URL's host (the address the controller actually
+// reaches) — not the host's self-reported system.ip, which can be a container IP.
+function nodeRow(n){
+  const s = n.summary||{}, res = n.resources||{};
+  const alerts = (s.alerts||[]).length + (n.nas ? (n.nas.alerts||0) : 0);
+  const nasBad = !!(n.nas && n.nas.pools_degraded);
+  const virt = !!(n.host_type && n.host_type!=='nexus');
+  const awaiting = virt && !n.ok && /await/i.test(n.error||'');
+  const dot = n.ok ? ((alerts||n.stale||nasBad)?'warn':'ok') : (awaiting?'warn':'bad');
+  const rm = me && me.role==='admin';
+  const host = esc(urlHost(n.base_url)) + (n.version? ' · v'+esc(n.version) : '');
+
+  let mid;
+  if(!n.ok){
+    mid = '<div class="hr-status '+(awaiting?'muted':'err')+'">'
+        + (awaiting?'Awaiting first poll…':'Unreachable: '+esc(n.error||''))+'</div>';
+  } else {
+    let mm = [];
+    if(n.size_bytes>0) mm.push(miniMeter('Store', n.used_bytes/n.size_bytes*100));
+    if(res.cpu_pct!=null) mm.push(miniMeter('CPU', res.cpu_pct));
+    if(res.memory && res.memory.pct!=null) mm.push(miniMeter('Mem', res.memory.pct));
+    let chips = [];
+    if(n.virt){
+      const v=n.virt;
+      chips.push(chip('VMs', (v.vms_running||0)+'/'+(v.vms||0)));
+      if(v.containers) chips.push(chip('CT', (v.containers_running||0)+'/'+(v.containers||0)));
+      chips.push(chip('Hosts', v.hosts||0));
+    } else if(n.nas){
+      const x=n.nas, degr=x.pools_degraded>0;
+      chips.push(chip('Pools', (x.pools||0)+(degr?' ⚠':' ✓'), degr?'bad':'',
+                      degr? x.pools_degraded+' pool(s) degraded' : 'all pools healthy'));
+      if(x.disks) chips.push(chip('Disks', x.disks));
+    } else {
+      const zfs=s.zfs||{}, disks=s.disks||{};
+      if(zfs.pools) chips.push(chip('ZFS', zfs.pools+' pool'+(zfs.pools>1?'s':'')+(zfs.online===false?' ⚠':''), zfs.online===false?'bad':''));
+      if(has(n,'disks') && disks.total!=null) chips.push(chip('Disks', disks.free+'/'+disks.total, disks.smart_ok===false?'bad':''));
+      if(has(n,'smb') && s.smb) chips.push(chip('SMB', s.smb.shares));
+      if(has(n,'nfs') && s.nfs) chips.push(chip('NFS', s.nfs.exports));
+      if(has(n,'iscsi') && s.iscsi) chips.push(chip('iSCSI', s.iscsi.targets));
+      if(n.llama){ const h=n.llama.health||{}, up=!!h.ok, mt=h.metrics||{}, model=(n.llama.model||'').split('/').pop()||'(none)';
+        chips.push(chip('llama', up?'up':'down', up?'':'bad'));
+        chips.push(chip('model', model.length>18?model.slice(0,17)+'…':model, '', model));
+        if(mt.predicted_tokens_seconds!=null) chips.push(chip('tok/s', Math.round(mt.predicted_tokens_seconds*10)/10));
+      }
+    }
+    if(alerts) chips.push(chip('alerts', alerts, 'bad'));
+    if(n.stale) chips.push(chip('stale', 'poll failed', 'bad'));
+    // Mini-meters + chips share one wrapping strip so extra tiles pack onto the
+    // same line (and drop to a 2nd line only when full) — keeps the row thin.
+    mid = '<div class="hr-body">'+mm.join('')+chips.join('')+'</div>';
+  }
+
+  const openUrl = virt ? esc(n.base_url)+'/' : '/nodes/'+esc(n.id)+'/';
+  const openLbl = n.nas ? 'Open UI ▸' : (virt ? 'Open console ▸' : 'Open dashboard ▸');
+  const actions = (n.ok? '<a class="btn-open" href="'+openUrl+'" target="_blank" rel="noopener">'+openLbl+'</a>':'')
+    + (rm ? '<button class="x edit" title="Edit" onclick="openEdit(\''+esc(n.id)+'\')">✎</button>'
+          + '<button class="x" title="Remove" onclick="removeNode(\''+esc(n.id)+'\',\''+esc(n.name)+'\')">×</button>' : '');
+
+  return '<div class="hrow">'
+    + '<span class="dot '+dot+'"></span>'
+    + '<div class="hr-name"><b title="'+esc(n.name)+'">'+esc(n.name)+'</b><span class="muted small">'+host+'</span></div>'
+    + mid
+    + '<div class="hr-actions">'+actions+'</div></div>';
+}
+function svcState(sv){
+  if(sv.active==='active') return 'ok';
+  if(sv.enabled==='enabled') return 'bad';   // should run, isn't
+  return 'off';                               // intentionally off
+}
+
+async function removeNode(id,name){
+  if(!confirm('Remove node "'+name+'" from the controller? (the node itself is untouched)')) return;
+  try{ await API.del('nodes/'+id); refresh(); }catch(e){ alert(e.message); }
+}
+
+// ── Alerts view ──
+function alertsView(){
+  let rows = [];
+  fleet.nodes.forEach(n=>{
+    if(!n.ok){ rows.push(tr([esc(n.name), '<span class="bad">unreachable</span>', esc(n.error||'')])); return; }
+    (((n.summary||{}).alerts)||[]).forEach(a=> rows.push(tr([esc(n.name), '<span class="warn">alert</span>', esc(a)])));
+    ((n.nas&&n.nas.alert_list)||[]).forEach(a=> rows.push(tr([esc(n.name), '<span class="warn">alert</span>', esc(a)])));
+  });
+  if(!rows.length) return '<div class="ok-txt big">✓ No alerts across the fleet.</div>';
+  return '<table class="tbl"><thead>'+tr(['Node','','Message'],'th')+'</thead><tbody>'+rows.join('')+'</tbody></table>';
+}
+function tr(cells,th){ const t=th?'th':'td'; return '<tr>'+cells.map(c=>'<'+t+'>'+c+'</'+t+'>').join('')+'</tr>'; }
+
+// ── Storage view ──
+function storageView(){
+  const r = fleet.rollup;
+  // Every host that reports capacity: nexus ZFS pools + proxmox/vmware datastores
+  // (both populate used_bytes/size_bytes on the envelope).
+  let rows = fleet.nodes.filter(n=>n.ok && n.size_bytes>0).map(n=>{
+    const used=n.used_bytes||0, size=n.size_bytes||0, pct = size?Math.round(used/size*100):0;
+    const z = (n.summary||{}).zfs||{};
+    const label = n.nas ? ('ZFS '+n.nas.pools+' pool'+(n.nas.pools>1?'s':''))
+                : n.virt ? (n.virt.hosts+' host'+(n.virt.hosts>1?'s':''))
+                : (z.pools ? 'ZFS '+z.pools+' pool'+(z.pools>1?'s':'') : '');
+    const degr = ((n.nas && n.nas.pools_degraded) || z.online===false) ? ' · DEGRADED' : '';
+    return '<div class="srow"><div class="srow-h"><b>'+esc(n.name)+'</b><span class="muted">'
+      + esc(hbytes(used)+' / '+hbytes(size))+' · '+pct+'%'+degr+(label?' · '+esc(label):'')+'</span></div>'
+      + '<div class="bar lg"><i class="'+(pct>=90?'bad':pct>=75?'warn':'ok')+'" style="width:'+pct+'%"></i></div></div>';
+  });
+  if(!rows.length) return '<div class="muted">No storage reported by any host.</div>';
+  const tpct = r.storage_size ? Math.round(r.storage_used/r.storage_size*100) : 0;
+  const total = '<div class="srow total"><div class="srow-h"><b>Fleet total</b><span class="muted">'
+    + hbytes(r.storage_used)+' / '+hbytes(r.storage_size)+' · '+tpct+'%</span></div>'
+    + '<div class="bar lg"><i class="'+(tpct>=90?'bad':tpct>=75?'warn':'ok')+'" style="width:'+tpct+'%"></i></div></div>';
+  return total + '<div class="sgap"></div>' + rows.join('');
+}
+
+// ── Services matrix (clickable) + fleet-wide bulk bar ──
+function nodeById(id){ return (fleet&&fleet.nodes||[]).find(n=>n.id===id); }
+function canWrite(n){ return me && me.role!=='viewer' && n && n.token_role==='admin'; }
+const ACTIONS = ['start','stop','restart','enable','disable'];
+
+function servicesView(){
+  const reach = fleet.nodes.filter(n=>n.ok);
+  if(!reach.length) return '<div class="muted">No reachable nodes.</div>';
+  const cols = {};
+  reach.forEach(n=> Object.entries((n.summary||{}).services||{}).forEach(([k,sv])=> cols[k]=sv.name||k));
+  const keys = Object.keys(cols).sort();
+  if(!keys.length) return '<div class="muted">No services reported.</div>';
+
+  // Bulk bar (operators+ only)
+  let bulk = '';
+  if (me.role !== 'viewer') {
+    bulk = '<div class="bulk"><span class="muted">Fleet action:</span>'
+      + '<select id="bk-svc">'+keys.map(k=>'<option value="'+esc(k)+'">'+esc(cols[k])+'</option>').join('')+'</select>'
+      + '<select id="bk-act">'+ACTIONS.map(a=>'<option'+(a==='restart'?' selected':'')+'>'+a+'</option>').join('')+'</select>'
+      + '<button onclick="bulkAction()">Apply to all nodes with this service</button>'
+      + '<span id="bk-msg" class="muted small"></span></div>';
+  }
+
+  let head = tr(['Node'].concat(keys.map(k=>esc(cols[k]))), 'th');
+  let rows = reach.map(n=>{
+    const svcs = (n.summary||{}).services||{};
+    const cells = ['<b>'+esc(n.name)+'</b>'].concat(keys.map(k=>{
+      const sv = svcs[k];
+      if(!sv) return '<span class="muted">—</span>';
+      return '<span class="sd click '+svcState(sv)+'" title="'+esc(sv.active)+' / '+esc(sv.enabled)
+        +' — click to manage" onclick="openSvc(\''+esc(n.id)+'\',\''+esc(k)+'\')"></span>';
+    }));
+    return tr(cells);
+  });
+  const legend = '<div class="legend"><span class="sd ok"></span> active '
+    + '<span class="sd bad"></span> down (enabled) <span class="sd off"></span> off <span class="muted">— n/a</span>'
+    + ' · <span class="muted">click a status to manage / view logs</span></div>';
+  return bulk + '<table class="tbl matrix"><thead>'+head+'</thead><tbody>'+rows.join('')+'</tbody></table>'+legend;
+}
+
+// ── Service action / logs modal ──
+let svc = null;  // {nodeId, key}
+function openSvc(nodeId, key){ svc = {nodeId, key}; renderSvc(); show('svcModal', true); }
+function closeSvc(){ show('svcModal', false); svc = null; }
+function renderSvc(){
+  const n = nodeById(svc.nodeId); if(!n){ closeSvc(); return; }
+  const sv = ((n.summary||{}).services||{})[svc.key] || {};
+  document.getElementById('sv-title').textContent = (sv.name||svc.key)+' · '+n.name;
+  document.getElementById('sv-state').innerHTML = 'active: <b class="'+(sv.active==='active'?'ok-txt':'bad')+'">'
+    + esc(sv.active||'?')+'</b> · enabled: <b>'+esc(sv.enabled||'?')+'</b>';
+  const wr = canWrite(n);
+  document.getElementById('sv-actions').innerHTML = wr
+    ? ACTIONS.map(a=>'<button class="'+(a==='stop'||a==='disable'?'ghost':'')+'" onclick="svcAction(\''+a+'\')">'+a+'</button>').join('')
+    : '<span class="muted small">Read-only: enroll this node with an admin token (and be operator/admin) to control services.</span>';
+  document.getElementById('sv-msg').textContent = '';
+  const pre = document.getElementById('sv-logs'); pre.style.display='none'; pre.textContent='';
+}
+async function svcAction(action){
+  const n = nodeById(svc.nodeId);
+  if(['stop','restart','disable'].includes(action) && !confirm(action+' '+svc.key+' on '+n.name+'?')) return;
+  const msg = document.getElementById('sv-msg'); msg.textContent = action+'…';
+  try{
+    await API.post('nodes/'+svc.nodeId+'/proxy/service/'+encodeURIComponent(svc.key)+'/'+action);
+    msg.innerHTML = '<span class="ok-txt">'+action+' ok</span>';
+    await refresh(); renderSvc(); msg.innerHTML = '<span class="ok-txt">'+action+' ok</span>';
+  }catch(e){ msg.innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
+}
+async function loadLogs(){
+  const pre = document.getElementById('sv-logs'); pre.style.display=''; pre.textContent='Loading…';
+  try{ const d = await API.get('nodes/'+svc.nodeId+'/proxy/logs/'+encodeURIComponent(svc.key));
+    pre.textContent = d.logs || '(no logs)';
+  }catch(e){ pre.textContent = 'Error: '+e.message; }
+}
+
+async function bulkAction(){
+  const service = document.getElementById('bk-svc').value;
+  const action = document.getElementById('bk-act').value;
+  const msg = document.getElementById('bk-msg');
+  if(!confirm(action+' "'+service+'" on every node that has it?')) return;
+  msg.textContent = 'Running…';
+  try{
+    const r = await API.post('fleet/action', {service, action});
+    const fails = r.results.filter(x=>!x.ok).map(x=>x.name+': '+(x.error||'?'));
+    const summary = '<span class="'+(r.failed?'warn':'ok-txt')+'">'+r.ok+' ok, '+r.failed+' failed</span>'
+      + (fails.length? ' — '+esc(fails.join('; ')) : '');
+    await refresh();   // re-renders the view (recreates #bk-msg) — set it after
+    const m2 = document.getElementById('bk-msg'); if(m2) m2.innerHTML = summary;
+  }catch(e){ const m2=document.getElementById('bk-msg'); if(m2) m2.innerHTML='<span class="bad">'+esc(e.message)+'</span>'; }
+}
+
+// ── Add-host dialog ──
+// Credential model per host type: 'token' (nexus API token), 'key' (truenas API
+// key + verify-TLS), or 'userpass' (proxmox/vmware). Toggles which fields show.
+const AUTH = {nexus:'token', truenas:'key', proxmox:'userpass', vcenter:'userpass', esxi:'userpass'};
+const URL_PH = {nexus:'https://192.168.1.10:8443', proxmox:'https://proxmox.local:8006',
+  vcenter:'https://vcenter.local', esxi:'https://esxi-host.local', truenas:'https://truenas.local'};
+const VIRT_USER_PH = {proxmox:'root@pam', vcenter:'administrator@vsphere.local', esxi:'root'};
+function authKind(ht){ return AUTH[ht] || 'token'; }
+function updateAddFields(){
+  const ht = document.getElementById('nd-htype').value, a = authKind(ht);
+  const set = (sel,on)=>document.querySelectorAll('#addModal '+sel).forEach(e=>e.style.display = on ? '' : 'none');
+  set('.nd-token', a==='token'); set('.nd-key', a==='key'); set('.nd-userpass', a==='userpass');
+  set('.nd-verify', a!=='token');   // verify-TLS for key + userpass, not nexus
+  document.getElementById('nd-url').placeholder = URL_PH[ht] || 'https://host';
+  if(a==='userpass') document.getElementById('nd-user').placeholder = VIRT_USER_PH[ht] || 'username';
+}
+function openAdd(){ ['nd-name','nd-url','nd-token','nd-key','nd-user','nd-pass','nd-tags'].forEach(i=>document.getElementById(i).value='');
+  document.getElementById('nd-verify').checked=false; document.getElementById('nd-htype').value='nexus'; updateAddFields();
+  document.getElementById('nd-test').textContent=''; document.getElementById('nd-err').textContent=''; show('addModal',true); }
+function closeAdd(){ show('addModal',false); }
+function nodeForm(){
+  const ht = document.getElementById('nd-htype').value, a = authKind(ht);
+  const f = {
+    host_type: ht,
+    name: document.getElementById('nd-name').value.trim(),
+    base_url: document.getElementById('nd-url').value.trim(),
+    tags: document.getElementById('nd-tags').value.split(',').map(t=>t.trim()).filter(Boolean),
+  };
+  if(a==='token'){ f.token = document.getElementById('nd-token').value.trim(); }
+  else if(a==='key'){ f.token = document.getElementById('nd-key').value.trim();
+         f.verify_ssl = document.getElementById('nd-verify').checked; }
+  else { f.username = document.getElementById('nd-user').value.trim();
+         f.password = document.getElementById('nd-pass').value;
+         f.verify_ssl = document.getElementById('nd-verify').checked; }
+  return f;
+}
+function probeSummary(r){
+  const m = r.metrics;
+  if(m && m.pool_count!=null){ return '<span class="ok-txt">OK</span> · '+esc(m.pool_count)+' pool'+(m.pool_count===1?'':'s')
+      +(m.pools_degraded?' · <span class="bad">'+esc(m.pools_degraded)+' degraded</span>':'')+' · '+esc(m.disk_count||0)+' disks'; }
+  if(m){ return '<span class="ok-txt">OK</span> · '+esc(m.host_count||0)+' host(s) · '
+      +esc(m.vm_running_count||0)+'/'+esc(m.vm_count||0)+' VMs running'; }
+  return '<span class="ok-txt">OK</span> · role '+esc(r.role||'?')+' · v'+esc(r.version||'?')
+      + ' · caps: '+esc((r.capabilities||[]).length);
+}
+async function testNode(){
+  const f = nodeForm(); const el = document.getElementById('nd-test');
+  el.textContent = 'Testing…'; document.getElementById('nd-err').textContent='';
+  try{ const r = await API.post('nodes/test', f); el.innerHTML = probeSummary(r);
+  }catch(e){ el.textContent=''; document.getElementById('nd-err').textContent = e.message; }
+}
+async function saveNode(){
+  try{ await API.post('nodes', nodeForm()); closeAdd(); refresh(); }
+  catch(e){ document.getElementById('nd-err').textContent = e.message; }
+}
+
+// ── Edit host (name / base URL / tags / type / credentials) ──
+let editId = null, editType = 'nexus';
+function openEdit(id){
+  const n = nodeById(id); if(!n) return;
+  editId = id; editType = n.host_type || 'nexus';
+  const a = authKind(editType);
+  const set = (sel,on)=>document.querySelectorAll('#editModal '+sel).forEach(e=>e.style.display = on ? '' : 'none');
+  set('.ed-token', a==='token'); set('.ed-key', a==='key'); set('.ed-userpass', a==='userpass');
+  set('.ed-verify', a!=='token');
+  document.getElementById('ed-name').value = n.name || '';
+  document.getElementById('ed-url').value = n.base_url || '';
+  document.getElementById('ed-tags').value = (n.tags || []).join(', ');
+  document.getElementById('ed-type').value = n.type_pinned ? (n.type || 'auto') : 'auto';
+  document.getElementById('ed-token').value = '';
+  document.getElementById('ed-key').value = '';
+  document.getElementById('ed-user').value = n.username || '';
+  document.getElementById('ed-pass').value = '';
+  document.getElementById('ed-verify').checked = !!n.verify_ssl;
+  document.getElementById('ed-test').textContent = ''; document.getElementById('ed-err').textContent = '';
+  show('editModal', true);
+}
+function closeEdit(){ show('editModal', false); editId = null; }
+function editForm(){
+  const f = {
+    name: document.getElementById('ed-name').value.trim(),
+    base_url: document.getElementById('ed-url').value.trim(),
+    tags: document.getElementById('ed-tags').value.split(',').map(t=>t.trim()).filter(Boolean),
+    type: document.getElementById('ed-type').value,
+  };
+  const a = authKind(editType);
+  if(a==='token'){ f.token = document.getElementById('ed-token').value.trim(); }
+  else if(a==='key'){ f.token = document.getElementById('ed-key').value.trim();
+         f.verify_ssl = document.getElementById('ed-verify').checked; }
+  else { f.username = document.getElementById('ed-user').value.trim();
+         f.password = document.getElementById('ed-pass').value;
+         f.verify_ssl = document.getElementById('ed-verify').checked; }
+  return f;
+}
+async function testEdit(){
+  const f = editForm(); const el = document.getElementById('ed-test'); const a = authKind(editType);
+  const body = {host_type: editType, base_url: f.base_url};
+  if(a==='token'){
+    if(!f.token){ el.innerHTML = '<span class="muted">Enter a token to test, or just Save to re-validate the current one.</span>'; return; }
+    body.token = f.token;
+  } else if(a==='key'){
+    if(!f.token){ el.innerHTML = '<span class="muted">Enter an API key to test, or just Save to re-validate the current one.</span>'; return; }
+    body.token = f.token; body.verify_ssl = f.verify_ssl;
+  } else {
+    if(!f.password){ el.innerHTML = '<span class="muted">Enter a password to test, or just Save to re-validate the current one.</span>'; return; }
+    body.username = f.username; body.password = f.password; body.verify_ssl = f.verify_ssl;
+  }
+  el.textContent = 'Testing…'; document.getElementById('ed-err').textContent = '';
+  try{ const r = await API.post('nodes/test', body); el.innerHTML = probeSummary(r);
+  }catch(e){ el.textContent = ''; document.getElementById('ed-err').textContent = e.message; }
+}
+async function saveEdit(){
+  const f = editForm(); const n = nodeById(editId); const a = authKind(editType);
+  const body = {name: f.name, tags: f.tags, type: f.type};
+  if(n && f.base_url && f.base_url !== n.base_url) body.base_url = f.base_url;  // re-probes server-side
+  if(a==='token'){ if(f.token) body.token = f.token; }
+  else if(a==='key'){ if(f.token) body.token = f.token;
+    if(n && f.verify_ssl !== !!n.verify_ssl) body.verify_ssl = f.verify_ssl; }
+  else {
+    if(f.username && f.username !== (n&&n.username)) body.username = f.username;
+    if(f.password) body.password = f.password;
+    if(n && f.verify_ssl !== !!n.verify_ssl) body.verify_ssl = f.verify_ssl;
+  }
+  try{ await API.put('nodes/'+editId, body); closeEdit(); refresh(); }
+  catch(e){ document.getElementById('ed-err').textContent = e.message; }
+}
+
+// ── TLS certificate ──
+async function openCert(){
+  document.getElementById('cert-pem').value=''; document.getElementById('cert-key').value='';
+  document.getElementById('cert-msg').textContent=''; await loadCertInfo(); show('certModal', true);
+}
+function closeCert(){ show('certModal', false); }
+async function loadCertInfo(){
+  const el = document.getElementById('cert-current');
+  try{
+    const c = await API.get('tls/info');
+    if(!c.present){ el.textContent = 'No certificate present.'; return; }
+    if(c.error){ el.innerHTML = '<span class="bad">'+esc(c.error)+'</span>'; return; }
+    el.innerHTML = 'Subject: <b>'+esc(c.subject||'?')+'</b><br>'
+      + 'Issuer: '+esc(c.issuer||'?')+'<br>'
+      + 'Expires: '+esc(c.expires||'?')+' · '
+      + (c.self_signed ? '<span class="warn">self-signed</span>' : '<span class="ok-txt">CA-signed</span>')
+      + '<br>SHA-256: <span class="mono">'+esc(c.fingerprint_sha256||'')+'</span>';
+  }catch(e){ el.innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
+}
+async function regenCert(){
+  if(!confirm('Generate a new self-signed certificate? You must restart the controller to apply.')) return;
+  const m = document.getElementById('cert-msg');
+  try{ await API.post('tls/regenerate'); m.innerHTML='<span class="ok-txt">New self-signed cert generated — restart the controller to apply.</span>'; await loadCertInfo(); }
+  catch(e){ m.innerHTML='<span class="bad">'+esc(e.message)+'</span>'; }
+}
+async function uploadCert(){
+  const cert = document.getElementById('cert-pem').value.trim();
+  const key = document.getElementById('cert-key').value.trim();
+  const m = document.getElementById('cert-msg');
+  if(!cert || !key){ m.innerHTML='<span class="bad">Paste both the certificate and the key PEM.</span>'; return; }
+  try{ await API.post('tls/cert', {cert, key}); m.innerHTML='<span class="ok-txt">Certificate installed — restart the controller to apply.</span>'; await loadCertInfo(); }
+  catch(e){ m.innerHTML='<span class="bad">'+esc(e.message)+'</span>'; }
+}
+
+boot();
+</script>
+</body>
+</html>

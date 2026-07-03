@@ -1,0 +1,29 @@
+# Nexus Controller — Docker Compose deployment.
+#
+#   docker compose up -d --build
+#
+# State (encrypted registry, credentials, audit log, TLS cert) persists in the
+# ./data bind mount, owned by the container's uid 10001.
+#
+# Config via a .env file next to this compose file, e.g.:
+#   CONTROLLER_BIND_IP=192.168.1.10     # host IP to expose HTTPS on (default 0.0.0.0)
+#   CONTROLLER_PORT=9443
+#   CONTROLLER_TLS=1                       # 0 = HTTP behind a reverse proxy
+#   CONTROLLER_ADMIN_PASSWORD=...          # first-run only (ignored once auth exists)
+
+services:
+  controller:
+    build: .
+    image: nexus-controller:latest
+    container_name: nexus-controller
+    restart: unless-stopped
+    # Publish HTTPS only on the chosen host interface (default all).
+    ports:
+      - "${CONTROLLER_BIND_IP:-0.0.0.0}:${CONTROLLER_PORT:-9443}:9443"
+    environment:
+      CONTROLLER_DATA_DIR: /data
+      CONTROLLER_PORT: "9443"
+      CONTROLLER_TLS: "${CONTROLLER_TLS:-1}"
+      CONTROLLER_ADMIN_PASSWORD: "${CONTROLLER_ADMIN_PASSWORD:-}"
+    volumes:
+      - ./data:/data

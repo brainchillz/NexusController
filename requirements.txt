@@ -1,0 +1,10 @@
+Flask>=2.0
+requests>=2.25
+cryptography>=3.4
+# Virtualization host adapters (only imported when a proxmox/vmware host is
+# enrolled; the core controller has no hard dependency on these).
+proxmoxer>=2.0
+pyVmomi>=8.0
+# TrueNAS adapter: JSON-RPC 2.0 over WebSocket (only imported when a TrueNAS host
+# is enrolled). Replaces the REST v2.0 API TrueNAS removes in 26.04.
+websocket-client>=1.7

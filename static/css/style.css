@@ -1,0 +1,136 @@
+:root{
+  --bg:#0e1116; --panel:#171c24; --panel2:#1d242e; --line:#2a323d;
+  --text:#e6edf3; --muted:#8b97a7; --accent:#3b82f6;
+  --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444;
+}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text)}
+button{font:inherit;cursor:pointer;border:0;border-radius:6px;padding:7px 12px;background:var(--accent);color:#fff}
+button.ghost{background:var(--panel2);color:var(--text);border:1px solid var(--line)}
+button.ghost:hover{border-color:var(--accent)}
+input{width:100%;padding:8px 10px;margin:4px 0;border-radius:6px;border:1px solid var(--line);background:#0b0e13;color:var(--text)}
+.muted{color:var(--muted)} .small{font-size:12px} .err{color:var(--bad);min-height:18px;margin-top:6px}
+.ok-txt{color:var(--ok)}
+
+/* Login */
+.login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center}
+.login-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:28px;width:320px}
+.login-card h1{margin:0;font-size:22px} .login-card h1 span{color:var(--accent)}
+.login-card .sub{margin:2px 0 16px;color:var(--muted)}
+.login-card button{width:100%;margin-top:8px}
+
+/* Header */
+header{display:flex;align-items:center;gap:10px;padding:12px 20px;background:var(--panel);border-bottom:1px solid var(--line)}
+.brand{font-weight:700} .brand span{color:var(--accent)} .spacer{flex:1}
+main{padding:20px;max-width:1200px;margin:0 auto}
+
+/* Rollup */
+.rollup{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+.pill{background:var(--panel2);border:1px solid var(--line);border-radius:20px;padding:6px 14px}
+.pill b{font-size:16px;margin-right:4px}
+.pill.ok b{color:var(--ok)} .pill.warn b{color:var(--warn)} .pill.bad b{color:var(--bad)}
+
+/* Fleet grid */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
+.card-h{display:flex;align-items:center;gap:8px;font-weight:600;font-size:16px}
+.card-h .x{margin-left:auto;background:transparent;color:var(--muted);padding:0 6px;font-size:18px;line-height:1}
+.card-h .x:hover{color:var(--bad)}
+.dot{width:10px;height:10px;border-radius:50%;display:inline-block;background:var(--muted)}
+.dot.ok{background:var(--ok)} .dot.warn{background:var(--warn)} .dot.bad{background:var(--bad)}
+.kv{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--line)}
+.kv span{color:var(--muted)}
+
+/* Overview: grouped horizontal rows */
+.hgroup{margin-bottom:16px}
+.hgroup-h{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);font-weight:600;margin:0 0 6px 2px}
+.hrow{display:flex;align-items:center;gap:16px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin-bottom:6px;flex-wrap:wrap}
+.hrow .dot{flex:none}
+.hr-name{display:flex;flex-direction:column;min-width:150px;max-width:230px;line-height:1.25}
+.hr-name b{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hr-body{display:flex;flex-wrap:wrap;align-items:center;gap:7px 14px;flex:1;min-width:140px}
+.hr-status{flex:1;min-width:120px}
+.hr-status.err{color:var(--bad)}
+.hr-actions{display:flex;align-items:center;gap:6px;margin-left:auto;flex:none}
+.mm{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);white-space:nowrap}
+.mm-l{width:36px}
+.mm-bar{width:54px;height:6px;background:#0b0e13;border:1px solid var(--line);border-radius:4px;overflow:hidden}
+.mm-bar i{display:block;height:100%;background:var(--ok)}
+.mm-bar i.warn{background:var(--warn)} .mm-bar i.bad{background:var(--bad)}
+.mm-v{min-width:30px;text-align:right;color:var(--text)}
+
+/* Tabs */
+.tabs{display:flex;gap:4px;margin-left:16px}
+.tab{background:transparent;color:var(--muted);border:1px solid transparent;padding:6px 12px}
+.tab:hover{color:var(--text)}
+.tab.active{background:var(--panel2);color:var(--text);border-color:var(--line)}
+#updated{margin-right:6px}
+
+/* Meters / bars */
+.meters,.meter{margin-top:6px}
+.meter-l{display:flex;justify-content:space-between;font-size:12px;color:var(--muted)}
+.bar{height:8px;background:#0b0e13;border:1px solid var(--line);border-radius:5px;overflow:hidden;margin-top:3px}
+.bar.lg{height:12px}
+.bar i{display:block;height:100%;background:var(--ok)}
+.bar i.warn{background:var(--warn)} .bar i.bad{background:var(--bad)}
+
+/* Chips */
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.ck{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:2px 8px;font-size:12px;color:var(--muted)}
+.ck b{color:var(--text)} .ck.bad{border-color:var(--bad)} .ck.bad b{color:var(--bad)}
+
+/* AI / llama block */
+.ai-block{margin-top:8px;padding:8px 10px;background:var(--panel2);border:1px solid var(--line);border-radius:6px}
+.ai-h{display:flex;align-items:center;gap:6px;margin-bottom:4px}
+.ai-h .sd{width:9px;height:9px;border-radius:50%}
+.ai-block .kv{border-bottom:0;padding:1px 0;font-size:12px}
+
+/* Service dots */
+.svc-dots{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}
+.sd{width:11px;height:11px;border-radius:3px;display:inline-block;background:var(--muted);vertical-align:middle}
+.sd.ok{background:var(--ok)} .sd.bad{background:var(--bad)} .sd.off{background:#3a4350}
+
+/* Tables (alerts / services matrix) */
+.tbl{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.tbl th,.tbl td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--line);font-size:13px}
+.tbl th{color:var(--muted);font-weight:600;background:var(--panel2)}
+.tbl tr:last-child td{border-bottom:0}
+.tbl.matrix td,.tbl.matrix th{text-align:center} .tbl.matrix td:first-child,.tbl.matrix th:first-child{text-align:left}
+.legend{margin-top:10px;color:var(--muted);font-size:12px;display:flex;gap:14px;align-items:center}
+.legend .sd{margin-right:4px}
+.big{font-size:16px;padding:12px 0}
+
+/* Storage rows */
+.srow{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin-bottom:8px}
+.srow.total{border-color:var(--accent)}
+.srow-h{display:flex;justify-content:space-between;margin-bottom:6px}
+.sgap{height:6px}
+.warn{color:var(--warn)} .bad{color:var(--bad)}
+.btn-open{display:inline-block;font-size:12px;text-decoration:none;color:var(--accent);border:1px solid var(--line);border-radius:6px;padding:5px 10px}
+.btn-open:hover{border-color:var(--accent);background:var(--panel2)}
+
+/* Services: bulk bar, clickable dots, logs */
+.bulk{display:flex;align-items:center;gap:8px;flex-wrap:wrap;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:12px}
+.bulk select{background:#0b0e13;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:6px 8px}
+.sd.click{cursor:pointer}
+.sd.click:hover{outline:2px solid var(--accent);outline-offset:1px}
+.modal-card.wide{width:640px}
+.modal-card.wide .x{background:transparent;color:var(--muted);font-size:20px;line-height:1;padding:0 6px}
+#sv-actions button{text-transform:capitalize}
+.logs{margin-top:10px;max-height:340px;overflow:auto;background:#0b0e13;border:1px solid var(--line);border-radius:6px;padding:10px;font:12px/1.45 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;color:#cdd6e0}
+
+/* Modal */
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center}
+.modal-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:22px;width:420px;max-width:92vw}
+.modal-card h2{margin:0 0 12px} .modal-card label{display:block;margin:8px 0;color:var(--muted)}
+.modal-card textarea{width:100%;margin-top:4px;background:#0b0e13;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:8px 10px;font:12px/1.4 ui-monospace,Menlo,Consolas,monospace;resize:vertical}
+.modal-card select{width:100%;margin-top:4px;background:#0b0e13;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:8px 10px}
+.card-h .x.edit{font-size:14px;margin-left:auto}
+.card-h .x.edit + .x{margin-left:4px}
+.card-h .x.edit:hover{color:var(--accent)}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;word-break:break-all}
+.modal-card label input{margin-top:2px}
+.modal-card label.check{display:flex;align-items:center;gap:8px}
+.modal-card label.check input{margin-top:0;width:auto}
+.row{display:flex;align-items:center;gap:10px;margin-top:10px}
+.row.end{justify-content:flex-end}

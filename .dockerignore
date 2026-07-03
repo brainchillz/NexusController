@@ -1,0 +1,16 @@
+# Keep the build context tiny and free of host state/secrets.
+.git
+venv
+__pycache__
+*.pyc
+tests
+data
+controller-auth.json
+nodes.json
+audit.log
+certs
+token
+github-token
+*.md
+install.sh
+uninstall.sh
