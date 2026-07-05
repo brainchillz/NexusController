@@ -12,6 +12,7 @@ top of them, not a replacement.
 > shell-outs** — it only ever speaks HTTPS to nodes. All privileged work stays on
 > the node, behind that node's own auth + RBAC + audit. That keeps the
 > controller's own attack surface tiny.
+<img width="1399" height="1120" alt="Screenshot 2026-07-04 at 9 46 15 PM" src="https://github.com/user-attachments/assets/5e74bcf9-2b9d-48e7-a93a-98396d8583fb" />
 
 ---
 
