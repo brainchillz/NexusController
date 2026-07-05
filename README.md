@@ -1,6 +1,6 @@
 # Nexus Controller
 
-A **central fleet console** for [Nexus Dashboard](https://github.com/brainchillz/NexusStationDashboard)
+A **central fleet console** for [Nexus Dashboard](https://github.com/brainchillz/NexusDashboard-Modular)
 nodes. Enroll your single-host Nexus dashboards as "nodes," then monitor and
 control the whole fleet from one pane of glass — over each node's existing
 token-authed REST API.
@@ -12,14 +12,21 @@ top of them, not a replacement.
 > shell-outs** — it only ever speaks HTTPS to nodes. All privileged work stays on
 > the node, behind that node's own auth + RBAC + audit. That keeps the
 > controller's own attack surface tiny.
-<img width="1399" height="1120" alt="Screenshot 2026-07-04 at 9 46 15 PM" src="https://github.com/user-attachments/assets/5e74bcf9-2b9d-48e7-a93a-98396d8583fb" />
+<img width="1399" height="1120" alt="Screenshot 2026-07-04 at 9 46 15 PM" src="https://github.com/user-attachments/assets/5e74bcf9-2b9d-48e7-a93a-98396d8583fb" />
 
 ---
 
 ## What it does
 
-- **Enroll** nodes with a URL + API token, with a connection test that captures
-  the node's TLS cert fingerprint, role, version, and capabilities.
+- **[Nexus Dashboard](https://github.com/brainchillz/NexusDashboard-Modular)
+  nodes first and foremost** — the single-host dashboard (ZFS/LVM/md storage,
+  SMB/NFS/iSCSI sharing, services, scheduled tasks, replication, LXD
+  VMs/containers, GPU + llama.cpp AI serving) is the controller's native host
+  type and the richest integration: enroll with a URL + API token (a connection
+  test captures the node's TLS cert fingerprint, role, version, and
+  capabilities) and you get storage/share/service chips and alerts in the fleet
+  view, fleet-wide service actions, **drill-in to the node's full SPA through
+  the controller** (websocket consoles included), and LXD instance counts.
 - **Virtualization hosts too** — enroll **Proxmox VE, VMware vCenter, or
   standalone ESXi** hosts (username/password) right alongside Nexus nodes. Their
   row shows host count, running/total **VMs & containers**, CPU/RAM, and
@@ -117,7 +124,8 @@ type is one new module + one registry line** — no route or frontend changes.
 
 - **Controller host:** Linux with `python3` + `python3-venv`, systemd, and
   network reach to your nodes. ~40 MB disk, ~40 MB RAM, near-zero CPU.
-- **Nodes:** Nexus Dashboard **v1.0.0+** (needs `/api/version` and token-aware
+- **Nodes:** [Nexus Dashboard](https://github.com/brainchillz/NexusDashboard-Modular)
+  **v1.0.0+** (needs `/api/version` and token-aware
   `/api/me`, returning `role` + `version` + `capabilities`). Older nodes will
   reject enrollment with a 401 — upgrade the node first.
 - An **API token** from each node (Nexus Dashboard → System → Users & Tokens). A
