@@ -110,3 +110,27 @@ def build_metrics(blobs):
         "host_count": host_count,
         "vms": vm_list,
     }
+
+
+# Guest lifecycle actions the Proxmox status endpoint accepts (qemu + lxc both
+# expose all four). Kept small on purpose — no destroy/delete from the console.
+VM_ACTIONS = {"start", "stop", "shutdown", "reboot"}
+
+
+def vm_action(host, user, password, node_name, kind, vmid, action,
+              port=8006, verify_ssl=False):
+    """Perform one lifecycle action on a single Proxmox guest. `kind` is
+    'qemu' (VM) or 'lxc' (container). Returns the Proxmox task UPID. Raises on
+    an unknown action or an API failure."""
+    if action not in VM_ACTIONS:
+        raise ValueError("unsupported action: %s" % action)
+    if kind not in ("qemu", "lxc"):
+        raise ValueError("unknown guest kind: %s" % kind)
+    import urllib3
+    from proxmoxer import ProxmoxAPI
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    px = ProxmoxAPI(host, user=user, password=password, port=port,
+                    verify_ssl=verify_ssl, timeout=CONNECT_TIMEOUT)
+    node = px.nodes(node_name)
+    guest = node.qemu(vmid) if kind == "qemu" else node.lxc(vmid)
+    return getattr(guest.status, action).post()

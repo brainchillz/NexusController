@@ -6,7 +6,7 @@
 # ./data bind mount, owned by the container's uid 10001.
 #
 # Config via a .env file next to this compose file, e.g.:
-#   CONTROLLER_BIND_IP=192.168.1.10     # host IP to expose HTTPS on (default 0.0.0.0)
+#   CONTROLLER_BIND_IP=192.168.2.116     # host IP to expose HTTPS on (default 0.0.0.0)
 #   CONTROLLER_PORT=9443
 #   CONTROLLER_TLS=1                       # 0 = HTTP behind a reverse proxy
 #   CONTROLLER_ADMIN_PASSWORD=...          # first-run only (ignored once auth exists)

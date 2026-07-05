@@ -1,6 +1,10 @@
 Flask>=2.0
 requests>=2.25
 cryptography>=3.4
+# Production WSGI server (embedded by app.py main(); dev falls back to werkzeug)
+gunicorn>=21.0
+# Drill-in websocket bridge (node v2 Containers console)
+flask-sock>=0.7
 # Virtualization host adapters (only imported when a proxmox/vmware host is
 # enrolled; the core controller has no hard dependency on these).
 proxmoxer>=2.0

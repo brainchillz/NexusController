@@ -9,7 +9,8 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements.
 
 # App.
 WORKDIR /app
-COPY app.py ./
+COPY app.py monitoring.py history.py ./
+COPY adapters/ ./adapters/
 COPY collectors/ ./collectors/
 COPY templates/ ./templates/
 COPY static/ ./static/

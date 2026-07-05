@@ -152,3 +152,47 @@ def build_metrics(hosts, vms, datastores, host_names):
         "host_count": len(hosts),
         "vms": vm_list,
     }
+
+
+VM_ACTIONS = {"start", "stop", "shutdown", "reboot"}
+
+
+def _find_vm_by_moid(content, moid):
+    from pyVmomi import vim
+    view = content.viewManager.CreateContainerView(
+        content.rootFolder, [vim.VirtualMachine], True)
+    try:
+        for vm in view.view:
+            if vm._moId == moid:
+                return vm
+    finally:
+        view.Destroy()
+    return None
+
+
+def vm_action(host, user, password, moid, action, port=443, verify_ssl=False):
+    """Perform one lifecycle action on a VMware guest identified by its managed
+    object id. `start`/`stop` are hard power ops; `shutdown`/`reboot` are the
+    graceful guest ops (require VMware Tools). Returns a short task/op label.
+    Raises on unknown action or a vSphere failure."""
+    if action not in VM_ACTIONS:
+        raise ValueError("unsupported action: %s" % action)
+    from pyVim.connect import Disconnect
+    with _socket_timeout(CONNECT_TIMEOUT):
+        si = _connect(host, user, password, port, verify_ssl)
+        try:
+            content = si.RetrieveContent()
+            vm = _find_vm_by_moid(content, moid)
+            if vm is None:
+                raise ValueError("VM %s not found" % moid)
+            if action == "start":
+                return vm.PowerOnVM_Task()._moId
+            if action == "stop":
+                return vm.PowerOffVM_Task()._moId
+            if action == "reboot":
+                vm.RebootGuest()
+                return "RebootGuest"
+            vm.ShutdownGuest()           # action == "shutdown"
+            return "ShutdownGuest"
+        finally:
+            Disconnect(si)

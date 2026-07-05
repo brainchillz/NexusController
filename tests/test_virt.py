@@ -131,3 +131,78 @@ def test_public_node_strips_password():
     pub = app._public_node(n)
     assert 'password_enc' not in pub and 'token_enc' not in pub
     assert pub['username'] == 'root@pam'   # username is not a secret
+
+
+# ── guest write actions ───────────────────────────────────────────────
+def test_proxmox_adapter_parses_guest_id(monkeypatch):
+    from adapters.proxmox import ProxmoxAdapter
+    seen = {}
+    def fake(host, user, pw, node_name, kind, vmid, action, port=8006, verify_ssl=False):
+        seen.update(node=node_name, kind=kind, vmid=vmid, action=action)
+        return 'UPID:task'
+    monkeypatch.setattr(proxmox, 'vm_action', fake)
+    a = ProxmoxAdapter()
+    # a node name that itself contains a hyphen must still parse (vmid = trailing int)
+    a._vm_action('h', 8006, 'root@pam', 'pw', False, 'qemu-pve-01-100', 'reboot')
+    assert seen == {'node': 'pve-01', 'kind': 'qemu', 'vmid': '100', 'action': 'reboot'}
+    a._vm_action('h', 8006, 'root@pam', 'pw', False, 'lxc-pve1-200', 'stop')
+    assert seen['kind'] == 'lxc' and seen['vmid'] == '200'
+
+
+def test_proxmox_adapter_rejects_bad_guest_id(monkeypatch):
+    from adapters.proxmox import ProxmoxAdapter
+    from adapters.base import NodeError
+    import pytest
+    monkeypatch.setattr(proxmox, 'vm_action', lambda *a, **k: 'x')
+    a = ProxmoxAdapter()
+    for bad in ('bogus', 'qemu-pve', 'qemu-pve-notanum', 'kvm-pve-1'):
+        with pytest.raises(NodeError):
+            a._vm_action('h', 8006, 'u', 'p', False, bad, 'start')
+
+
+def test_vm_action_endpoint(client, monkeypatch):
+    import app as A
+    from collectors import proxmox as P
+    with client.session_transaction() as s:
+        s['user'] = 'admin'
+    cfg = A.load_config(); cfg.setdefault('users', {})['admin'] = {
+        'password': A.generate_password_hash('x' * 10), 'role': 'admin'}
+    A.save_config(cfg)
+    A.save_nodes({'nodes': [{'id': 'p1', 'name': 'pve', 'host_type': 'proxmox',
+                             'base_url': 'https://10.0.0.5:8006',
+                             'username': 'root@pam',
+                             'password_enc': A.encrypt_secret('pw')}]})   # no cert_fp → pin check skipped
+    calls = []
+    monkeypatch.setattr(P, 'vm_action',
+                        lambda *a, **k: (calls.append(a) or 'UPID:done'))
+    r = client.post('/api/nodes/p1/vm/qemu-pve-100/reboot')
+    assert r.status_code == 200 and r.get_json()['task'] == 'UPID:done'
+    assert calls and calls[0][4] == 'qemu' and calls[0][6] == 'reboot'
+    # bad action → 400
+    assert client.post('/api/nodes/p1/vm/qemu-pve-100/destroy').status_code == 400
+    # unknown node → 404
+    assert client.post('/api/nodes/nope/vm/x/start').status_code == 404
+
+
+def test_vm_action_rejected_on_nonvirt_host(client, monkeypatch):
+    import app as A
+    with client.session_transaction() as s:
+        s['user'] = 'admin'
+    cfg = A.load_config(); cfg.setdefault('users', {})['admin'] = {
+        'password': A.generate_password_hash('x' * 10), 'role': 'admin'}
+    A.save_config(cfg)
+    A.save_nodes({'nodes': [{'id': 'a1', 'name': 'silo', 'host_type': 'agent',
+                             'base_url': 'https://10.0.0.6:9143'}]})
+    assert client.post('/api/nodes/a1/vm/x/start').status_code == 400
+
+
+def test_vm_action_viewer_blocked(client, monkeypatch):
+    import app as A
+    with client.session_transaction() as s:
+        s['user'] = 'ro'
+    cfg = A.load_config(); cfg.setdefault('users', {})['ro'] = {
+        'password': A.generate_password_hash('x' * 10), 'role': 'viewer'}
+    A.save_config(cfg)
+    A.save_nodes({'nodes': [{'id': 'p2', 'name': 'pve', 'host_type': 'proxmox',
+                             'base_url': 'https://10.0.0.5:8006'}]})
+    assert client.post('/api/nodes/p2/vm/qemu-pve-100/start').status_code == 403

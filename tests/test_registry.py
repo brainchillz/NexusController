@@ -74,7 +74,7 @@ def test_decrypt_garbage_returns_none():
 
 # ── URL parsing for cert pinning ─────────────────────────────────────
 def test_split_host_port_defaults():
-    assert app._split_host_port('https://192.168.1.10:8443') == ('192.168.1.10', 8443)
+    assert app._split_host_port('https://192.168.1.88:8443') == ('192.168.1.88', 8443)
     assert app._split_host_port('https://node.local') == ('node.local', 443)
     assert app._split_host_port('http://node.local') == ('node.local', 80)
 
@@ -199,12 +199,14 @@ def test_install_cert_rejects_garbage():
 # ── fleet bulk-action input validation ───────────────────────────────
 # ── fan-out resilience: one down node must not crash the whole summary ─
 def test_fetch_one_unreachable_pinned_node_returns_envelope(monkeypatch):
-    """A pinned node that is offline raises a raw socket error from
-    cert_fingerprint during _verify_pin. _fetch_one must catch it and return
-    a down envelope, not propagate (which would 500 the whole fleet view)."""
-    def boom(host, port):
-        raise OSError('Connection refused')
-    monkeypatch.setattr(app, 'cert_fingerprint', boom)
+    """A pinned node that is offline raises NodeError from the pinned
+    transport. _fetch_one must catch it and return a down envelope, not
+    propagate (which would 500 the whole fleet view)."""
+    import adapters.base
+
+    def boom(method, url, fingerprint, **kw):
+        raise adapters.base.NodeError('Connection refused')
+    monkeypatch.setattr(adapters.base, 'pinned_request', boom)
     node = {'id': 'n1', 'name': 'silo', 'base_url': 'https://10.0.0.1:8443',
             'cert_fp': 'deadbeef' * 8, 'role': 'admin'}
     out = app._fetch_one(node)
@@ -220,3 +222,205 @@ def test_fleet_action_allowlist_and_service_regex():
     assert not app.RE_SERVICE.match('smbd; rm -rf /')
     assert not app.RE_SERVICE.match('../../etc')
     assert not app.RE_SERVICE.match('a b')
+
+
+# ── v2 node integration: new module ids in classification ────
+def test_classify_gpu_capability_counts_as_ai():
+    assert app.classify_node({}, ['gpu']) == 'AI'
+
+
+def test_classify_v2_storage_mgmt_capabilities():
+    assert app.classify_node({}, ['replication', 'schedules']) == 'Storage'
+    assert app.classify_node({}, ['minidlna']) == 'Storage'
+
+
+def test_classify_running_instances_is_virtualization():
+    # A node running LXD instances and serving nothing else → Virtualization.
+    assert app.classify_node({}, ['instances'], None, {'running': 3, 'total': 4}) == 'Virtualization'
+
+
+def test_classify_storage_outranks_instances():
+    # silo: ZFS pools + LXD → stays Storage (containers are secondary).
+    s = {'zfs': {'pools': [{'name': 'tank'}]}}
+    assert app.classify_node(s, ['zfs', 'instances'], None, {'running': 3, 'total': 4}) == 'Storage'
+
+
+def test_classify_instances_capability_fallback():
+    # Idle node whose only meaningful module is Containers → Virtualization.
+    assert app.classify_node({}, ['instances', 'dashboard']) == 'Virtualization'
+    # But any storage capability outranks it.
+    assert app.classify_node({}, ['instances', 'zfs']) == 'Storage'
+
+
+# ── version-skew flagging ─────────────────────────────────────────────
+def test_version_skew_flags_laggards_only():
+    rs = [{'ok': True, 'host_type': 'nexus', 'version': '2.0.0'},
+          {'ok': True, 'host_type': 'nexus', 'version': '1.0.2'},
+          {'ok': True, 'host_type': 'truenas', 'version': '25.10.2.1'},  # vendor version: ignored
+          {'ok': False, 'host_type': 'nexus', 'version': '0.9.0'}]      # down: ignored
+    app.flag_version_skew(rs)
+    assert 'version_lag' not in rs[0]
+    assert rs[1]['version_lag'] == '2.0.0'
+    assert 'version_lag' not in rs[2]
+    assert 'version_lag' not in rs[3]
+
+
+def test_version_skew_uniform_fleet_unflagged():
+    rs = [{'ok': True, 'host_type': 'nexus', 'version': '2.0.0'},
+          {'ok': True, 'version': '2.0.0'}]   # no host_type = nexus
+    app.flag_version_skew(rs)
+    assert not any('version_lag' in r for r in rs)
+
+
+def test_version_tuple_tolerant():
+    assert app._version_tuple('2.0.0') == (2, 0, 0)
+    assert app._version_tuple('v1.2') == (1, 2)
+    assert app._version_tuple(None) == (0,)
+    assert app._version_tuple('2.0.0') > app._version_tuple('1.9.9')
+
+
+# ── rollup folds nexus LXD instances into VM/CT counts ────────────────
+def test_rollup_counts_nexus_instances():
+    rs = [{'ok': True, 'summary': {}, 'used_bytes': 0, 'size_bytes': 0,
+           'instances': {'total': 4, 'running': 3, 'vms': 1, 'containers': 3}}]
+    r = app.compute_rollup(rs)
+    assert r['vms'] == 4 and r['containers'] == 3
+
+
+# ── drill-in websocket shim ───────────────────────────────────────────
+def test_render_drillin_websocket_shim():
+    out = app.render_drillin_html('<html><head></head><body></body></html>', 'n1')
+    assert 'window.WebSocket' in out
+    assert '/nodes/n1/ws/' in out
+
+
+# ── adapter descriptors (drive the Add/Edit-host modal) ───────────────
+def test_adapter_descriptors_complete():
+    import adapters
+    ds = adapters.descriptors()
+    kinds = [d['kind'] for d in ds]
+    assert kinds[0] == 'nexus'   # first option in the Add-Host dropdown
+    assert set(kinds) == {'nexus', 'proxmox', 'vcenter', 'esxi', 'truenas',
+                          'synology', 'zimaos', 'unraid', 'omv', 'sparkdash',
+                          'agent'}
+    for d in ds:
+        for k in ('kind', 'label', 'auth', 'secret_label', 'url_placeholder',
+                  'username_placeholder', 'verify_tls', 'default_type', 'polled'):
+            assert k in d, f"{d['kind']} missing {k}"
+        assert d['auth'] in ('token', 'userpass')
+    tn = next(d for d in ds if d['kind'] == 'truenas')
+    assert tn['auth'] == 'token' and tn['secret_label'] == 'API key' and tn['verify_tls']
+
+
+# ── controller user management ────────────────────────────────────────
+def test_username_regex():
+    assert app.RE_USERNAME.match('operator1')
+    assert app.RE_USERNAME.match('a.b_c-d')
+    assert not app.RE_USERNAME.match('bad name')
+    assert not app.RE_USERNAME.match('x' * 33)
+    assert not app.RE_USERNAME.match('')
+
+
+def test_user_management_flow(client, monkeypatch):
+    # admin session
+    import app as A
+    with client.session_transaction() as s:
+        s['user'] = 'admin'
+    # seed an admin user in the temp config
+    cfg = A.load_config(); cfg.setdefault('users', {})['admin'] = {
+        'password': A.generate_password_hash('x'*10), 'role': 'admin'}
+    A.save_config(cfg)
+
+    r = client.post('/api/users', json={'username': 'viewer1', 'role': 'viewer', 'password': 'p'*10})
+    assert r.status_code == 200
+    names = [u['username'] for u in client.get('/api/users').get_json()['users']]
+    assert 'viewer1' in names
+    # created users must change password on first login
+    v = next(u for u in client.get('/api/users').get_json()['users'] if u['username'] == 'viewer1')
+    assert v['must_change'] and v['role'] == 'viewer'
+    # bad role / short password rejected
+    assert client.post('/api/users', json={'username': 'x', 'role': 'root', 'password': 'p'*10}).status_code == 400
+    assert client.post('/api/users', json={'username': 'y', 'role': 'viewer', 'password': 'short'}).status_code == 400
+    # promote, then delete
+    assert client.put('/api/users/viewer1', json={'role': 'operator'}).status_code == 200
+    assert client.delete('/api/users/viewer1').status_code == 200
+    # can't delete self / last admin
+    assert client.delete('/api/users/admin').status_code == 400
+
+
+# ── node cert review / re-pin ─────────────────────────────────────────
+def _admin(client):
+    import app as A
+    with client.session_transaction() as s:
+        s['user'] = 'admin'
+    cfg = A.load_config(); cfg.setdefault('users', {})['admin'] = {
+        'password': A.generate_password_hash('x' * 10), 'role': 'admin'}
+    A.save_config(cfg)
+
+
+def test_node_cert_reports_mismatch(client, monkeypatch):
+    import app as A
+    _admin(client)
+    A.save_nodes({'nodes': [{'id': 'c1', 'name': 'silo', 'host_type': 'nexus',
+                             'base_url': 'https://10.0.0.9:9143', 'cert_fp': 'aa' * 32}]})
+    monkeypatch.setattr(A, 'cert_fingerprint', lambda h, p: 'bb' * 32)
+    j = client.get('/api/nodes/c1/cert').get_json()
+    assert j['pinned'] == 'aa' * 32 and j['observed'] == 'bb' * 32 and j['match'] is False
+    assert client.get('/api/nodes/nope/cert').status_code == 404
+
+
+def test_node_cert_http_has_no_certificate(client, monkeypatch):
+    import app as A
+    _admin(client)
+    A.save_nodes({'nodes': [{'id': 'h1', 'name': 'plain', 'host_type': 'agent',
+                             'base_url': 'http://10.0.0.9:9143', 'cert_fp': None}]})
+    j = client.get('/api/nodes/h1/cert').get_json()
+    assert j['scheme'] == 'http' and j['observed'] is None
+
+
+def test_node_repin_accepts_reviewed_fp(client, monkeypatch):
+    import app as A
+    _admin(client)
+    A.save_nodes({'nodes': [{'id': 'c2', 'name': 'silo', 'host_type': 'nexus',
+                             'base_url': 'https://10.0.0.9:9143', 'cert_fp': 'aa' * 32}]})
+    monkeypatch.setattr(A, 'cert_fingerprint', lambda h, p: 'bb' * 32)
+    r = client.post('/api/nodes/c2/repin', json={'expected': 'bb' * 32})
+    assert r.status_code == 200 and r.get_json()['cert_fp'] == 'bb' * 32
+    # persisted
+    n = A._find_node('c2')
+    assert n['cert_fp'] == 'bb' * 32
+
+
+def test_node_repin_rejects_stale_review(client, monkeypatch):
+    """If the live cert changed again since the admin reviewed it, re-pin 409s
+    rather than trusting whatever is served at click time."""
+    import app as A
+    _admin(client)
+    A.save_nodes({'nodes': [{'id': 'c3', 'name': 'silo', 'host_type': 'nexus',
+                             'base_url': 'https://10.0.0.9:9143', 'cert_fp': 'aa' * 32}]})
+    monkeypatch.setattr(A, 'cert_fingerprint', lambda h, p: 'cc' * 32)  # now a 3rd cert
+    r = client.post('/api/nodes/c3/repin', json={'expected': 'bb' * 32})
+    assert r.status_code == 409
+    assert A._find_node('c3')['cert_fp'] == 'aa' * 32  # unchanged
+
+
+# ── tag-targeted fleet actions ────────────────────────────────────────
+def test_fleet_action_targets_by_tag(client, monkeypatch):
+    import app as A
+    _admin(client)
+    A.save_nodes({'nodes': [
+        {'id': 'a', 'name': 'alpha', 'host_type': 'nexus', 'base_url': 'https://1', 'tags': ['prod', 'east']},
+        {'id': 'b', 'name': 'bravo', 'host_type': 'nexus', 'base_url': 'https://2', 'tags': ['prod']},
+        {'id': 'c', 'name': 'charlie', 'host_type': 'nexus', 'base_url': 'https://3', 'tags': ['dev']},
+    ]})
+    seen = []
+    monkeypatch.setattr(A, '_proxy_service_action',
+                        lambda n, s, act: (seen.append(n['name']) or
+                                           {'id': n['id'], 'name': n['name'], 'ok': True, 'status': 200, 'error': None}))
+    r = client.post('/api/fleet/action', json={'service': 'smbd', 'action': 'restart', 'tags': ['prod']})
+    j = r.get_json()
+    assert r.status_code == 200 and j['ok'] == 2
+    assert sorted(seen) == ['alpha', 'bravo']   # charlie (dev) excluded
+    assert 'prod' in j['scope']
+    # a tag nobody has → 404
+    assert client.post('/api/fleet/action', json={'service': 'smbd', 'action': 'restart', 'tags': ['nope']}).status_code == 404

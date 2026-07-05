@@ -28,19 +28,69 @@ top of them, not a replacement.
   **API key**. The row shows pool health (✓ / ⚠ degraded), disk count, and
   capacity/CPU/memory, and its status dot goes amber on a degraded pool or an
   active alert. Read-only calls over the **JSON-RPC 2.0 WebSocket API**, polled in
-  the background like the hypervisors. (Unraid and Synology are next.)
+  the background like the hypervisors. **Synology DSM** enrolls the same way
+  (username/password of a local no-2FA admin account, DSM Web API, volumes map
+  to pools), as does **ZimaOS / ZimaCube** (local account over the LAN HTTP
+  API; storages map to pools), **Unraid 7.x** (webGui username/password
+  driving its GraphQL API; the parity array + every mounted pool appear as
+  pools, and disk/pool problems plus unread Unraid alerts surface as alerts),
+  and **OpenMediaVault** (web-UI admin credentials driving its JSON-RPC API;
+  managed filesystems appear as pools with mdadm array state folded in, and
+  SMART failures on monitored disks surface as alerts).
+- **Any bare Linux or Windows machine** — for hosts that don't warrant a full
+  dashboard, drop the **Nexus Agent** on them (`agent/` in this repo). Linux:
+  a single stdlib-only Python file + systemd unit (`agent/install.sh`).
+  Windows: a PowerShell 5.1 script + Scheduled Task (`agent/install.ps1`,
+  TLS bound in http.sys so the agent runs as NETWORK SERVICE). Both speak the
+  same read-only HTTPS contract (bearer token, self-signed cert TOFU-pinned
+  by the controller): up/down, CPU, memory, and per-mount/per-drive storage
+  utilization. No dependencies, no write endpoints. Enroll either as host
+  type **Nexus Agent**.
+- **DGX Spark clusters too** — enroll a
+  [SparkDash](https://github.com/brainchillz/sparkdash) instance to monitor a
+  whole **sparkrun DGX Spark cluster** as one host: nodes online, GPU
+  utilization, VRAM, vLLM health + loaded model, running recipe, and cluster
+  disk/CPU/memory; the dot goes amber when the cluster reports unhealthy. An
+  API token is optional (reads are public) — supply one to arm write actions
+  through the controller's proxy.
 - **Fleet Overview** — hosts as compact horizontal rows **grouped by type**
   (Storage / Virtualization / AI / General): each row shows reachability, the
   reachable IP, CPU/mem/storage mini-bars, and type-specific chips (ZFS/shares/
   disks, VM & container counts, or **llama-server health + model + tok/s**).
 - **Fleet-wide views** — every **alert** across the fleet, **storage** totals,
   and a **services matrix** (node × service status).
+- **Push notifications** — a background monitor watches every host's state and
+  posts **state-transition** events (host down/up, degraded pool, new alerts,
+  certificate change, version drift) to a chat **webhook** (Google Chat, Slack,
+  Discord, ntfy, or Gotify). Debounced against flapping, with all-clear
+  recovery messages. Configure under **🔔 Notify** (admin).
+- **User management** — create operator / viewer / admin logins, reset
+  passwords, all from the UI (**👥 Users**); first login on a new account
+  forces a password change.
+- **History & capacity forecasting** — a 30-day SQLite ring buffer records
+  every host each minute. Overview rows show a **CPU sparkline**; the Storage
+  tab projects **days-to-full** per pool (and fleet-wide) from the observed
+  fill rate, plus a rolling **availability %** per host.
+- **Certificate re-pin** — if a host starts serving a new TLS certificate (a
+  renewal, or something worse), it goes unreachable on the pin. Admins get a
+  **🔐 Review cert** action showing the pinned vs. now-serving fingerprint
+  side-by-side; re-pinning is guarded so a certificate that changes *again*
+  between review and click is refused rather than blindly trusted.
 - **Control at scale** — start / stop / restart / enable / disable services on a
   node, view its logs, or run a **fleet-wide action** ("restart `smbd`
-  everywhere") with per-node success/failure reporting.
+  everywhere", or only on nodes tagged `prod`) with per-node success/failure
+  reporting.
+- **Tags** — label hosts (`prod`, `storage`, `rack-3`) and **filter the overview**
+  to just those hosts, or **target a fleet action** at a single tag.
+- **Guest control** — start / stop / shut down / reboot **VMs and containers**
+  on Proxmox and VMware hosts straight from the controller (🖥 Guests), with the
+  same pin-verify + audit trail as every other action. Power operations only —
+  no create or destroy.
 - **Drill-in** — "Open dashboard ▸" opens a node's *own* dashboard SPA **through**
   the controller; the node's token stays server-side, and every action is audited
-  on the controller in addition to the node.
+  on the controller in addition to the node. This includes the node's
+  **Containers console** (xterm over websocket) — the controller bridges the
+  websocket with the node's token attached server-side.
 - **Graceful degradation** — a slow or unreachable node never blocks the fleet
   view; results are briefly cached so auto-refresh doesn't hammer nodes.
 
@@ -55,6 +105,12 @@ top of them, not a replacement.
 The controller is a **node registry** + a **fan-out aggregator** + an **action
 reverse-proxy**. Nodes never call back — communication is pull-only, so the
 controller's own IP can change without breaking anything (see *Networking*).
+
+Host-type support lives in the **`adapters/` package** — one self-contained
+module per host type (Nexus node, Proxmox, vCenter, ESXi, TrueNAS, SparkDash).
+Each adapter describes its own enrollment UI (label, credential fields,
+placeholders), served to the SPA via `GET /api/host-types`, so **adding a host
+type is one new module + one registry line** — no route or frontend changes.
 
 ## Requirements
 
@@ -195,6 +251,25 @@ returned through the API.
   TLS-verify toggle. Create the key under a user with the **Read Only Admin**
   role (Credentials → Users → *Roles*) — a key without it authenticates but
   gets `403` on every call.
+- **Synology DSM** — base URL (`https://host:5001`), username + password of a
+  **local account without 2FA** in the **administrators** group (DSM has no
+  read-only admin role; the controller only ever issues read calls). All
+  DSM volumes appear as pools.
+- **ZimaOS (ZimaCube)** — base URL (`http://host` — ZimaOS serves plain HTTP
+  on the LAN, so there is no certificate to pin; use an https reverse proxy in
+  front if you want TLS + pinning), username + password of a local ZimaOS
+  account. Storages appear as pools; RAID status, missing/faulty members, and
+  unhealthy disks surface as alerts.
+- **Unraid (7.x)** — base URL (`http://host`, or `https://` if you've enabled
+  SSL — then the cert is pinned), webGui username + password (e.g. `root`).
+  The controller drives Unraid's GraphQL API through a cached webGui session;
+  read-only queries only. The parity array and each mounted pool appear as
+  pools; unread Unraid alert/warning notifications count as alerts.
+- **OpenMediaVault** — base URL (`http://host`, or `https://` with SSL
+  enabled — then pinned), the **web-UI admin** username + password (OMV's UI
+  login is separate from the box's SSH/system accounts). Managed filesystems
+  appear as pools, mdadm array state folds into pool health, and SMART
+  problems on monitored disks raise alerts.
 
 Virtualization and NAS hosts are polled in the background (default every 60s);
 their row shows the last poll. **Open console ▸** / **Open UI ▸** links to the
@@ -240,8 +315,12 @@ readonly token shows as read-only.
   privileged work happens on the node behind its own auth.
 - **Tokens encrypted at rest** (Fernet) in `nodes.json`; never returned via the
   API.
-- **Per-node TLS cert pinning** (trust-on-first-use): the fingerprint is captured
-  at enroll and checked on every call; a changed cert fails closed.
+- **Per-node TLS cert pinning** (trust-on-first-use): the fingerprint is
+  captured at enroll and verified **in-handshake on every call** (the pin is
+  asserted on the same connection that carries the request); a changed cert
+  fails closed. Background-polled hosts (hypervisors/NAS) pre-check the pin
+  before each poll and additionally support full CA verification (verify-TLS
+  toggle).
 - **RBAC** enforced centrally (viewer can't write; enroll/remove is admin-only).
 - **Audit log** of every controller-side mutation (operator, node, method, path,
   result) — in addition to the node's own audit.
@@ -277,10 +356,12 @@ changes do matter: a node's `base_url` is stored in the registry; update it with
 | `POST` | `/api/nodes/test` | test-connection without enrolling |
 | `PUT` | `/api/nodes/<id>` | update name/tags/type/token (admin) |
 | `DELETE` | `/api/nodes/<id>` | un-enroll (admin) |
+| `GET` | `/api/host-types` | adapter descriptors (drive the Add/Edit modal) |
 | `GET` | `/api/fleet/summary` | fan-out rollup (`?fresh=1` bypasses cache) |
 | `POST` | `/api/fleet/action` | fleet-wide service action |
 | `*` | `/api/nodes/<id>/proxy/<path>` | reverse-proxy to a node's `/api/<path>` |
 | `GET` | `/nodes/<id>/` | drill-in: the node's SPA, retargeted |
+| `WS` | `/nodes/<id>/ws/<path>` | drill-in websocket bridge (node console) |
 | `GET` | `/api/tls/info` | current serving certificate metadata |
 | `POST` | `/api/tls/regenerate` | regenerate the self-signed cert (admin) |
 | `POST` | `/api/tls/cert` | install a supplied cert + key (admin) |
@@ -298,14 +379,13 @@ atomic JSON writes, `escapeHtml`/`jsArg`, central RBAC guard.
 
 ## Status
 
-Implemented: enrollment + in-UI editing + encrypted registry, cert-pinning
-`NodeClient`, cached fan-out fleet view, alerts/storage/services aggregation,
-fleet-wide service actions, drill-in reverse-proxy, AI/llama status, node-type
-classification, **Proxmox / VMware (vCenter + ESXi) virtualization adapters**,
-**a TrueNAS NAS adapter (read-only JSON-RPC 2.0 WebSocket, API-key auth)**, TLS certificate
-management, and both systemd (`install.sh`) and Docker (`docker-compose.yml`)
-deployment.
-
-Roadmap: **more NAS adapters (Unraid, Synology)**, virtualization write actions
-(start/stop VM), per-node/tag RBAC scoping, cert-change & version-skew warnings in
-the UI, controller user-management UI, and fan-out rate-limiting for large fleets.
+Implemented: enrollment + in-UI editing + encrypted registry, in-handshake
+cert-pinning `NodeClient`, cached fan-out fleet view, alerts/storage/services
+aggregation, fleet-wide service actions, drill-in reverse-proxy **incl. a
+websocket bridge for the node's Containers console**, AI/llama status, **LXD
+instance counts for v2 nodes**, node-type classification, **version-skew
+warnings**, a **self-describing host-adapter package** (Proxmox / vCenter /
+ESXi virtualization + TrueNAS NAS, read-only JSON-RPC 2.0 WebSocket, API-key
+auth), TLS certificate management, an embedded-gunicorn runtime, and both
+systemd (`install.sh`) and Docker (`docker-compose.yml`) deployment. The UI
+matches the Nexus Dashboard v2 dark-grey/orange theme.

@@ -10,7 +10,7 @@ from collectors import truenas
 GB = 1024 ** 3
 
 # ~64 GiB box, one healthy 16 TB pool ~3% full, 9 disks.
-INFO = {'hostname': 'nas1', 'version': 'TrueNAS-25.10.2.1',
+INFO = {'hostname': 'vmstor', 'version': 'TrueNAS-25.10.2.1',
         'model': 'Intel(R) Xeon(R) CPU D-1521', 'physmem': 64 * GB,
         'uptime_seconds': 10795843.8}
 POOLS = [{'name': 'SATAFLASH', 'status': 'ONLINE', 'healthy': True,
@@ -28,7 +28,7 @@ CPU_GRAPH = {'legend': ['time', 'cpu', 'cpu0', 'cpu1'],
 MEM_GRAPH = {'legend': ['time', 'available'],
              'data': [[1, 8 * GB], [2, 8 * GB], [3, 0]]}
 
-NAS_NODE = {'id': 'n1', 'name': 'nas1', 'base_url': 'https://192.168.1.20',
+NAS_NODE = {'id': 'n1', 'name': 'vmstor', 'base_url': 'https://192.168.2.8',
             'host_type': 'truenas', 'type': 'Storage', 'type_pinned': False, 'tags': []}
 
 
@@ -92,6 +92,24 @@ def test_compute_rollup_tolerates_nas_envelope():
     assert r['healthy'] == 1 and r['unreachable'] == 0
     assert r['storage_used'] == int(480 * GB)          # folds into fleet capacity
     assert r['vms'] == 0 and r['containers'] == 0       # a NAS has neither
+    assert r['alerts'] == 0 and r['degraded'] == 0      # clean NAS = clean rollup
+
+
+def test_compute_rollup_counts_nas_alerts():
+    # NAS alerts live in the nas block, not summary.alerts — the rollup must
+    # fold them in (else the header pill says 0 while the row shows an alert).
+    env = app.build_nas_envelope(NAS_NODE, truenas.build_metrics(INFO, POOLS, DISKS, ALERTS))
+    r = app.compute_rollup([env])
+    assert r['alerts'] == 1
+    assert r['degraded'] == 1
+
+
+def test_compute_rollup_degraded_pool_marks_host_degraded():
+    pools = [dict(POOLS[0], healthy=False, status='DEGRADED')]
+    env = app.build_nas_envelope(NAS_NODE, truenas.build_metrics(INFO, pools, DISKS, []))
+    r = app.compute_rollup([env])
+    assert r['alerts'] == 0            # a degraded pool is not an "alert"…
+    assert r['degraded'] == 1          # …but the host counts as degraded
 
 
 def test_truenas_adapter_dispatch_and_auth():

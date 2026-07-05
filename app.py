@@ -13,21 +13,19 @@ Phase 1 scope: enrollment + NodeClient + controller auth/RBAC skeleton, plus a
 basic fleet-summary fan-out (Phase 2 will add caching + richer rollups).
 """
 import os
-import ssl
 import re
 import json
 import time
 import socket
 import secrets
-import hashlib
 import threading
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import requests
 from urllib3.exceptions import InsecureRequestWarning
 import urllib3
 from flask import Flask, jsonify, request, session, send_from_directory, g, Response
+from flask_sock import Sock
 from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography import x509
@@ -35,15 +33,27 @@ from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+import requests
+import adapters
+import monitoring
+import history
+from adapters import (   # host-type seam — see adapters/__init__.py
+    NodeError, NodeClient, classify_node, parse_human_bytes, _serves_ai,
+    probe_node, build_virt_envelope, build_nas_envelope, build_spark_envelope,
+    build_agent_envelope,
+    cert_fingerprint, _split_host_port, start_virt_poller, ADAPTERS,
+    NODE_TIMEOUT, PROXY_TIMEOUT, FANOUT_WORKERS, VIRT_POLL_INTERVAL)
+from adapters import adapter_for as _adapter_for, probe_host as _probe_host
+
 # Nodes use self-signed certs by default; we pin their fingerprint ourselves
-# (TOFU, accept-new), so requests' own CA verification is intentionally off and
-# its warning is noise here.
+# (TOFU, in-handshake — see adapters.base), so requests' own CA verification is
+# intentionally off and its warning is noise here.
 urllib3.disable_warnings(InsecureRequestWarning)
 
 app = Flask(__name__, static_url_path='')
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = '0.1.1'
+APP_VERSION = '0.5.4'
 
 
 def env_bool(name, default):
@@ -67,6 +77,8 @@ except OSError:
 AUTH_FILE = os.environ.get('CONTROLLER_AUTH_FILE', os.path.join(DATA_DIR, 'controller-auth.json'))
 NODES_FILE = os.environ.get('CONTROLLER_NODES_FILE', os.path.join(DATA_DIR, 'nodes.json'))
 AUDIT_FILE = os.environ.get('CONTROLLER_AUDIT_FILE', os.path.join(DATA_DIR, 'audit.log'))
+HISTORY_FILE = os.environ.get('CONTROLLER_HISTORY_FILE', os.path.join(DATA_DIR, 'history.db'))
+HISTORY_DAYS = int(os.environ.get('CONTROLLER_HISTORY_DAYS', '30'))
 
 TLS_ENABLED = env_bool('CONTROLLER_TLS', True)
 TLS_DIR = os.environ.get('CONTROLLER_TLS_DIR', os.path.join(DATA_DIR, 'certs'))
@@ -74,22 +86,11 @@ TLS_CERT = os.environ.get('CONTROLLER_TLS_CERT', os.path.join(TLS_DIR, 'controll
 TLS_KEY = os.environ.get('CONTROLLER_TLS_KEY', os.path.join(TLS_DIR, 'controller.key'))
 PORT = int(os.environ.get('CONTROLLER_PORT', '9443' if TLS_ENABLED else '9080'))
 
-# Per-node call timeout (connect, read) seconds; short so a slow node never
-# blocks the fleet view.
-NODE_TIMEOUT = (4, 8)
-# The reverse-proxy carries user-initiated actions (incl. writes like disk
-# format/mkfs) that can legitimately run far longer than a fleet poll, so it
-# gets its own generous read timeout rather than the short fan-out one.
-PROXY_TIMEOUT = (4, 300)
-FANOUT_WORKERS = 8
+# (Per-node timeouts, fan-out workers, and the virt poll interval live in
+# adapters.base — imported above.)
 # Brief fleet-summary cache so the SPA's auto-refresh doesn't hammer the nodes.
 # A manual refresh passes ?fresh=1 to bypass it.
 FLEET_CACHE_TTL = 12
-# Virtualization hosts (proxmox/vmware) are polled by a background thread rather
-# than live in the fan-out: a hypervisor API call (esp. pyVmomi) can take many
-# seconds, which must never block the fleet view. The fan-out serves each virt
-# host's last polled result from _virt_cache.
-VIRT_POLL_INTERVAL = int(os.environ.get('CONTROLLER_VIRT_POLL', '60'))
 
 MIN_PASSWORD_LEN = 8
 # Controller roles, most→least privilege. admin manages nodes + full control;
@@ -127,22 +128,6 @@ def load_json(path, default):
 
 def err(msg, code=400):
     return jsonify({'success': False, 'error': msg}), code
-
-
-# Nodes report ZFS used/size as human strings (e.g. "1.2T") from the node's
-# _human_bytes (suffixes B/K/M/G/T/P). Parse them back to bytes so the
-# controller can sum fleet-wide storage.
-_UNIT_MULT = {'B': 1, 'K': 1024, 'M': 1024 ** 2, 'G': 1024 ** 3,
-              'T': 1024 ** 4, 'P': 1024 ** 5}
-
-
-def parse_human_bytes(s):
-    if not s:
-        return 0
-    m = re.match(r'^\s*([\d.]+)\s*([BKMGTP])?\s*$', str(s))
-    if not m:
-        return 0
-    return int(float(m.group(1)) * _UNIT_MULT.get(m.group(2) or 'B', 1))
 
 
 # ─── Config / auth bootstrap ──────────────────────────────────────────
@@ -222,7 +207,10 @@ PUBLIC_ENDPOINTS = {'api_login', 'api_me', 'index', 'static'}
 RBAC_EXEMPT = {'api_logout', 'change_password'}
 # Endpoints that require the top (admin) role regardless of method — enrolling
 # or removing a node, and managing controller users.
-ADMIN_ONLY = {'nodes_add', 'node_delete', 'node_update', 'tls_regenerate', 'tls_upload_cert'}
+ADMIN_ONLY = {'nodes_add', 'node_delete', 'node_update', 'node_cert', 'node_repin',
+              'tls_regenerate', 'tls_upload_cert',
+              'notifications_save', 'notifications_test',
+              'users_list', 'users_add', 'users_update', 'users_delete'}
 
 
 def _resolve_identity():
@@ -298,143 +286,9 @@ def _find_node(node_id):
     return None
 
 
-# ─── NodeClient — authenticated, cert-pinned calls to one node ────────
-def cert_fingerprint(host, port):
-    """SHA-256 of the node's leaf certificate (DER), captured over a raw TLS
-    socket. Used for TOFU pinning — accept-new at enroll, compare every call."""
-    ctx = ssl._create_unverified_context()
-    with socket.create_connection((host, port), timeout=NODE_TIMEOUT[0]) as sock:
-        with ctx.wrap_socket(sock, server_hostname=host) as ssock:
-            der = ssock.getpeercert(binary_form=True)
-    return hashlib.sha256(der).hexdigest()
-
-
-def _split_host_port(base_url):
-    from urllib.parse import urlparse
-    u = urlparse(base_url)
-    return u.hostname, (u.port or (443 if u.scheme == 'https' else 80))
-
-
-class NodeError(Exception):
-    pass
-
-
-class NodeClient:
-    """One node's API surface: bearer auth + per-node cert pinning + timeout."""
-
-    def __init__(self, node):
-        self.node = node
-        self.base_url = node['base_url'].rstrip('/')
-        self.token = decrypt_secret(node.get('token_enc', '')) if node.get('token_enc') else None
-        self.cert_fp = node.get('cert_fp')
-
-    def _verify_pin(self):
-        if not self.cert_fp:
-            return  # not pinned yet (enroll path captures it)
-        host, port = _split_host_port(self.base_url)
-        try:
-            live = cert_fingerprint(host, port)
-        except (socket.error, ssl.SSLError, OSError) as e:
-            # Offline/unreachable node: surface as NodeError so the fan-out
-            # records this node as down instead of crashing the whole summary.
-            raise NodeError(f'cannot reach {host}:{port} ({e})')
-        if live != self.cert_fp:
-            raise NodeError(f'certificate fingerprint changed for {host} '
-                            f'(pinned {self.cert_fp[:16]}…, saw {live[:16]}…)')
-
-    def request(self, method, path, **kwargs):
-        self._verify_pin()
-        url = f"{self.base_url}/api/{path.lstrip('/')}"
-        headers = kwargs.pop('headers', {})
-        if self.token:
-            headers['Authorization'] = f'Bearer {self.token}'
-        try:
-            return requests.request(method, url, headers=headers, verify=False,
-                                    timeout=NODE_TIMEOUT, **kwargs)
-        except requests.RequestException as e:
-            raise NodeError(str(e))
-
-    def get_json(self, path):
-        r = self.request('GET', path)
-        if r.status_code != 200:
-            raise NodeError(f'HTTP {r.status_code}')
-        return r.json()
-
-
-def probe_node(base_url, token):
-    """Test-connection at enroll: capture cert fingerprint, validate the token
-    via /api/me, return role + version + capabilities. Raises NodeError."""
-    host, port = _split_host_port(base_url)
-    if not host:
-        raise NodeError('invalid base URL')
-    try:
-        fp = cert_fingerprint(host, port)
-    except (socket.error, ssl.SSLError, OSError) as e:
-        raise NodeError(f'cannot reach {host}:{port} ({e})')
-    headers = {'Authorization': f'Bearer {token}'} if token else {}
-    try:
-        r = requests.get(f"{base_url.rstrip('/')}/api/me", headers=headers,
-                         verify=False, timeout=NODE_TIMEOUT)
-    except requests.RequestException as e:
-        raise NodeError(str(e))
-    if r.status_code == 401:
-        raise NodeError('token rejected (401) — check the token and that it is admin/readonly')
-    if r.status_code != 200:
-        raise NodeError(f'unexpected response (HTTP {r.status_code})')
-    data = r.json()
-    return {
-        'cert_fp': fp,
-        'role': data.get('role'),
-        'version': data.get('version'),
-        'fqdn': data.get('fqdn'),
-        'capabilities': data.get('capabilities', []),
-    }
-
-
-def _serves_ai(llama):
-    """A node is serving AI if its llama-server is healthy, or the service is
-    active with a model loaded. `llama` is the node's /api/llama (+ embedded
-    health), which the node's /api/summary does NOT include — the controller
-    fetches it separately for llamacpp-capable nodes."""
-    if not isinstance(llama, dict):
-        return False
-    health = llama.get('health') or {}
-    if health.get('ok'):
-        return True
-    svc = llama.get('service') or {}
-    return svc.get('active') == 'active' and bool(llama.get('model'))
-
-
-def classify_node(summary, capabilities, llama=None):
-    """Suggest a node type (Storage / AI / Mixed / Unknown) from a node's
-    /api/summary + (separately fetched) llama status + capabilities. Heuristic
-    per proposal §6.7; manual override lives in the registry."""
-    serves_storage = False
-    serves_ai = _serves_ai(llama)
-    if isinstance(summary, dict):
-        zfs = summary.get('zfs') or {}
-        nfs = summary.get('nfs') or {}
-        smb = summary.get('smb') or {}
-        iscsi = summary.get('iscsi') or {}
-        pools = len(zfs.get('pools', []) or []) if isinstance(zfs.get('pools'), list) else zfs.get('pools', 0)
-        serves_storage = bool(pools or smb.get('shares') or nfs.get('exports') or iscsi.get('targets'))
-    if not (serves_storage or serves_ai):
-        # idle — fall back to enabled capabilities
-        caps = set(capabilities or [])
-        # Node module ids (see node app MODULES): AI = 'llamacpp'; storage feature
-        # areas. 'disks' alone is weak evidence but counts toward storage.
-        has_ai = bool(caps & {'llamacpp', 'llama', 'ai'})
-        has_storage = bool(caps & {'zfs', 'iscsi', 'nfs', 'smb', 'lvm', 'mdraid', 'disks'})
-        if has_ai and has_storage:
-            return 'Mixed'
-        if has_ai:
-            return 'AI'
-        if has_storage:
-            return 'Storage'
-        return 'Unknown'
-    if serves_storage and serves_ai:
-        return 'Mixed'
-    return 'Storage' if serves_storage else 'AI'
+# Inject the app-owned services the adapters package needs (it never imports
+# app — see adapters/base.configure).
+adapters.configure(decrypt_secret=decrypt_secret, load_nodes=load_nodes)
 
 
 # ─── Routes: SPA + auth ───────────────────────────────────────────────
@@ -494,10 +348,99 @@ def change_password():
     return jsonify({'success': True})
 
 
+# ─── Controller user management (admin) ───────────────────────────────
+RE_USERNAME = re.compile(r'^[A-Za-z0-9._-]{1,32}$')
+
+
+@app.route('/api/users')
+def users_list():
+    """List controller logins (no password hashes). Admin-only."""
+    out = [{'username': u, 'role': _user_role(r),
+            'must_change': bool(isinstance(r, dict) and r.get('must_change'))}
+           for u, r in _users().items()]
+    out.sort(key=lambda u: u['username'].lower())
+    return jsonify({'users': out})
+
+
+@app.route('/api/users', methods=['POST'])
+def users_add():
+    """Create a controller login (admin)."""
+    data = request.get_json() or {}
+    user = (data.get('username') or '').strip()
+    role = data.get('role')
+    pw = data.get('password') or ''
+    if not RE_USERNAME.match(user):
+        return err('username must be 1–32 chars: letters, digits, . _ -')
+    if role not in ROLES:
+        return err('role must be one of: %s' % ', '.join(ROLES))
+    if len(pw) < MIN_PASSWORD_LEN:
+        return err(f'password must be at least {MIN_PASSWORD_LEN} characters')
+    cfg = load_config()
+    if user in cfg.get('users', {}):
+        return err('user already exists')
+    cfg.setdefault('users', {})[user] = {
+        'password': generate_password_hash(pw), 'role': role, 'must_change': True}
+    save_config(cfg)
+    g.audit_target = 'user:%s (%s)' % (user, role)
+    return jsonify({'success': True})
+
+
+@app.route('/api/users/<user>', methods=['PUT'])
+def users_update(user):
+    """Change a user's role and/or reset their password (admin)."""
+    data = request.get_json() or {}
+    cfg = load_config()
+    rec = cfg.get('users', {}).get(user)
+    if not isinstance(rec, dict):
+        return err('user not found', 404)
+    if 'role' in data:
+        if data['role'] not in ROLES:
+            return err('role must be one of: %s' % ', '.join(ROLES))
+        # Don't let the last admin demote themselves out of admin access.
+        if user == g.identity_name and data['role'] != 'admin':
+            return err('cannot remove your own admin role')
+        rec['role'] = data['role']
+    if data.get('password'):
+        if len(data['password']) < MIN_PASSWORD_LEN:
+            return err(f'password must be at least {MIN_PASSWORD_LEN} characters')
+        rec['password'] = generate_password_hash(data['password'])
+        rec['must_change'] = True   # operator-set password → force a change on first login
+    cfg['users'][user] = rec
+    save_config(cfg)
+    g.audit_target = 'user:%s' % user
+    return jsonify({'success': True})
+
+
+@app.route('/api/users/<user>', methods=['DELETE'])
+def users_delete(user):
+    """Remove a controller login (admin). Can't delete yourself or the last admin."""
+    cfg = load_config()
+    users = cfg.get('users', {})
+    if user not in users:
+        return err('user not found', 404)
+    if user == g.identity_name:
+        return err('cannot delete your own account')
+    admins = [u for u, r in users.items() if _user_role(r) == 'admin']
+    if _user_role(users[user]) == 'admin' and len(admins) <= 1:
+        return err('cannot delete the last admin')
+    del users[user]
+    save_config(cfg)
+    g.audit_target = 'user:%s (deleted)' % user
+    return jsonify({'success': True})
+
+
 # ─── Routes: node registry (enrollment) ───────────────────────────────
 @app.route('/api/nodes')
 def nodes_list():
     return jsonify({'nodes': [_public_node(n) for n in load_nodes().get('nodes', [])]})
+
+
+@app.route('/api/host-types')
+def host_types():
+    """UI descriptors for every registered host type — the Add/Edit modals
+    build their type dropdown + credential fields from this, so a new adapter
+    module shows up in the UI with zero SPA changes."""
+    return jsonify({'types': adapters.descriptors()})
 
 
 @app.route('/api/nodes/test', methods=['POST'])
@@ -519,11 +462,18 @@ def nodes_test():
     m = info.pop('metrics', None)  # don't ship the full inventory in a test
     resp = {'success': True, 'host_type': host_type, **info}
     if m:  # a polled probe — surface a quick count instead of role/version
-        if 'pool_count' in m:  # NAS probe
+        if 'pool_count' in m:          # NAS probe
             resp['metrics'] = {'pool_count': m.get('pool_count'),
                                'pools_degraded': m.get('pools_degraded'),
                                'disk_count': m.get('disk_count')}
-        else:                  # virt probe
+        elif 'cluster_healthy' in m:   # sparkdash probe (snapshot)
+            resp['metrics'] = {'node_count': m.get('node_count'),
+                               'cluster_healthy': bool(m.get('cluster_healthy')),
+                               'model': (m.get('vllm') or {}).get('model')}
+        elif m.get('agent') == 'nexus-agent':   # bare-host agent probe
+            resp['metrics'] = {'mount_count': len(m.get('mounts') or []),
+                               'hostname': m.get('hostname'), 'os': m.get('os')}
+        else:                          # virt probe
             resp['metrics'] = {'host_count': m.get('host_count'), 'vm_count': m.get('vm_count'),
                                'vm_running_count': m.get('vm_running_count')}
     return jsonify(resp)
@@ -702,405 +652,90 @@ def node_delete(node_id):
     return jsonify({'success': True})
 
 
+@app.route('/api/nodes/<node_id>/cert', methods=['GET'])
+def node_cert(node_id):
+    """Compare a node's pinned TLS fingerprint against the certificate it is
+    serving *right now*. Admin-only. Lets an operator review a cert change
+    out-of-band before deciding whether to re-pin. An http:// host has no
+    certificate to pin."""
+    n = _find_node(node_id)
+    if not n:
+        return err('node not found', 404)
+    pinned = n.get('cert_fp')
+    if not (n.get('base_url') or '').lower().startswith('https'):
+        return jsonify({'scheme': 'http', 'pinned': pinned, 'observed': None,
+                        'match': None, 'note': 'plain HTTP — no certificate to pin'})
+    host, port = _split_host_port(n['base_url'])
+    observed = error = None
+    try:
+        observed = cert_fingerprint(host, port)
+    except Exception as e:
+        error = str(e)
+    return jsonify({
+        'scheme': 'https', 'host': host, 'port': port,
+        'pinned': pinned, 'observed': observed,
+        'match': (observed == pinned) if (observed and pinned) else None,
+        'error': error,
+    })
+
+
+@app.route('/api/nodes/<node_id>/repin', methods=['POST'])
+def node_repin(node_id):
+    """Accept a node's *current* TLS certificate as the new pin (TOFU re-trust).
+    Admin-only. The client echoes back the fingerprint it just reviewed as
+    `expected`; we re-capture the live cert and re-pin only if it still matches
+    what the admin saw — so a certificate that flips again between review and
+    click is rejected rather than blindly trusted."""
+    data = request.get_json() or {}
+    expected = (data.get('expected') or '').strip().lower().replace(':', '')
+    reg = load_nodes()
+    n = next((x for x in reg.get('nodes', []) if x.get('id') == node_id), None)
+    if not n:
+        return err('node not found', 404)
+    if not (n.get('base_url') or '').lower().startswith('https'):
+        return err('node uses plain HTTP — there is no certificate to pin', 400)
+    host, port = _split_host_port(n['base_url'])
+    try:
+        observed = cert_fingerprint(host, port)
+    except Exception as e:
+        return err('cannot reach %s:%s to read its certificate (%s)' % (host, port, e), 502)
+    if expected and observed != expected:
+        return err('the certificate changed again since you reviewed it '
+                   '(reviewed %s…, now serving %s…) — re-open and verify before re-pinning'
+                   % (expected[:16], observed[:16]), 409)
+    old = n.get('cert_fp')
+    if observed == old:
+        return jsonify({'success': True, 'cert_fp': observed, 'previous': old,
+                        'unchanged': True, 'node': _public_node(n)})
+    n['cert_fp'] = observed
+    save_nodes(reg)
+    with _fleet_lock:   # drop the cached error envelope so the row recovers now
+        _fleet_cache['ts'] = 0.0
+    adapters.evict_cache(node_id)  # clear any stale polled error envelope
+    g.audit_target = '%s cert re-pin %s… → %s…' % (n['name'], (old or 'none')[:16], observed[:16])
+    return jsonify({'success': True, 'cert_fp': observed, 'previous': old,
+                    'node': _public_node(n)})
+
+
 # ─── Fleet aggregation ────────────────────────────────────────────────
 _fleet_cache = {'ts': 0.0, 'data': None}
 _fleet_lock = threading.Lock()
 
 
-# ─── Host adapters — per-type probe / fetch / drill-in ────────────────
-# Every enrolled host has a `host_type`. The default 'nexus' adapter speaks the
-# Nexus Dashboard REST API (Bearer token + /api/*, systemd services, ZFS pools)
-# and proxies the node's own SPA for drill-in. Virtualization adapters
-# (proxmox/vmware) talk to a hypervisor API and normalize their metrics into the
-# SAME per-node envelope, so the fleet rollup, cards, and storage view work
-# across host types with little special-casing.
-def _base_envelope(node):
-    """Fields common to every host type's fan-out envelope."""
-    return {'id': node['id'], 'name': node['name'], 'base_url': node['base_url'],
-            'host_type': node.get('host_type', 'nexus'),
-            'type': node.get('type', 'Unknown'), 'type_pinned': node.get('type_pinned', False),
-            'tags': node.get('tags', []),
-            'capabilities': node.get('capabilities', []),
-            'token_role': node.get('role'),  # enrolled token's role (gates writes)
-            'version': node.get('version'), 'ok': False, 'error': None,
-            'summary': None, 'resources': None, 'used_bytes': 0, 'size_bytes': 0}
-
-
-class HostAdapter:
-    """Per-host-type strategy: how to probe at enroll, fetch for the fan-out, and
-    where the card's drill-in points. Subclasses normalize into `_base_envelope`."""
-    kind = 'nexus'
-    auth = 'token'   # credential model: 'token' (API token/key) or 'userpass'
-
-    def probe(self, base_url, creds):
-        """Enroll/test-connection: validate credentials + capture the cert
-        fingerprint; return identity (role/version/capabilities). Raises NodeError."""
-        raise NotImplementedError
-
-    def fetch(self, node):
-        """Fan-out: pull one host's status into an envelope. MUST NOT raise —
-        a single unreachable host must never crash the whole fleet view."""
-        raise NotImplementedError
-
-    def native_url(self, node):
-        """Where the card's 'Open dashboard' link points."""
-        return '/nodes/%s/' % node['id']
-
-
-class NexusAdapter(HostAdapter):
-    """A single-host Nexus Dashboard node, over its token-authed REST API."""
-    kind = 'nexus'
-
-    def probe(self, base_url, creds):
-        return probe_node(base_url, (creds or {}).get('token'))
-
-    def fetch(self, node):
-        """Pull one node's summary + resources. Never raises — returns an
-        envelope. Adds parsed storage bytes so the rollup can sum capacity."""
-        out = _base_envelope(node)
-        try:
-            client = NodeClient(node)
-            out['summary'] = client.get_json('summary')
-            try:
-                out['resources'] = client.get_json('system/resources')
-            except NodeError:
-                pass  # resources are best-effort
-            zfs = (out['summary'] or {}).get('zfs') or {}
-            out['used_bytes'] = parse_human_bytes(zfs.get('used'))
-            out['size_bytes'] = parse_human_bytes(zfs.get('size'))
-            # AI nodes: pull llama config + health (not in /api/summary) for the
-            # card and for AI/Mixed classification. Best-effort.
-            if 'llamacpp' in (node.get('capabilities') or []):
-                try:
-                    li = client.get_json('llama')
-                    try:
-                        li['health'] = client.get_json('llama/health')
-                    except NodeError:
-                        li['health'] = {'ok': False}
-                    # Only surface llama on nodes that actually run/serve it — a
-                    # storage node with the module merely toggled on (no model
-                    # configured) shouldn't show a 'down' AI card.
-                    if li.get('configured') or _serves_ai(li):
-                        out['llama'] = li
-                except NodeError:
-                    pass
-            out['ok'] = True
-            # Refresh version + capabilities straight from the node so the
-            # registry self-heals — no manual "test connection" / token re-entry
-            # to update the version column after a node upgrade. Best-effort.
-            try:
-                me = client.get_json('me')
-                if me.get('version'):
-                    out['version'] = me['version']
-                if isinstance(me.get('capabilities'), list):
-                    out['capabilities'] = me['capabilities']
-            except NodeError:
-                pass
-            out['type_auto'] = classify_node(out['summary'], out.get('capabilities'), out.get('llama'))
-        except NodeError as e:
-            out['error'] = str(e)
-        except Exception as e:
-            # Defense in depth: one node must never crash the whole fan-out.
-            out['error'] = str(e)
-        return out
-
-
-def build_virt_envelope(node, metrics):
-    """Map a collector metric dict (see collectors/*.build_metrics) into the
-    fan-out envelope. Pure → unit-tested. Splits LXC containers out of the VM
-    list (Proxmox tags them 'lxc-…'); VMware has none. Populates `resources`
-    and used/size bytes so the existing CPU/Mem meters + storage rollup light up
-    for virt hosts unchanged."""
-    out = _base_envelope(node)
-    vms = metrics.get('vms') or []
-    is_ct = lambda v: str(v.get('vm_id', '')).startswith('lxc-')
-    running = lambda v: v.get('power_state') in ('running', 'poweredOn')
-    containers = [v for v in vms if is_ct(v)]
-    guests = [v for v in vms if not is_ct(v)]
-    out['ok'] = True
-    out['resources'] = {'cpu_pct': metrics.get('cpu_usage_percent'),
-                        'memory': {'pct': metrics.get('memory_usage_percent')}}
-    out['used_bytes'] = int((metrics.get('storage_used_gb') or 0) * 1024 ** 3)
-    out['size_bytes'] = int((metrics.get('storage_total_gb') or 0) * 1024 ** 3)
-    out['virt'] = {
-        'kind': node.get('host_type'),
-        'hosts': metrics.get('host_count') or 0,
-        'vms': len(guests), 'vms_running': sum(1 for v in guests if running(v)),
-        'containers': len(containers), 'containers_running': sum(1 for v in containers if running(v)),
-        'mem_used_gb': round(metrics.get('memory_used_gb') or 0, 1),
-        'mem_total_gb': round(metrics.get('memory_total_gb') or 0, 1),
-        'storage_used_gb': round(metrics.get('storage_used_gb') or 0, 1),
-        'storage_total_gb': round(metrics.get('storage_total_gb') or 0, 1),
-        'vm_list': vms,
-    }
-    out['type_auto'] = 'Virtualization'
-    return out
-
-
-def build_nas_envelope(node, metrics):
-    """Map a NAS collector metric dict (collectors/truenas.build_metrics) into the
-    fan-out envelope. Pure → unit-tested. Adds a `nas` block + `resources` +
-    used/size bytes so the CPU/Mem meters, storage rollup, and overview rows all
-    light up for a NAS the same way they do for nexus/virt hosts."""
-    out = _base_envelope(node)
-    out['ok'] = True
-    out['resources'] = {'cpu_pct': metrics.get('cpu_usage_percent'),
-                        'memory': {'pct': metrics.get('memory_usage_percent')}}
-    out['used_bytes'] = int((metrics.get('storage_used_gb') or 0) * 1024 ** 3)
-    out['size_bytes'] = int((metrics.get('storage_total_gb') or 0) * 1024 ** 3)
-    out['nas'] = {
-        'kind': node.get('host_type'),
-        'hostname': metrics.get('hostname'),
-        'model': metrics.get('model'),
-        'version': metrics.get('version'),
-        'pools': metrics.get('pool_count') or 0,
-        'pools_healthy': metrics.get('pools_healthy') or 0,
-        'pools_degraded': metrics.get('pools_degraded') or 0,
-        'disks': metrics.get('disk_count') or 0,
-        'alerts': metrics.get('alert_count') or 0,
-        'alert_list': metrics.get('alerts') or [],
-        'pool_list': metrics.get('pools') or [],
-        'storage_used_gb': round(metrics.get('storage_used_gb') or 0, 1),
-        'storage_total_gb': round(metrics.get('storage_total_gb') or 0, 1),
-    }
-    out['type_auto'] = 'Storage'
-    return out
-
-
-class VirtAdapter(HostAdapter):
-    """Base for hypervisor hosts (proxmox/vmware): username+password auth, cert
-    pinning, background polling into _virt_cache. Subclasses supply the collector
-    and the native-UI link. `fetch` (fan-out) reads the cache; `collect` (poller)
-    does the real hypervisor call."""
-    default_port = 443
-    auth = 'userpass'
-    default_type = 'Virtualization'   # fallback classification (see envelope)
-
-    def envelope(self, node, metrics):
-        """Collector metric dict → fan-out envelope (per host-type)."""
-        return build_virt_envelope(node, metrics)
-
-    def _collect_metrics(self, host, port, user, password, verify_ssl):
-        raise NotImplementedError
-
-    def probe(self, base_url, creds):
-        """Validate credentials by doing a real collect + capture the cert
-        fingerprint for pinning. Returns identity incl. the initial metrics so
-        the caller can seed the cache (no second connect)."""
-        creds = creds or {}
-        if not creds.get('username') or not creds.get('password'):
-            raise NodeError('username and password are required')
-        host, port = _split_host_port(base_url)
-        if not host:
-            raise NodeError('invalid base URL')
-        try:
-            fp = cert_fingerprint(host, port)
-        except (socket.error, ssl.SSLError, OSError) as e:
-            raise NodeError(f'cannot reach {host}:{port} ({e})')
-        try:
-            metrics = self._collect_metrics(host, port, creds['username'],
-                                             creds['password'], bool(creds.get('verify_ssl')))
-        except Exception as e:
-            raise NodeError(f'connection/credentials rejected: {e}')
-        return {'cert_fp': fp, 'role': None, 'version': None, 'fqdn': None,
-                'capabilities': [self.kind], 'metrics': metrics}
-
-    def collect(self, node):
-        """Poller entry point: verify the pinned cert, decrypt creds, poll the
-        hypervisor, and return an envelope. Never raises."""
-        try:
-            host, port = _split_host_port(node['base_url'])
-            if node.get('cert_fp'):
-                live = cert_fingerprint(host, port)
-                if live != node['cert_fp']:
-                    raise NodeError('certificate fingerprint changed for %s:%s '
-                                    '(pinned %s…, saw %s…)'
-                                    % (host, port, node['cert_fp'][:16], live[:16]))
-            pw = decrypt_secret(node.get('password_enc', '')) or ''
-            metrics = self._collect_metrics(host, port, node.get('username', ''),
-                                            pw, bool(node.get('verify_ssl')))
-            return self.envelope(node, metrics)
-        except Exception as e:
-            out = _base_envelope(node)
-            out['error'] = str(e)
-            out['type_auto'] = self.default_type
-            return out
-
-    def fetch(self, node):
-        """Fan-out: serve this host's last polled envelope from the cache."""
-        with _virt_lock:
-            entry = _virt_cache.get(node['id'])
-        if not entry:
-            out = _base_envelope(node)
-            out['error'] = 'awaiting first poll'
-            out['type_auto'] = self.default_type
-            return out
-        env = dict(entry['env'])
-        # Reflect live registry metadata (type/tags edits shouldn't wait a poll).
-        env['type'] = node.get('type', 'Virtualization')
-        env['type_pinned'] = node.get('type_pinned', False)
-        env['tags'] = node.get('tags', [])
-        env['stale'] = (time.time() - entry['ts']) > VIRT_POLL_INTERVAL * 3
-        return env
-
-    def native_url(self, node):
-        # Virt hosts serve their own native UI; the browser reaches it directly.
-        return node['base_url'] + '/'
-
-
-class ProxmoxAdapter(VirtAdapter):
-    kind = 'proxmox'
-    default_port = 8006
-
-    def _collect_metrics(self, host, port, user, password, verify_ssl):
-        from collectors import proxmox
-        return proxmox.collect_metrics(host, user, password, port=port, verify_ssl=verify_ssl)
-
-
-class VMwareAdapter(VirtAdapter):
-    """vSphere over pyVmomi. vCenter aggregates all managed ESXi hosts + VMs;
-    a standalone ESXi host reports just itself. Same collector for both — the
-    subclasses differ only in `kind` (host-type label)."""
-    default_port = 443
-
-    def _collect_metrics(self, host, port, user, password, verify_ssl):
-        from collectors import vmware
-        return vmware.collect_metrics(host, user, password, port=port, verify_ssl=verify_ssl)
-
-    def native_url(self, node):
-        return node['base_url'] + '/ui'   # vSphere / ESXi HTML5 client
-
-
-class VCenterAdapter(VMwareAdapter):
-    kind = 'vcenter'
-
-
-class ESXiAdapter(VMwareAdapter):
-    kind = 'esxi'
-
-
-class TrueNasAdapter(VirtAdapter):
-    """TrueNAS SCALE/CORE over the JSON-RPC 2.0 WebSocket API (REST v2.0 is removed
-    in TrueNAS 26.04). Reuses the virt background-poller + cert-pinning machinery,
-    but authenticates with an API key via ``auth.login_with_api_key`` (not
-    username/password), classifies as Storage, and normalizes into the `nas`
-    envelope. Read-only — the poller only ever calls read methods (+ one reporting
-    read)."""
-    kind = 'truenas'
-    default_port = 443
-    auth = 'token'
-    default_type = 'Storage'
-
-    def envelope(self, node, metrics):
-        return build_nas_envelope(node, metrics)
-
-    def probe(self, base_url, creds):
-        creds = creds or {}
-        token = (creds.get('token') or '').strip()
-        if not token:
-            raise NodeError('an API key is required')
-        host, port = _split_host_port(base_url)
-        if not host:
-            raise NodeError('invalid base URL')
-        try:
-            fp = cert_fingerprint(host, port)
-        except (socket.error, ssl.SSLError, OSError) as e:
-            raise NodeError(f'cannot reach {host}:{port} ({e})')
-        from collectors import truenas
-        try:
-            metrics = truenas.collect_metrics(host, token, port=port,
-                                              verify_ssl=bool(creds.get('verify_ssl')))
-        except Exception as e:
-            raise NodeError(f'connection/API key rejected: {e}')
-        return {'cert_fp': fp, 'role': None, 'version': metrics.get('version'),
-                'fqdn': metrics.get('hostname'), 'capabilities': [self.kind],
-                'metrics': metrics}
-
-    def collect(self, node):
-        try:
-            host, port = _split_host_port(node['base_url'])
-            if node.get('cert_fp'):
-                live = cert_fingerprint(host, port)
-                if live != node['cert_fp']:
-                    raise NodeError('certificate fingerprint changed for %s:%s '
-                                    '(pinned %s…, saw %s…)'
-                                    % (host, port, node['cert_fp'][:16], live[:16]))
-            from collectors import truenas
-            tok = decrypt_secret(node.get('token_enc', '')) or ''
-            metrics = truenas.collect_metrics(host, tok, port=port,
-                                              verify_ssl=bool(node.get('verify_ssl')))
-            return build_nas_envelope(node, metrics)
-        except Exception as e:
-            out = _base_envelope(node)
-            out['error'] = str(e)
-            out['type_auto'] = self.default_type
-            return out
-
-    def native_url(self, node):
-        return node['base_url'] + '/ui/dashboard'   # TrueNAS SCALE web UI
-
-
-ADAPTERS = {a.kind: a for a in
-            (NexusAdapter(), ProxmoxAdapter(), VCenterAdapter(), ESXiAdapter(),
-             TrueNasAdapter())}
-
-
-def _adapter_for(node):
-    """Resolve a host's adapter; records without a host_type are nexus nodes."""
-    return ADAPTERS.get(node.get('host_type') or 'nexus', ADAPTERS['nexus'])
-
-
-def _probe_host(host_type, base_url, creds):
-    """Adapter-aware enroll/test probe. Raises NodeError on unknown type."""
-    adapter = ADAPTERS.get(host_type or 'nexus')
-    if not adapter:
-        raise NodeError('unknown host type: %s' % host_type)
-    return adapter.probe(base_url, creds)
-
-
-# ─── Virtualization host polling (background) ─────────────────────────
-_virt_cache = {}          # node_id -> {'env': envelope, 'ts': float}
-_virt_lock = threading.Lock()
-
-
+# ─── Host adapters ────────────────────────────────────────────────────
+# Per-host-type probe/fetch/drill-in lives in the adapters/ package — one
+# self-describing module per host type (see adapters/__init__.py). Adding a
+# host type = adding a module there; the enroll modal builds itself from
+# /api/host-types.
 def _virt_seed_cache(node, metrics):
-    """Prime the cache from an enroll/edit probe's metrics so the card doesn't
-    show 'awaiting first poll' until the next background cycle."""
-    env = _adapter_for(node).envelope(node, metrics)
-    with _virt_lock:
-        _virt_cache[node['id']] = {'env': env, 'ts': time.time()}
-
-
-def _is_virt(node):
-    return (node.get('host_type') or 'nexus') != 'nexus'
-
-
-def _virt_poll_once():
-    nodes = [n for n in load_nodes().get('nodes', []) if _is_virt(n)]
-    ids = {n['id'] for n in nodes}
-    if nodes:
-        with ThreadPoolExecutor(max_workers=FANOUT_WORKERS) as pool:
-            futs = {pool.submit(_adapter_for(n).collect, n): n for n in nodes}
-            for fut in as_completed(futs):
-                n = futs[fut]
-                with _virt_lock:
-                    _virt_cache[n['id']] = {'env': fut.result(), 'ts': time.time()}
-    with _virt_lock:  # drop cache entries for removed hosts
-        for k in [k for k in _virt_cache if k not in ids]:
-            del _virt_cache[k]
-
-
-def _virt_poller_loop():
-    while True:
-        try:
-            _virt_poll_once()
-        except Exception:
-            pass  # a poll cycle must never kill the poller thread
-        time.sleep(VIRT_POLL_INTERVAL)
-
-
-def start_virt_poller():
-    threading.Thread(target=_virt_poller_loop, daemon=True, name='virt-poller').start()
+    """Prime the poll cache from an enroll/edit probe's metrics so the row
+    doesn't show 'awaiting first poll' until the next background cycle.
+    No-op for live-fetched types (e.g. the bare-host agent) — they have no
+    poll cache (and no envelope() on their adapter)."""
+    adapter = _adapter_for(node)
+    if not adapter.polled:
+        return
+    adapters.seed_cache(node['id'], adapter.envelope(node, metrics))
 
 
 def _fetch_one(node):
@@ -1127,7 +762,8 @@ def compute_rollup(results):
             continue
         healthy += 1
         s = r.get('summary') or {}
-        n_alerts = len(s.get('alerts') or [])
+        nas = r.get('nas') or {}         # NAS hosts report alerts/pool health here
+        n_alerts = len(s.get('alerts') or []) + (nas.get('alerts') or 0)
         alerts += n_alerts
         used += r.get('used_bytes', 0)
         size += r.get('size_bytes', 0)
@@ -1138,12 +774,37 @@ def compute_rollup(results):
         v = r.get('virt') or {}          # virt hosts: fold VM/CT counts into the rollup
         vms += (v.get('vms') or 0) + (v.get('containers') or 0)
         containers += v.get('containers') or 0
-        if n_alerts or down or zfs_bad or r.get('stale'):
+        i = r.get('instances') or {}     # nexus nodes running LXD (v2 Containers)
+        vms += (i.get('vms') or 0) + (i.get('containers') or 0)
+        containers += i.get('containers') or 0
+        if n_alerts or down or zfs_bad or nas.get('pools_degraded') or r.get('stale'):
             degraded += 1
     return {'total': len(results), 'healthy': healthy, 'unreachable': unreachable,
             'alerts': alerts, 'degraded': degraded, 'services_down': svc_down,
             'storage_used': used, 'storage_size': size,
             'vms': vms, 'containers': containers}
+
+
+def _version_tuple(v):
+    """'2.0.0' → (2, 0, 0); tolerant of prefixes/suffixes; unknown → (0,)."""
+    parts = re.findall(r'\d+', str(v or ''))
+    return tuple(int(p) for p in parts[:3]) or (0,)
+
+
+def flag_version_skew(results):
+    """Mark nexus envelopes whose dashboard version trails the fleet's newest
+    with version_lag = the newest version string. Pure → unit-tested. Virt/NAS
+    hosts have vendor versions and are ignored."""
+    nexus = [r for r in results
+             if r.get('ok') and (r.get('host_type') or 'nexus') == 'nexus' and r.get('version')]
+    if len(nexus) < 2:
+        return results
+    newest = max(nexus, key=lambda r: _version_tuple(r.get('version')))
+    top = _version_tuple(newest.get('version'))
+    for r in nexus:
+        if _version_tuple(r.get('version')) < top:
+            r['version_lag'] = newest.get('version')
+    return results
 
 
 def _build_fleet():
@@ -1177,9 +838,20 @@ def _build_fleet():
             dirty = True
     if dirty:
         save_nodes(reg)
+    flag_version_skew(results)
     results.sort(key=lambda r: r['name'].lower())
     return {'nodes': results, 'rollup': compute_rollup(results),
             'generated_at': datetime.now().astimezone().isoformat(timespec='seconds')}
+
+
+def _refresh_fleet():
+    """Build the fleet and store it in the shared cache. Used by the HTTP
+    endpoint and the background monitor so both share one recent snapshot."""
+    data = _build_fleet()
+    with _fleet_lock:
+        _fleet_cache['data'] = data
+        _fleet_cache['ts'] = time.time()
+    return data
 
 
 @app.route('/api/fleet/summary')
@@ -1189,10 +861,281 @@ def fleet_summary():
         age = time.time() - _fleet_cache['ts']
         if not fresh and _fleet_cache['data'] is not None and age < FLEET_CACHE_TTL:
             return jsonify({**_fleet_cache['data'], 'cached': True, 'cache_age': round(age, 1)})
-        data = _build_fleet()
-        _fleet_cache['data'] = data
-        _fleet_cache['ts'] = time.time()
+    data = _refresh_fleet()
     return jsonify({**data, 'cached': False, 'cache_age': 0})
+
+
+# ─── Notifications: monitor state transitions, POST to webhooks ────────
+# A background thread rebuilds the fleet every MONITOR_INTERVAL, diffs each
+# host's alertable conditions (monitoring.host_conditions) against the last
+# cycle, and posts state-transition events to the configured webhooks. Config
+# (incl. webhook URLs, which carry tokens) lives in the 0600 auth file.
+MONITOR_INTERVAL = int(os.environ.get('CONTROLLER_MONITOR_INTERVAL', '60'))
+# A condition must persist this many cycles before it fires (rides out a single
+# dropped poll); recovery notifies immediately.
+FLAP_CYCLES = int(os.environ.get('CONTROLLER_FLAP_CYCLES', '2'))
+# Don't re-fire the same (host, condition) within this window (flap guard).
+NOTIFY_COOLDOWN = int(os.environ.get('CONTROLLER_NOTIFY_COOLDOWN', '1800'))
+WEBHOOK_TIMEOUT = (5, 10)
+
+_mon = {'present_streak': {}, 'active': set(), 'last_fire': {}, 'seeded': False}
+_mon_lock = threading.Lock()
+
+
+def notify_config():
+    return load_config().get('notifications') or {'enabled': False, 'webhooks': []}
+
+
+def _mask_url(url):
+    """Show scheme://host/…path (hide query/tokens) for the config API."""
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(url)
+        tail = u.path if len(u.path) <= 24 else u.path[:23] + '…'
+        return f'{u.scheme}://{u.hostname}{tail}' + ('?…' if u.query else '')
+    except Exception:
+        return '(hidden)'
+
+
+def _public_notify_config():
+    cfg = notify_config()
+    hooks = []
+    for h in cfg.get('webhooks', []):
+        hooks.append({'id': h.get('id'), 'name': h.get('name'),
+                      'format': h.get('format', 'gchat'),
+                      'min_severity': h.get('min_severity', 'warning'),
+                      'url_display': _mask_url(h.get('url', ''))})
+    return {'enabled': bool(cfg.get('enabled')), 'webhooks': hooks,
+            'interval': MONITOR_INTERVAL}
+
+
+def send_webhook(hook, title, text):
+    """POST one event/digest to one webhook. Returns (ok, error)."""
+    try:
+        kw = monitoring.webhook_payload(hook.get('format'), title, text)
+        r = requests.post(hook['url'], timeout=WEBHOOK_TIMEOUT, **kw)
+        if r.status_code >= 300:
+            return False, 'HTTP %d' % r.status_code
+        return True, None
+    except requests.RequestException as e:
+        return False, str(e)
+
+
+def _dispatch(events):
+    """Send a batch of events to every enabled webhook that wants their
+    severity. Grouped into one message per webhook."""
+    cfg = notify_config()
+    if not cfg.get('enabled') or not events:
+        return
+    for hook in cfg.get('webhooks', []):
+        floor = monitoring.SEVERITY.get(hook.get('min_severity', 'warning'), 1)
+        # recoveries always pass (so an all-clear isn't filtered out)
+        want = [e for e in events
+                if e['kind'] == 'recovered'
+                or monitoring.SEVERITY.get(e['severity'], 3) <= floor]
+        if not want:
+            continue
+        title, text = monitoring.format_digest(want)
+        ok, err = send_webhook(hook, title, text)
+        if not ok:
+            print('notify: webhook %s failed: %s' % (hook.get('name'), err), flush=True)
+
+
+def _monitor_cycle(results):
+    """Diff this fan-out against the running state and dispatch transitions.
+    Debounced: FLAP_CYCLES to fire, immediate recovery, per-key cooldown."""
+    snap = monitoring.snapshot_conditions(results)
+    present = {(hid, key) for hid, e in snap.items() for key in e['conditions']}
+    now = time.time()
+    fire, recover = [], []
+    with _mon_lock:
+        streak = _mon['present_streak']
+        # advance streaks
+        for pk in present:
+            streak[pk] = streak.get(pk, 0) + 1
+        for pk in list(streak):
+            if pk not in present:
+                del streak[pk]
+        if not _mon['seeded']:
+            # first cycle after (re)start: adopt current state silently
+            _mon['active'] = set(present)
+            for pk in present:
+                _mon['last_fire'][pk] = now
+            _mon['seeded'] = True
+            return
+        # fire: present, stable, not already active, cooldown elapsed
+        for pk in present:
+            if pk in _mon['active'] or streak.get(pk, 0) < FLAP_CYCLES:
+                continue
+            if now - _mon['last_fire'].get(pk, 0) < NOTIFY_COOLDOWN:
+                continue
+            hid, key = pk
+            meta = snap[hid]['conditions'][key]
+            fire.append({'host_id': hid, 'host': snap[hid]['name'], 'key': key,
+                         'kind': 'firing', 'severity': meta['severity'], 'detail': meta['detail']})
+            _mon['active'].add(pk)
+            _mon['last_fire'][pk] = now
+        # recover: was active, now absent
+        for pk in list(_mon['active']):
+            if pk not in present:
+                hid, key = pk
+                name = (snap.get(hid) or {}).get('name', hid)
+                recover.append({'host_id': hid, 'host': name, 'key': key,
+                                'kind': 'recovered', 'severity': 'info',
+                                'detail': _COND_LABEL.get(key, key)})
+                _mon['active'].discard(pk)
+    _dispatch(fire + recover)
+
+
+_COND_LABEL = {'unreachable': 'reachable again', 'cert_changed': 'certificate re-pinned',
+               'alerts': 'alerts cleared', 'pool_degraded': 'pools healthy',
+               'cluster_unhealthy': 'cluster healthy', 'services_down': 'services back up',
+               'stale': 'polling again', 'version_lag': 'version in sync'}
+
+
+# ─── History store (lazy: importing app must not create a stray DB) ───
+_history = None
+_history_lock = threading.Lock()
+
+
+def get_history():
+    global _history
+    if _history is None:
+        with _history_lock:
+            if _history is None:
+                _history = history.HistoryStore(HISTORY_FILE, HISTORY_DAYS)
+    return _history
+
+
+def _monitor_loop():
+    while True:
+        try:
+            data = _refresh_fleet()
+            _monitor_cycle(data['nodes'])
+            try:
+                get_history().record(data['nodes'])
+            except Exception as e:
+                print('history: record failed: %s' % e, flush=True)
+        except Exception as e:
+            print('monitor: cycle failed: %s' % e, flush=True)
+        time.sleep(MONITOR_INTERVAL)
+
+
+@app.route('/api/history/spark')
+def history_spark():
+    """Compact recent CPU series per host for the Overview sparklines. One call
+    returns every host: {host_id: [v, …]} downsampled to `buckets` points over
+    the last `hours`."""
+    hours = min(168, max(1, float(request.args.get('hours', 6))))
+    buckets = min(60, max(4, int(request.args.get('buckets', 24))))
+    metric = request.args.get('metric', 'cpu')
+    hist = get_history()
+    out = {}
+    for n in load_nodes().get('nodes', []):
+        pts = hist.series(n['id'], hours, buckets, metric)
+        if pts:
+            out[n['id']] = [round(v, 1) if v is not None else None for _, v in pts]
+    return jsonify({'hours': hours, 'metric': metric, 'spark': out})
+
+
+@app.route('/api/history/summary')
+def history_summary():
+    """Per-host availability% + storage capacity forecast over `hours` (default
+    7 days), plus a fleet storage forecast. Feeds the Storage tab."""
+    hours = min(720, max(1, float(request.args.get('hours', 168))))
+    hist = get_history()
+    reg = load_nodes().get('nodes', [])
+    seen = {}
+    with _fleet_lock:
+        data = _fleet_cache['data']
+    for r in (data or {}).get('nodes', []):
+        seen[r['id']] = r
+    hosts = {}
+    fleet_pts, fleet_size, fleet_used = {}, 0, 0
+    for n in reg:
+        hid = n['id']
+        avail, nsamp = hist.availability(hid, hours)
+        r = seen.get(hid) or {}
+        size = int(r.get('size_bytes') or 0)
+        used = int(r.get('used_bytes') or 0)
+        fc = history.forecast_capacity(hist.storage_points(hid, hours), size, used) if size else None
+        hosts[hid] = {'availability': avail, 'samples': nsamp, 'forecast': fc}
+        for ts, u in hist.storage_points(hid, hours):
+            fleet_pts[ts] = fleet_pts.get(ts, 0) + u
+        fleet_size += size
+        fleet_used += used
+    fleet_fc = history.forecast_capacity(sorted(fleet_pts.items()), fleet_size, fleet_used) \
+        if fleet_size else None
+    return jsonify({'hours': hours, 'hosts': hosts, 'fleet': fleet_fc})
+
+
+@app.route('/api/history/<host_id>')
+def history_host(host_id):
+    """Full CPU+mem series for one host (detail view)."""
+    if not _find_node(host_id):
+        return err('node not found', 404)
+    hours = min(720, max(1, float(request.args.get('hours', 24))))
+    buckets = min(200, max(4, int(request.args.get('buckets', 96))))
+    hist = get_history()
+    return jsonify({
+        'host_id': host_id, 'hours': hours,
+        'cpu': [{'ts': ts, 'v': v} for ts, v in hist.series(host_id, hours, buckets, 'cpu')],
+        'mem': [{'ts': ts, 'v': v} for ts, v in hist.series(host_id, hours, buckets, 'mem')],
+        'availability': hist.availability(host_id, hours)[0],
+    })
+
+
+def start_monitor():
+    threading.Thread(target=_monitor_loop, daemon=True, name='monitor').start()
+
+
+@app.route('/api/notifications')
+def notifications_get():
+    return jsonify(_public_notify_config())
+
+
+@app.route('/api/notifications', methods=['POST'])
+def notifications_save():
+    """Replace notification config (admin). A webhook with a blank url keeps its
+    stored URL (so the masked display can be re-saved without re-entering the
+    token)."""
+    data = request.get_json() or {}
+    cfg = load_config()
+    existing = {h.get('id'): h for h in (cfg.get('notifications') or {}).get('webhooks', [])}
+    hooks = []
+    for h in data.get('webhooks', []):
+        hid = h.get('id') or secrets.token_hex(6)
+        url = (h.get('url') or '').strip()
+        if not url and hid in existing:
+            url = existing[hid]['url']   # keep stored token
+        if not url:
+            continue
+        fmt = h.get('format', 'gchat')
+        sev = h.get('min_severity', 'warning')
+        if sev not in monitoring.SEVERITY:
+            sev = 'warning'
+        hooks.append({'id': hid, 'name': (h.get('name') or 'webhook').strip(),
+                      'url': url, 'format': fmt, 'min_severity': sev})
+    cfg['notifications'] = {'enabled': bool(data.get('enabled')), 'webhooks': hooks}
+    save_config(cfg)
+    g.audit_target = 'notifications (%d webhook(s))' % len(hooks)
+    return jsonify({'success': True, **_public_notify_config()})
+
+
+@app.route('/api/notifications/test', methods=['POST'])
+def notifications_test():
+    """Send a test message to every configured webhook (admin)."""
+    cfg = notify_config()
+    hooks = cfg.get('webhooks', [])
+    if not hooks:
+        return err('no webhooks configured')
+    results = []
+    for h in hooks:
+        ok, e = send_webhook(h, 'Nexus Controller',
+                             '✅ Test notification — webhook *%s* is working.' % h.get('name'))
+        results.append({'name': h.get('name'), 'ok': ok, 'error': e})
+    g.audit_target = 'notifications-test'
+    return jsonify({'success': True, 'results': results})
 
 
 FLEET_ACTIONS = {'start', 'stop', 'restart', 'enable', 'disable'}
@@ -1229,17 +1172,27 @@ def fleet_action():
     service = (data.get('service') or '').strip()
     action = (data.get('action') or '').strip()
     node_ids = data.get('node_ids')
+    tags = data.get('tags')
     if action not in FLEET_ACTIONS:
         return err('invalid action (start/stop/restart/enable/disable)')
     if not RE_SERVICE.match(service):
         return err('invalid service name')
     nodes = load_nodes().get('nodes', [])
+    scope = 'all nodes'
+    # Explicit node_ids win; else an optional tag set narrows the fan-out to
+    # hosts bearing ANY of the given tags ("restart smbd on everything tagged
+    # prod"). No selector = every node that has the service.
     if isinstance(node_ids, list) and node_ids:
         wanted = set(node_ids)
         nodes = [n for n in nodes if n['id'] in wanted]
+        scope = '%d node(s)' % len(nodes)
+    elif isinstance(tags, list) and tags:
+        want = {str(t) for t in tags}
+        nodes = [n for n in nodes if want & set(n.get('tags') or [])]
+        scope = 'tag(s) ' + ','.join(sorted(want))
     if not nodes:
         return err('no matching nodes', 404)
-    g.audit_target = 'fleet %s/%s [%d node(s)]' % (service, action, len(nodes))
+    g.audit_target = 'fleet %s/%s [%s → %d node(s)]' % (service, action, scope, len(nodes))
     results = []
     with ThreadPoolExecutor(max_workers=FANOUT_WORKERS) as pool:
         futs = [pool.submit(_proxy_service_action, n, service, action) for n in nodes]
@@ -1249,8 +1202,38 @@ def fleet_action():
         _fleet_cache['ts'] = 0.0
     results.sort(key=lambda r: r['name'].lower())
     ok = sum(1 for r in results if r['ok'])
-    return jsonify({'service': service, 'action': action, 'ok': ok,
+    return jsonify({'service': service, 'action': action, 'scope': scope, 'ok': ok,
                     'failed': len(results) - ok, 'results': results})
+
+
+VM_ACTIONS = {'start', 'stop', 'shutdown', 'reboot'}
+
+
+@app.route('/api/nodes/<node_id>/vm/<vm_id>/<action>', methods=['POST'])
+def vm_action(node_id, vm_id, action):
+    """Guest (VM/CT) lifecycle action on a virtualization host — start / stop /
+    shutdown / reboot. Operator+ (viewer is blocked upstream). Delegates to the
+    host adapter (Proxmox/VMware), which re-verifies the pinned cert before the
+    write. Best-effort power ops only; no create/destroy from the console."""
+    if action not in VM_ACTIONS:
+        return err('invalid action (start/stop/shutdown/reboot)')
+    node = _find_node(node_id)
+    if not node:
+        return err('node not found', 404)
+    adapter = _adapter_for(node)
+    if not getattr(adapter, 'supports_write', False):
+        return err('host type %r does not support guest actions' % node.get('host_type'), 400)
+    try:
+        task = adapter.vm_action(node, vm_id, action)
+    except NodeError as e:
+        return err(str(e), 502)
+    except Exception as e:   # defense in depth: never 500 on a hypervisor hiccup
+        return err('action failed: %s' % e, 502)
+    with _fleet_lock:        # next poll reflects the new power state
+        _fleet_cache['ts'] = 0.0
+    adapters.evict_cache(node_id)
+    g.audit_target = '%s guest %s → %s' % (node['name'], vm_id, action)
+    return jsonify({'success': True, 'task': str(task), 'action': action})
 
 
 # ─── Drill-in: reverse-proxy a node's own SPA + API ───────────────────
@@ -1261,25 +1244,31 @@ _HOP_HEADERS = {'content-encoding', 'transfer-encoding', 'connection',
 
 def render_drillin_html(html, node_id):
     """Retarget the node's own index.html to run through the controller:
-    inject a fetch-shim rewriting /api/* to the proxy, and point the one static
-    asset reference at the controller's node-static proxy. Pure → unit-tested."""
+    inject a fetch-shim rewriting /api/* to the proxy, a WebSocket-shim
+    rewriting /ws/* to the controller's ws bridge (the v2 node's Containers
+    console is a websocket), and point static asset references at the
+    controller's node-static proxy. Pure → unit-tested."""
     base = '/nodes/%s' % node_id
     html = html.replace('href="/static/', 'href="%s/static/' % base)
     html = html.replace('src="/static/', 'src="%s/static/' % base)
     shim = ('<script>(function(){var P="/api/nodes/%s/proxy/";'
             'var f=window.fetch;window.fetch=function(u,o){'
             'if(typeof u==="string"&&u.indexOf("/api/")===0){u=P+u.slice(5);}'
-            'return f.call(this,u,o);};})();</script>') % node_id
+            'return f.call(this,u,o);};'
+            # The node SPA builds ws URLs as (ws|wss)://<location.host>/ws/…,
+            # which lands on the CONTROLLER's host — rewrite the path to the
+            # per-node bridge. Also handle a bare "/ws/…" path.
+            'var W=window.WebSocket,B="/nodes/%s/ws/";'
+            'function r(u){if(typeof u!=="string")return u;'
+            'var m=u.match(/^(wss?:\\/\\/[^\\/]+)\\/ws\\/(.*)$/);'
+            'if(m)return m[1]+B+m[2];'
+            'if(u.indexOf("/ws/")===0)return B+u.slice(4);return u;}'
+            'window.WebSocket=function(u,p){return p===undefined?new W(r(u)):new W(r(u),p);};'
+            'window.WebSocket.prototype=W.prototype;'
+            '})();</script>') % (node_id, node_id)
     if '<head>' in html:
         return html.replace('<head>', '<head>' + shim, 1)
     return shim + html
-
-
-def _node_raw_get(node, path):
-    """GET an arbitrary (non-/api) path on a node, cert-pin enforced."""
-    client = NodeClient(node)
-    client._verify_pin()
-    return requests.get(client.base_url + path, verify=False, timeout=NODE_TIMEOUT)
 
 
 @app.route('/nodes/<node_id>/')
@@ -1289,8 +1278,8 @@ def node_drillin(node_id):
     if not node:
         return err('node not found', 404)
     try:
-        r = _node_raw_get(node, '/')
-    except (NodeError, requests.RequestException) as e:
+        r = NodeClient(node).raw_get('/')
+    except NodeError as e:
         return Response('<h2>Drill-in unavailable</h2><p>%s</p>'
                         '<p><a href="/">&larr; back to fleet</a></p>' % str(e), status=502,
                         content_type='text/html')
@@ -1304,8 +1293,8 @@ def node_static(node_id, subpath):
     if not node:
         return err('node not found', 404)
     try:
-        r = _node_raw_get(node, '/static/' + subpath)
-    except (NodeError, requests.RequestException) as e:
+        r = NodeClient(node).raw_get('/static/' + subpath)
+    except NodeError as e:
         return err(str(e), 502)
     return Response(r.content, status=r.status_code,
                     content_type=r.headers.get('Content-Type', 'application/octet-stream'))
@@ -1321,27 +1310,127 @@ def node_proxy(node_id, subpath):
     if not node:
         return err('node not found', 404)
     g.audit_target = '%s:/api/%s' % (node['name'], subpath)
-    client = NodeClient(node)
-    try:
-        client._verify_pin()
-    except NodeError as e:
-        return err(str(e), 502)
     qs = request.query_string.decode()
-    url = '%s/api/%s%s' % (client.base_url, subpath, ('?' + qs if qs else ''))
+    path = subpath + ('?' + qs if qs else '')
     headers = {}
-    if client.token:
-        headers['Authorization'] = 'Bearer ' + client.token
     ct = request.headers.get('Content-Type')
     if ct:
         headers['Content-Type'] = ct
     body = request.get_data()
     try:
-        resp = requests.request(request.method, url, headers=headers,
-                                data=body if body else None, verify=False, timeout=PROXY_TIMEOUT)
-    except requests.RequestException as e:
+        resp = NodeClient(node).request(request.method, path, headers=headers,
+                                        data=body if body else None,
+                                        timeout=PROXY_TIMEOUT)
+    except NodeError as e:
         return err('proxy to node failed: %s' % e, 502)
     out = [(k, v) for k, v in resp.headers.items() if k.lower() not in _HOP_HEADERS]
     return Response(resp.content, status=resp.status_code, headers=out)
+
+
+# ─── Drill-in websocket bridge (node Containers console) ───────────────
+sock = Sock(app)
+
+
+def _pinned_ws_connect(node, path):
+    """Open a websocket to the node with the enrolled bearer token, pinning the
+    TLS cert in-handshake: we establish TLS ourselves, verify the fingerprint
+    BEFORE any HTTP bytes (incl. the Authorization header) are sent, then hand
+    the socket to websocket-client for the upgrade (ws:// skips its own wrap)."""
+    import ssl as _ssl
+    import hashlib as _hashlib
+    import websocket as wsclient
+    host, port = _split_host_port(node['base_url'])
+    ctx = _ssl._create_unverified_context()
+    raw = socket.create_connection((host, port), timeout=NODE_TIMEOUT[0])
+    try:
+        tls = ctx.wrap_socket(raw, server_hostname=host)
+    except OSError:
+        raw.close()
+        raise
+    try:
+        fp = _hashlib.sha256(tls.getpeercert(binary_form=True)).hexdigest()
+        if node.get('cert_fp') and fp != node['cert_fp']:
+            raise NodeError('certificate fingerprint changed for %s:%s '
+                            '(pinned %s…, saw %s…)'
+                            % (host, port, node['cert_fp'][:16], fp[:16]))
+        tls.settimeout(15)
+        token = decrypt_secret(node.get('token_enc', '')) or ''
+        ws = wsclient.create_connection(
+            'ws://%s:%s%s' % (host, port, path), socket=tls,
+            header=['Authorization: Bearer ' + token],
+            enable_multithread=True, timeout=None)
+    except Exception:
+        tls.close()
+        raise
+    return ws
+
+
+@sock.route('/nodes/<node_id>/ws/<path:subpath>')
+def node_ws(ws, node_id, subpath):
+    """Bridge a browser websocket (drill-in) to the node's websocket with the
+    node's token attached server-side — the browser never sees it. The node
+    still enforces its own auth/role on the connection (its console requires an
+    admin token). require_login already authenticated the controller session."""
+    node = _find_node(node_id)
+    if not node:
+        try:
+            ws.send(json.dumps({'type': 'error', 'error': 'node not found'}))
+        finally:
+            ws.close()
+        return
+    qs = request.query_string.decode()
+    path = '/ws/' + subpath + ('?' + qs if qs else '')
+    try:
+        upstream = _pinned_ws_connect(node, path)
+    except Exception as e:
+        try:
+            ws.send(json.dumps({'type': 'error', 'error': 'bridge: %s' % e}))
+        finally:
+            ws.close()
+        return
+    audit_line('WS', request.path, '%s:%s' % (node['name'], path.split('?')[0]), 101)
+    stop = threading.Event()
+
+    def pump_node_to_browser():
+        try:
+            while not stop.is_set():
+                data = upstream.recv()
+                if data is None or data == '' or data == b'':
+                    break
+                ws.send(data)
+        except Exception:
+            pass
+        finally:
+            stop.set()
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=pump_node_to_browser, daemon=True)
+    t.start()
+    try:
+        while not stop.is_set():
+            msg = ws.receive(timeout=30)
+            if msg is None:
+                continue
+            if isinstance(msg, str):
+                upstream.send(msg)          # JSON control/stdin frames
+            else:
+                upstream.send_binary(msg)
+    except Exception:
+        pass
+    finally:
+        stop.set()
+        for c in (upstream,):
+            try:
+                c.close()
+            except Exception:
+                pass
+        try:
+            ws.close()
+        except Exception:
+            pass
 
 
 # ─── TLS certificate management (cryptography lib — no openssl) ────────
@@ -1524,13 +1613,46 @@ def cli_set_password(argv):
 def main():
     cfg = ensure_bootstrap()
     app.secret_key = cfg['secret_key']
-    ssl_ctx = None
     if TLS_ENABLED:
         ensure_tls_cert()
-        ssl_ctx = (TLS_CERT, TLS_KEY)
-    start_virt_poller()  # background polling for any enrolled proxmox/vmware hosts
     print(f'Nexus Controller v{APP_VERSION} on {"https" if TLS_ENABLED else "http"}://0.0.0.0:{PORT}', flush=True)
-    app.run(host='0.0.0.0', port=PORT, ssl_context=ssl_ctx, threaded=True)
+    try:
+        from gunicorn.app.base import BaseApplication
+    except ImportError:
+        # Dev fallback: werkzeug's threaded server (fine locally; the container
+        # and installer always have gunicorn from requirements.txt).
+        start_virt_poller()
+        start_monitor()
+        app.run(host='0.0.0.0', port=PORT, threaded=True,
+                ssl_context=(TLS_CERT, TLS_KEY) if TLS_ENABLED else None)
+        return
+
+    class Controller(BaseApplication):
+        """Embedded gunicorn so `python app.py` stays the one entrypoint (the
+        Dockerfile, systemd unit, and CLI subcommands are unchanged).
+        MUST stay a single worker: the fleet/virt caches and the poller are
+        in-process state. gthread worker = websocket-capable (flask-sock)."""
+
+        def load_config(self):
+            self.cfg.set('bind', '0.0.0.0:%d' % PORT)
+            self.cfg.set('workers', 1)
+            self.cfg.set('worker_class', 'gthread')
+            self.cfg.set('threads', int(os.environ.get('CONTROLLER_THREADS', '16')))
+            self.cfg.set('timeout', 120)
+            self.cfg.set('accesslog', None)
+            if TLS_ENABLED:
+                self.cfg.set('certfile', TLS_CERT)
+                self.cfg.set('keyfile', TLS_KEY)
+            # Background threads must live in the WORKER process, not the master.
+            def _post_fork(server, worker):
+                start_virt_poller()
+                start_monitor()
+            self.cfg.set('post_fork', _post_fork)
+
+        def load(self):
+            return app
+
+    Controller().run()
 
 
 def cli_install_cert(argv):

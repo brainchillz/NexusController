@@ -33,6 +33,8 @@
       <span id="updated" class="muted small"></span>
       <span id="whoami" class="muted"></span>
       <button class="ghost" onclick="openAdd()" id="addBtn">+ Add Node</button>
+      <button class="ghost" onclick="openNotify()" id="notifyBtn" title="Notifications">🔔 Notify</button>
+      <button class="ghost" onclick="openUsers()" id="usersBtn" title="Users">👥 Users</button>
       <button class="ghost" onclick="openCert()" id="certBtn" title="TLS certificate">🔒 Cert</button>
       <button class="ghost" onclick="refresh()">Refresh</button>
       <button class="ghost" onclick="doLogout()">Sign out</button>
@@ -49,18 +51,12 @@
     <div class="modal-card">
       <h2>Add Host</h2>
       <label>Host type
-        <select id="nd-htype" onchange="updateAddFields()">
-          <option value="nexus">Nexus Dashboard node</option>
-          <option value="proxmox">Proxmox VE</option>
-          <option value="vcenter">VMware vCenter</option>
-          <option value="esxi">VMware ESXi (standalone)</option>
-          <option value="truenas">TrueNAS (SCALE / CORE)</option>
-        </select>
+        <!-- options are built from /api/host-types (adapter descriptors) -->
+        <select id="nd-htype" onchange="updateAddFields()"></select>
       </label>
       <label>Name <input id="nd-name" placeholder="silo"></label>
-      <label>Base URL <input id="nd-url" placeholder="https://192.168.1.10:8443"></label>
-      <label class="nd-token">API token <input id="nd-token" type="password" placeholder="sd_…"></label>
-      <label class="nd-key">API key <input id="nd-key" type="password" placeholder="1-…"></label>
+      <label>Base URL <input id="nd-url" placeholder="https://192.168.1.88:8443"></label>
+      <label class="nd-secret"><span id="nd-secret-l">API token</span> <input id="nd-secret" type="password"></label>
       <label class="nd-userpass">Username <input id="nd-user" placeholder="root@pam"></label>
       <label class="nd-userpass">Password <input id="nd-pass" type="password" placeholder="host account password"></label>
       <label class="nd-verify check"><input id="nd-verify" type="checkbox"> Verify the host's TLS certificate</label>
@@ -94,8 +90,7 @@
           <option value="Unknown">Unknown</option>
         </select>
       </label>
-      <label class="ed-token">New API token <input id="ed-token" type="password" placeholder="leave blank to keep current token"></label>
-      <label class="ed-key">New API key <input id="ed-key" type="password" placeholder="leave blank to keep current key"></label>
+      <label class="ed-secret"><span id="ed-secret-l">New API token</span> <input id="ed-secret" type="password" placeholder="leave blank to keep the current one"></label>
       <label class="ed-userpass">Username <input id="ed-user" placeholder="root@pam"></label>
       <label class="ed-userpass">New password <input id="ed-pass" type="password" placeholder="leave blank to keep current password"></label>
       <label class="ed-verify check"><input id="ed-verify" type="checkbox"> Verify the host's TLS certificate</label>
@@ -143,6 +138,74 @@
     </div>
   </div>
 
+  <!-- Node cert re-pin dialog -->
+  <div id="repinModal" class="modal" style="display:none">
+    <div class="modal-card wide">
+      <div class="row"><h2 style="margin:0;flex:1">Certificate review — <span id="rp-name"></span></h2>
+        <button class="x" onclick="closeRepin()">×</button></div>
+      <p class="muted small">This host is now serving a <b>different TLS certificate</b> than the one
+        pinned at enrollment. This is expected after a certificate renewal or reinstall — but it can
+        also mean a man-in-the-middle. <b>Verify the new fingerprint out-of-band</b> (on the host
+        itself) before you re-pin.</p>
+      <div id="rp-body" class="small" style="margin:10px 0">Reading certificate…</div>
+      <div id="rp-msg" class="small" style="min-height:18px"></div>
+      <div class="row end">
+        <button class="ghost" onclick="closeRepin()">Cancel</button>
+        <button id="rp-accept" onclick="doRepin()" disabled>Re-pin (trust new certificate)</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Guests (VM/CT) console -->
+  <div id="guestsModal" class="modal" style="display:none">
+    <div class="modal-card wide">
+      <div class="row"><h2 style="margin:0;flex:1">Guests · <span id="gs-node"></span></h2>
+        <button class="x" onclick="closeGuests()">×</button></div>
+      <div id="gs-msg" class="small" style="min-height:18px"></div>
+      <div id="gs-body" style="max-height:60vh;overflow:auto"></div>
+    </div>
+  </div>
+
+  <!-- Notifications dialog -->
+  <div id="notifyModal" class="modal" style="display:none">
+    <div class="modal-card wide">
+      <div class="row"><h2 style="margin:0;flex:1">Notifications</h2>
+        <button class="x" onclick="closeNotify()">×</button></div>
+      <p class="muted small">Post fleet state changes (host down/up, degraded pool, alerts,
+        certificate change, version drift) to a chat webhook. Supports Google&nbsp;Chat, Slack,
+        Discord, ntfy, and Gotify.</p>
+      <label class="check"><input id="nf-enabled" type="checkbox"> Enable notifications</label>
+      <div id="nf-hooks"></div>
+      <div class="row"><button class="ghost" onclick="addHook()">+ Add webhook</button>
+        <button class="ghost" onclick="testNotify()">Send test</button>
+        <span id="nf-msg" class="muted small"></span></div>
+      <div id="nf-err" class="err"></div>
+      <div class="row end">
+        <button class="ghost" onclick="closeNotify()">Cancel</button>
+        <button onclick="saveNotify()">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Users dialog -->
+  <div id="usersModal" class="modal" style="display:none">
+    <div class="modal-card wide">
+      <div class="row"><h2 style="margin:0;flex:1">Controller Users</h2>
+        <button class="x" onclick="closeUsers()">×</button></div>
+      <p class="muted small"><b>admin</b> manages nodes + full control · <b>operator</b> controls
+        (no enroll/remove) · <b>viewer</b> is read-only.</p>
+      <table class="tbl"><thead><tr><th>User</th><th>Role</th><th></th></tr></thead>
+        <tbody id="us-rows"></tbody></table>
+      <div class="row" style="margin-top:12px;flex-wrap:wrap">
+        <input id="us-name" placeholder="username" style="width:130px">
+        <select id="us-role" style="width:auto"><option>viewer</option><option>operator</option><option>admin</option></select>
+        <input id="us-pass" type="password" placeholder="initial password" style="width:170px">
+        <button onclick="addUser()">Add user</button>
+      </div>
+      <div id="us-msg" class="small" style="min-height:18px"></div>
+    </div>
+  </div>
+
 <script>
 const API = {
   async req(method, path, body) {
@@ -167,15 +230,24 @@ function showApp(){show('login',false);show('app',true);}
 function hbytes(n){ n=Number(n)||0; const u=['B','K','M','G','T','P']; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;} return (i?n.toFixed(1):n)+u[i]; }
 
 let me = null, fleet = null, tab = 'overview', poller = null;
+let HT = {}, HT_ORDER = [];   // host-type descriptors from /api/host-types
+
+async function loadHostTypes(){
+  try{
+    const d = await API.get('host-types');
+    HT = {}; HT_ORDER = [];
+    (d.types||[]).forEach(t=>{ HT[t.kind]=t; HT_ORDER.push(t.kind); });
+  }catch(e){ /* modal falls back to nexus-only defaults */ }
+}
 
 async function boot(){
   try { me = await API.get('me'); }
   catch(e){ showLogin(); return; }
   showApp();
+  loadHostTypes();
   document.getElementById('whoami').textContent = me.user + ' · ' + me.role;
   const adminUI = me.role === 'admin' ? '' : 'none';
-  document.getElementById('addBtn').style.display = adminUI;
-  document.getElementById('certBtn').style.display = adminUI;
+  ['addBtn','certBtn','notifyBtn','usersBtn'].forEach(i=>document.getElementById(i).style.display = adminUI);
   setTab(tab);
   await refresh();
   startPoll();
@@ -184,8 +256,23 @@ async function boot(){
 async function doLogin(e){
   e.preventDefault();
   const u = document.getElementById('lg-user').value, p = document.getElementById('lg-pass').value;
-  try { await API.post('login', {username:u, password:p}); document.getElementById('lg-err').textContent=''; boot(); }
+  try {
+    const r = await API.post('login', {username:u, password:p});
+    document.getElementById('lg-err').textContent='';
+    if(r.must_change){ await forceChangePassword(p); }
+    boot();
+  }
   catch(err){ document.getElementById('lg-err').textContent = err.message; }
+}
+async function forceChangePassword(oldpw){
+  for(;;){
+    const np = prompt('This account must set a new password before continuing (min 8 chars):');
+    if(np===null) continue;              // can't skip
+    if(np.length < 8){ alert('Too short — at least 8 characters.'); continue; }
+    if(prompt('Confirm the new password:') !== np){ alert('Passwords did not match.'); continue; }
+    try{ await API.post('account/password', {old_password: oldpw, new_password: np}); return; }
+    catch(e){ alert(e.message); }
+  }
 }
 async function doLogout(){ try{await API.post('logout');}catch(e){} showLogin(); }
 
@@ -194,6 +281,7 @@ function startPoll(){ stopPoll(); poller = setInterval(()=>{ if(!document.hidden
 function stopPoll(){ if(poller){ clearInterval(poller); poller=null; } }
 document.addEventListener('visibilitychange', ()=>{ if(!document.hidden && me) loadFleet(false); });
 
+let sparks = {}, histSummary = null, histAt = 0;
 function refresh(){ return loadFleet(true); }   // manual → bypass cache
 async function loadFleet(fresh){
   let data;
@@ -202,7 +290,43 @@ async function loadFleet(fresh){
   fleet = data;
   const u = document.getElementById('updated');
   u.textContent = 'updated ' + new Date().toLocaleTimeString() + (data.cached ? ' (cached '+data.cache_age+'s)' : '');
+  loadSparks();   // background — re-renders when it lands
   renderRollup(); render();
+}
+async function loadSparks(){
+  try{ const d = await API.get('history/spark?hours=6&buckets=24'); sparks = d.spark||{}; if(tab==='overview') render(); }
+  catch(e){ /* history is best-effort */ }
+}
+// tiny inline SVG sparkline from a value array (0..100), gaps allowed
+function sparkline(vals){
+  const pts = (vals||[]).filter(v=>v!=null);
+  if(pts.length < 2) return '';
+  const w=58, h=16, n=vals.length, mx=100;
+  let d='', started=false;
+  vals.forEach((v,i)=>{ if(v==null){ started=false; return; }
+    const x=(i/(n-1))*w, y=h-(v/mx)*(h-2)-1;
+    d += (started?'L':'M')+x.toFixed(1)+' '+y.toFixed(1)+' '; started=true; });
+  const last = pts[pts.length-1];
+  const cls = last>=90?'bad':last>=75?'warn':'ok';
+  return '<svg class="spark" width="'+w+'" height="'+h+'" viewBox="0 0 '+w+' '+h+'" title="CPU, last 6h">'
+    + '<path d="'+d+'" fill="none" class="spark-'+cls+'" stroke-width="1.5"/></svg>';
+}
+async function loadHistSummary(force){
+  if(!force && histSummary && Date.now()-histAt < 30000) return histSummary;
+  try{ histSummary = await API.get('history/summary?hours=168'); histAt = Date.now(); }
+  catch(e){ histSummary = null; }
+  return histSummary;
+}
+function fmtForecast(fc){
+  if(!fc) return '';
+  if(fc.trend==='growing' && fc.days_to_full!=null){
+    const d = fc.days_to_full;
+    const t = d>=730 ? '~'+(d/365).toFixed(1)+'y' : d>=60 ? '~'+Math.round(d/30)+'mo' : '~'+Math.round(d)+'d';
+    const cls = d<=30?'bad':d<=90?'warn':'muted';
+    return ' · <span class="'+cls+'" title="at current growth ('+hbytes(fc.bytes_per_day)+'/day)">full in '+t+'</span>';
+  }
+  if(fc.trend==='shrinking') return ' · <span class="muted">shrinking</span>';
+  return '';
 }
 
 function renderRollup(){
@@ -222,6 +346,7 @@ function setTab(t){
   tab = t;
   document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active', b.dataset.tab===t));
   render();
+  if(t==='storage') loadHistSummary().then(()=>{ if(tab==='storage') render(); });
 }
 function render(){
   if(!fleet){ document.getElementById('view').innerHTML='<div class="muted">Loading fleet…</div>'; return; }
@@ -244,16 +369,41 @@ function category(n){
   if(n.type==='AI') return 'AI';
   return 'General';   // Mixed, Unknown, or anything unclassified
 }
+// ── Tag filter (overview) ──
+let tagFilter = new Set();
+function allTags(){
+  const s = new Set();
+  fleet.nodes.forEach(n => (n.tags||[]).forEach(t => s.add(t)));
+  return [...s].sort();
+}
+function matchesTags(n){
+  if(!tagFilter.size) return true;
+  const nt = new Set(n.tags||[]);
+  for(const t of tagFilter) if(nt.has(t)) return true;   // OR across selected tags
+  return false;
+}
+function toggleTag(t){ tagFilter.has(t) ? tagFilter.delete(t) : tagFilter.add(t); render(); }
+function clearTags(){ tagFilter.clear(); render(); }
+function tagBar(){
+  const tags = allTags();
+  if(!tags.length) return '';
+  const chips = tags.map(t=>'<span class="tagf'+(tagFilter.has(t)?' on':'')+'" onclick="toggleTag('+JSON.stringify(t)+')">'+esc(t)+'</span>').join('');
+  const clear = tagFilter.size ? '<span class="tagf clear" onclick="clearTags()">clear ✕</span>' : '';
+  return '<div class="tagbar"><span class="muted small">Tags:</span>'+chips+clear+'</div>';
+}
 function overviewView(){
   const groups={};
-  fleet.nodes.forEach(n=>{ const c=category(n); (groups[c]=groups[c]||[]).push(n); });
-  let html='';
+  fleet.nodes.filter(matchesTags).forEach(n=>{ const c=category(n); (groups[c]=groups[c]||[]).push(n); });
+  let html=tagBar();
+  let any=false;
   CAT_ORDER.forEach(c=>{
     const list=groups[c]; if(!list||!list.length) return;
+    any=true;
     html += '<div class="hgroup"><div class="hgroup-h">'+c+' <span class="muted">('+list.length+')</span></div>'
           + list.map(nodeRow).join('') + '</div>';
   });
-  return html || '<div class="muted">No hosts enrolled yet.</div>';
+  if(!any) html += '<div class="muted">'+(tagFilter.size?'No hosts match the selected tag(s).':'No hosts enrolled yet.')+'</div>';
+  return html;
 }
 function urlHost(u){ try{ return new URL(u).hostname; }catch(e){ return (u||'').replace(/^[a-z]+:\/\//,'').split(/[:\/]/)[0]; } }
 function chip(k,v,cls,title){ return '<span class="ck '+(cls||'')+'"'+(title?' title="'+esc(title)+'"':'')+'>'+esc(k)+' <b>'+esc(v)+'</b></span>'; }
@@ -270,11 +420,17 @@ function nodeRow(n){
   const s = n.summary||{}, res = n.resources||{};
   const alerts = (s.alerts||[]).length + (n.nas ? (n.nas.alerts||0) : 0);
   const nasBad = !!(n.nas && n.nas.pools_degraded);
+  const sparkBad = !!(n.spark && n.spark.healthy===false);
   const virt = !!(n.host_type && n.host_type!=='nexus');
   const awaiting = virt && !n.ok && /await/i.test(n.error||'');
-  const dot = n.ok ? ((alerts||n.stale||nasBad)?'warn':'ok') : (awaiting?'warn':'bad');
+  const dot = n.ok ? ((alerts||n.stale||nasBad||sparkBad)?'warn':'ok') : (awaiting?'warn':'bad');
   const rm = me && me.role==='admin';
-  const host = esc(urlHost(n.base_url)) + (n.version? ' · v'+esc(n.version) : '');
+  // version-skew warning: flagged server-side when a nexus node trails the
+  // fleet's newest dashboard version.
+  const ver = !n.version ? ''
+    : n.version_lag ? ' · <span class="warn" title="behind fleet — newest is v'+esc(n.version_lag)+'">v'+esc(n.version)+' ⚠</span>'
+    : ' · v'+esc(n.version);
+  const host = esc(urlHost(n.base_url)) + ver;
 
   let mid;
   if(!n.ok){
@@ -285,6 +441,7 @@ function nodeRow(n){
     if(n.size_bytes>0) mm.push(miniMeter('Store', n.used_bytes/n.size_bytes*100));
     if(res.cpu_pct!=null) mm.push(miniMeter('CPU', res.cpu_pct));
     if(res.memory && res.memory.pct!=null) mm.push(miniMeter('Mem', res.memory.pct));
+    if(sparks[n.id]) mm.push(sparkline(sparks[n.id]));
     let chips = [];
     if(n.virt){
       const v=n.virt;
@@ -296,6 +453,23 @@ function nodeRow(n){
       chips.push(chip('Pools', (x.pools||0)+(degr?' ⚠':' ✓'), degr?'bad':'',
                       degr? x.pools_degraded+' pool(s) degraded' : 'all pools healthy'));
       if(x.disks) chips.push(chip('Disks', x.disks));
+    } else if(n.agent){
+      const x=n.agent;
+      if(x.os) chips.push(chip('OS', x.os.length>24?x.os.slice(0,23)+'…':x.os, '', (x.os||'')+(x.kernel?' · '+x.kernel:'')));
+      if(x.mounts) chips.push(chip('Mounts', x.mounts, '',
+        (x.mount_list||[]).map(m=>m.mountpoint+' '+(m.percent!=null?m.percent+'%':'')).join(', ')));
+      if(x.load1!=null) chips.push(chip('load', x.load1));
+      if(x.uptime_seconds!=null) chips.push(chip('up', x.uptime_seconds>=172800 ? Math.floor(x.uptime_seconds/86400)+'d' : Math.floor(x.uptime_seconds/3600)+'h'));
+    } else if(n.spark){
+      const x=n.spark, down=(x.nodes||0)-(x.nodes_online||0);
+      chips.push(chip('Nodes', (x.nodes_online||0)+'/'+(x.nodes||0)+(down?' ⚠':' ✓'), down?'bad':'',
+                      x.node_list ? x.node_list.map(nd=>nd.name+(nd.online?'':' (offline)')).join(', ') : ''));
+      if(x.gpu_util_pct!=null) chips.push(chip('GPU', Math.round(x.gpu_util_pct)+'%'));
+      if(x.vram_used_mb) chips.push(chip('VRAM', (x.vram_used_mb/1024).toFixed(0)+'G'));
+      chips.push(chip('vLLM', x.vllm_healthy?'up':'down', x.vllm_healthy?'':'bad'));
+      if(x.model){ const m=String(x.model).split('/').pop();
+        chips.push(chip('model', m.length>22?m.slice(0,21)+'…':m, '', x.model)); }
+      if(x.recipe && !x.model) chips.push(chip('recipe', x.recipe, x.recipe_running?'':'bad'));
     } else {
       const zfs=s.zfs||{}, disks=s.disks||{};
       if(zfs.pools) chips.push(chip('ZFS', zfs.pools+' pool'+(zfs.pools>1?'s':'')+(zfs.online===false?' ⚠':''), zfs.online===false?'bad':''));
@@ -303,6 +477,9 @@ function nodeRow(n){
       if(has(n,'smb') && s.smb) chips.push(chip('SMB', s.smb.shares));
       if(has(n,'nfs') && s.nfs) chips.push(chip('NFS', s.nfs.exports));
       if(has(n,'iscsi') && s.iscsi) chips.push(chip('iSCSI', s.iscsi.targets));
+      if(n.instances && n.instances.total) chips.push(chip('CT',
+        (n.instances.running||0)+'/'+n.instances.total,
+        '', 'LXD instances (containers'+(n.instances.vms?' + '+n.instances.vms+' VM':'')+') running/total'));
       if(n.llama){ const h=n.llama.health||{}, up=!!h.ok, mt=h.metrics||{}, model=(n.llama.model||'').split('/').pop()||'(none)';
         chips.push(chip('llama', up?'up':'down', up?'':'bad'));
         chips.push(chip('model', model.length>18?model.slice(0,17)+'…':model, '', model));
@@ -317,8 +494,13 @@ function nodeRow(n){
   }
 
   const openUrl = virt ? esc(n.base_url)+'/' : '/nodes/'+esc(n.id)+'/';
-  const openLbl = n.nas ? 'Open UI ▸' : (virt ? 'Open console ▸' : 'Open dashboard ▸');
-  const actions = (n.ok? '<a class="btn-open" href="'+openUrl+'" target="_blank" rel="noopener">'+openLbl+'</a>':'')
+  const openLbl = (n.nas || n.spark) ? 'Open UI ▸' : (virt ? 'Open console ▸' : 'Open dashboard ▸');
+  const openable = n.host_type !== 'agent';   // the agent has no web UI
+  const certChanged = !n.ok && /fingerprint changed/i.test(n.error||'');
+  const hasGuests = !!(n.ok && n.virt && (n.virt.vm_list||[]).length);
+  const actions = (n.ok && openable ? '<a class="btn-open" href="'+openUrl+'" target="_blank" rel="noopener">'+openLbl+'</a>':'')
+    + (hasGuests ? '<button class="btn-open" title="View / control guests" onclick="openGuests(\''+esc(n.id)+'\')">🖥 Guests</button>' : '')
+    + (rm && certChanged ? '<button class="btn-open" style="border-color:var(--bad);color:var(--bad)" title="Certificate changed — review and re-pin" onclick="openRepin(\''+esc(n.id)+'\',\''+esc(n.name)+'\')">🔐 Review cert</button>' : '')
     + (rm ? '<button class="x edit" title="Edit" onclick="openEdit(\''+esc(n.id)+'\')">✎</button>'
           + '<button class="x" title="Remove" onclick="removeNode(\''+esc(n.id)+'\',\''+esc(n.name)+'\')">×</button>' : '');
 
@@ -355,6 +537,7 @@ function tr(cells,th){ const t=th?'th':'td'; return '<tr>'+cells.map(c=>'<'+t+'>
 // ── Storage view ──
 function storageView(){
   const r = fleet.rollup;
+  const hs = (histSummary && histSummary.hosts) || {};
   // Every host that reports capacity: nexus ZFS pools + proxmox/vmware datastores
   // (both populate used_bytes/size_bytes on the envelope).
   let rows = fleet.nodes.filter(n=>n.ok && n.size_bytes>0).map(n=>{
@@ -362,18 +545,23 @@ function storageView(){
     const z = (n.summary||{}).zfs||{};
     const label = n.nas ? ('ZFS '+n.nas.pools+' pool'+(n.nas.pools>1?'s':''))
                 : n.virt ? (n.virt.hosts+' host'+(n.virt.hosts>1?'s':''))
+                : n.spark ? (n.spark.nodes+' node'+(n.spark.nodes>1?'s':''))
+                : n.agent ? (n.agent.mounts+' mount'+(n.agent.mounts>1?'s':''))
                 : (z.pools ? 'ZFS '+z.pools+' pool'+(z.pools>1?'s':'') : '');
     const degr = ((n.nas && n.nas.pools_degraded) || z.online===false) ? ' · DEGRADED' : '';
+    const fc = fmtForecast((hs[n.id]||{}).forecast);
     return '<div class="srow"><div class="srow-h"><b>'+esc(n.name)+'</b><span class="muted">'
-      + esc(hbytes(used)+' / '+hbytes(size))+' · '+pct+'%'+degr+(label?' · '+esc(label):'')+'</span></div>'
+      + esc(hbytes(used)+' / '+hbytes(size))+' · '+pct+'%'+degr+(label?' · '+esc(label):'')+fc+'</span></div>'
       + '<div class="bar lg"><i class="'+(pct>=90?'bad':pct>=75?'warn':'ok')+'" style="width:'+pct+'%"></i></div></div>';
   });
   if(!rows.length) return '<div class="muted">No storage reported by any host.</div>';
   const tpct = r.storage_size ? Math.round(r.storage_used/r.storage_size*100) : 0;
+  const tfc = fmtForecast(histSummary && histSummary.fleet);
   const total = '<div class="srow total"><div class="srow-h"><b>Fleet total</b><span class="muted">'
-    + hbytes(r.storage_used)+' / '+hbytes(r.storage_size)+' · '+tpct+'%</span></div>'
+    + hbytes(r.storage_used)+' / '+hbytes(r.storage_size)+' · '+tpct+'%'+tfc+'</span></div>'
     + '<div class="bar lg"><i class="'+(tpct>=90?'bad':tpct>=75?'warn':'ok')+'" style="width:'+tpct+'%"></i></div></div>';
-  return total + '<div class="sgap"></div>' + rows.join('');
+  const note = (histSummary ? '' : '<p class="muted small">Capacity forecasts appear once a few hours of history accrue.</p>');
+  return total + note + '<div class="sgap"></div>' + rows.join('');
 }
 
 // ── Services matrix (clickable) + fleet-wide bulk bar ──
@@ -392,10 +580,16 @@ function servicesView(){
   // Bulk bar (operators+ only)
   let bulk = '';
   if (me.role !== 'viewer') {
+    const tags = allTags();
+    const tagSel = tags.length
+      ? '<span class="muted">on</span><select id="bk-tag"><option value="">all nodes</option>'
+        + tags.map(t=>'<option value="'+esc(t)+'">tag: '+esc(t)+'</option>').join('')+'</select>'
+      : '<input type="hidden" id="bk-tag" value="">';
     bulk = '<div class="bulk"><span class="muted">Fleet action:</span>'
       + '<select id="bk-svc">'+keys.map(k=>'<option value="'+esc(k)+'">'+esc(cols[k])+'</option>').join('')+'</select>'
       + '<select id="bk-act">'+ACTIONS.map(a=>'<option'+(a==='restart'?' selected':'')+'>'+a+'</option>').join('')+'</select>'
-      + '<button onclick="bulkAction()">Apply to all nodes with this service</button>'
+      + tagSel
+      + '<button onclick="bulkAction()">Apply</button>'
       + '<span id="bk-msg" class="muted small"></span></div>';
   }
 
@@ -453,11 +647,16 @@ async function loadLogs(){
 async function bulkAction(){
   const service = document.getElementById('bk-svc').value;
   const action = document.getElementById('bk-act').value;
+  const tagEl = document.getElementById('bk-tag');
+  const tag = tagEl ? tagEl.value : '';
   const msg = document.getElementById('bk-msg');
-  if(!confirm(action+' "'+service+'" on every node that has it?')) return;
+  const where = tag ? 'every node tagged "'+tag+'" that has it' : 'every node that has it';
+  if(!confirm(action+' "'+service+'" on '+where+'?')) return;
   msg.textContent = 'Running…';
   try{
-    const r = await API.post('fleet/action', {service, action});
+    const body = {service, action};
+    if(tag) body.tags = [tag];
+    const r = await API.post('fleet/action', body);
     const fails = r.results.filter(x=>!x.ok).map(x=>x.name+': '+(x.error||'?'));
     const summary = '<span class="'+(r.failed?'warn':'ok-txt')+'">'+r.ok+' ok, '+r.failed+' failed</span>'
       + (fails.length? ' — '+esc(fails.join('; ')) : '');
@@ -467,45 +666,55 @@ async function bulkAction(){
 }
 
 // ── Add-host dialog ──
-// Credential model per host type: 'token' (nexus API token), 'key' (truenas API
-// key + verify-TLS), or 'userpass' (proxmox/vmware). Toggles which fields show.
-const AUTH = {nexus:'token', truenas:'key', proxmox:'userpass', vcenter:'userpass', esxi:'userpass'};
-const URL_PH = {nexus:'https://192.168.1.10:8443', proxmox:'https://proxmox.local:8006',
-  vcenter:'https://vcenter.local', esxi:'https://esxi-host.local', truenas:'https://truenas.local'};
-const VIRT_USER_PH = {proxmox:'root@pam', vcenter:'administrator@vsphere.local', esxi:'root'};
-function authKind(ht){ return AUTH[ht] || 'token'; }
+// Everything about a host type — label, credential model ('token' = an API
+// token/key with its own label, 'userpass' = username+password), placeholders,
+// whether the verify-TLS toggle applies — comes from its adapter's descriptor
+// (/api/host-types). Adding a host type on the server needs NO changes here.
+const HT_FALLBACK = {kind:'nexus', label:'Nexus Dashboard node', auth:'token',
+  secret_label:'API token', secret_placeholder:'', url_placeholder:'https://host',
+  username_placeholder:'username', verify_tls:false};
+function htDesc(ht){ return HT[ht] || HT_FALLBACK; }
 function updateAddFields(){
-  const ht = document.getElementById('nd-htype').value, a = authKind(ht);
+  const d = htDesc(document.getElementById('nd-htype').value);
   const set = (sel,on)=>document.querySelectorAll('#addModal '+sel).forEach(e=>e.style.display = on ? '' : 'none');
-  set('.nd-token', a==='token'); set('.nd-key', a==='key'); set('.nd-userpass', a==='userpass');
-  set('.nd-verify', a!=='token');   // verify-TLS for key + userpass, not nexus
-  document.getElementById('nd-url').placeholder = URL_PH[ht] || 'https://host';
-  if(a==='userpass') document.getElementById('nd-user').placeholder = VIRT_USER_PH[ht] || 'username';
+  set('.nd-secret', d.auth==='token'); set('.nd-userpass', d.auth==='userpass');
+  set('.nd-verify', !!d.verify_tls);
+  document.getElementById('nd-secret-l').textContent = d.secret_label || 'API token';
+  document.getElementById('nd-secret').placeholder = d.secret_placeholder || '';
+  document.getElementById('nd-url').placeholder = d.url_placeholder || 'https://host';
+  document.getElementById('nd-user').placeholder = d.username_placeholder || 'username';
 }
-function openAdd(){ ['nd-name','nd-url','nd-token','nd-key','nd-user','nd-pass','nd-tags'].forEach(i=>document.getElementById(i).value='');
-  document.getElementById('nd-verify').checked=false; document.getElementById('nd-htype').value='nexus'; updateAddFields();
+function openAdd(){
+  const sel = document.getElementById('nd-htype');
+  const kinds = HT_ORDER.length ? HT_ORDER : ['nexus'];
+  sel.innerHTML = kinds.map(k=>'<option value="'+esc(k)+'">'+esc(htDesc(k).label||k)+'</option>').join('');
+  ['nd-name','nd-url','nd-secret','nd-user','nd-pass','nd-tags'].forEach(i=>document.getElementById(i).value='');
+  document.getElementById('nd-verify').checked=false; sel.value=kinds[0]; updateAddFields();
   document.getElementById('nd-test').textContent=''; document.getElementById('nd-err').textContent=''; show('addModal',true); }
 function closeAdd(){ show('addModal',false); }
 function nodeForm(){
-  const ht = document.getElementById('nd-htype').value, a = authKind(ht);
+  const ht = document.getElementById('nd-htype').value, d = htDesc(ht);
   const f = {
     host_type: ht,
     name: document.getElementById('nd-name').value.trim(),
     base_url: document.getElementById('nd-url').value.trim(),
     tags: document.getElementById('nd-tags').value.split(',').map(t=>t.trim()).filter(Boolean),
   };
-  if(a==='token'){ f.token = document.getElementById('nd-token').value.trim(); }
-  else if(a==='key'){ f.token = document.getElementById('nd-key').value.trim();
-         f.verify_ssl = document.getElementById('nd-verify').checked; }
+  if(d.auth==='token'){ f.token = document.getElementById('nd-secret').value.trim(); }
   else { f.username = document.getElementById('nd-user').value.trim();
-         f.password = document.getElementById('nd-pass').value;
-         f.verify_ssl = document.getElementById('nd-verify').checked; }
+         f.password = document.getElementById('nd-pass').value; }
+  if(d.verify_tls) f.verify_ssl = document.getElementById('nd-verify').checked;
   return f;
 }
 function probeSummary(r){
   const m = r.metrics;
   if(m && m.pool_count!=null){ return '<span class="ok-txt">OK</span> · '+esc(m.pool_count)+' pool'+(m.pool_count===1?'':'s')
       +(m.pools_degraded?' · <span class="bad">'+esc(m.pools_degraded)+' degraded</span>':'')+' · '+esc(m.disk_count||0)+' disks'; }
+  if(m && m.node_count!=null){ return '<span class="ok-txt">OK</span> · '+esc(m.node_count)+' node'+(m.node_count===1?'':'s')
+      +' · '+(m.cluster_healthy?'healthy':'<span class="bad">unhealthy</span>')
+      +(m.model?' · '+esc(String(m.model).split('/').pop()):''); }
+  if(m && m.mount_count!=null){ return '<span class="ok-txt">OK</span> · '+esc(m.hostname||'agent')
+      +' · '+esc(m.os||'linux')+' · '+esc(m.mount_count)+' filesystem'+(m.mount_count===1?'':'s'); }
   if(m){ return '<span class="ok-txt">OK</span> · '+esc(m.host_count||0)+' host(s) · '
       +esc(m.vm_running_count||0)+'/'+esc(m.vm_count||0)+' VMs running'; }
   return '<span class="ok-txt">OK</span> · role '+esc(r.role||'?')+' · v'+esc(r.version||'?')
@@ -527,16 +736,16 @@ let editId = null, editType = 'nexus';
 function openEdit(id){
   const n = nodeById(id); if(!n) return;
   editId = id; editType = n.host_type || 'nexus';
-  const a = authKind(editType);
+  const d = htDesc(editType);
   const set = (sel,on)=>document.querySelectorAll('#editModal '+sel).forEach(e=>e.style.display = on ? '' : 'none');
-  set('.ed-token', a==='token'); set('.ed-key', a==='key'); set('.ed-userpass', a==='userpass');
-  set('.ed-verify', a!=='token');
+  set('.ed-secret', d.auth==='token'); set('.ed-userpass', d.auth==='userpass');
+  set('.ed-verify', !!d.verify_tls);
+  document.getElementById('ed-secret-l').textContent = 'New ' + (d.secret_label || 'API token');
   document.getElementById('ed-name').value = n.name || '';
   document.getElementById('ed-url').value = n.base_url || '';
   document.getElementById('ed-tags').value = (n.tags || []).join(', ');
   document.getElementById('ed-type').value = n.type_pinned ? (n.type || 'auto') : 'auto';
-  document.getElementById('ed-token').value = '';
-  document.getElementById('ed-key').value = '';
+  document.getElementById('ed-secret').value = '';
   document.getElementById('ed-user').value = n.username || '';
   document.getElementById('ed-pass').value = '';
   document.getElementById('ed-verify').checked = !!n.verify_ssl;
@@ -551,44 +760,39 @@ function editForm(){
     tags: document.getElementById('ed-tags').value.split(',').map(t=>t.trim()).filter(Boolean),
     type: document.getElementById('ed-type').value,
   };
-  const a = authKind(editType);
-  if(a==='token'){ f.token = document.getElementById('ed-token').value.trim(); }
-  else if(a==='key'){ f.token = document.getElementById('ed-key').value.trim();
-         f.verify_ssl = document.getElementById('ed-verify').checked; }
+  const d = htDesc(editType);
+  if(d.auth==='token'){ f.token = document.getElementById('ed-secret').value.trim(); }
   else { f.username = document.getElementById('ed-user').value.trim();
-         f.password = document.getElementById('ed-pass').value;
-         f.verify_ssl = document.getElementById('ed-verify').checked; }
+         f.password = document.getElementById('ed-pass').value; }
+  if(d.verify_tls) f.verify_ssl = document.getElementById('ed-verify').checked;
   return f;
 }
 async function testEdit(){
-  const f = editForm(); const el = document.getElementById('ed-test'); const a = authKind(editType);
+  const f = editForm(); const el = document.getElementById('ed-test'); const d = htDesc(editType);
   const body = {host_type: editType, base_url: f.base_url};
-  if(a==='token'){
-    if(!f.token){ el.innerHTML = '<span class="muted">Enter a token to test, or just Save to re-validate the current one.</span>'; return; }
+  const secretName = d.auth==='userpass' ? 'password' : (d.secret_label || 'token');
+  if(d.auth==='token'){
+    if(!f.token){ el.innerHTML = '<span class="muted">Enter a '+esc(secretName)+' to test, or just Save to re-validate the current one.</span>'; return; }
     body.token = f.token;
-  } else if(a==='key'){
-    if(!f.token){ el.innerHTML = '<span class="muted">Enter an API key to test, or just Save to re-validate the current one.</span>'; return; }
-    body.token = f.token; body.verify_ssl = f.verify_ssl;
   } else {
     if(!f.password){ el.innerHTML = '<span class="muted">Enter a password to test, or just Save to re-validate the current one.</span>'; return; }
-    body.username = f.username; body.password = f.password; body.verify_ssl = f.verify_ssl;
+    body.username = f.username; body.password = f.password;
   }
+  if(d.verify_tls) body.verify_ssl = f.verify_ssl;
   el.textContent = 'Testing…'; document.getElementById('ed-err').textContent = '';
   try{ const r = await API.post('nodes/test', body); el.innerHTML = probeSummary(r);
   }catch(e){ el.textContent = ''; document.getElementById('ed-err').textContent = e.message; }
 }
 async function saveEdit(){
-  const f = editForm(); const n = nodeById(editId); const a = authKind(editType);
+  const f = editForm(); const n = nodeById(editId); const d = htDesc(editType);
   const body = {name: f.name, tags: f.tags, type: f.type};
   if(n && f.base_url && f.base_url !== n.base_url) body.base_url = f.base_url;  // re-probes server-side
-  if(a==='token'){ if(f.token) body.token = f.token; }
-  else if(a==='key'){ if(f.token) body.token = f.token;
-    if(n && f.verify_ssl !== !!n.verify_ssl) body.verify_ssl = f.verify_ssl; }
+  if(d.auth==='token'){ if(f.token) body.token = f.token; }
   else {
     if(f.username && f.username !== (n&&n.username)) body.username = f.username;
     if(f.password) body.password = f.password;
-    if(n && f.verify_ssl !== !!n.verify_ssl) body.verify_ssl = f.verify_ssl;
   }
+  if(d.verify_tls && n && f.verify_ssl !== !!n.verify_ssl) body.verify_ssl = f.verify_ssl;
   try{ await API.put('nodes/'+editId, body); closeEdit(); refresh(); }
   catch(e){ document.getElementById('ed-err').textContent = e.message; }
 }
@@ -625,6 +829,183 @@ async function uploadCert(){
   if(!cert || !key){ m.innerHTML='<span class="bad">Paste both the certificate and the key PEM.</span>'; return; }
   try{ await API.post('tls/cert', {cert, key}); m.innerHTML='<span class="ok-txt">Certificate installed — restart the controller to apply.</span>'; await loadCertInfo(); }
   catch(e){ m.innerHTML='<span class="bad">'+esc(e.message)+'</span>'; }
+}
+
+// ── Node certificate re-pin ──
+let repinId = null, repinObserved = null;
+function fmtFp(fp){ return fp ? fp.match(/.{1,2}/g).join(':') : '(none)'; }
+async function openRepin(id, name){
+  repinId = id; repinObserved = null;
+  document.getElementById('rp-name').textContent = name;
+  document.getElementById('rp-msg').textContent = '';
+  document.getElementById('rp-accept').disabled = true;
+  document.getElementById('rp-body').textContent = 'Reading certificate…';
+  show('repinModal', true);
+  try{
+    const c = await API.get('nodes/'+id+'/cert');
+    if(c.scheme === 'http'){
+      document.getElementById('rp-body').innerHTML = '<span class="muted">This host uses plain HTTP — there is no certificate to pin.</span>';
+      return;
+    }
+    if(c.error || !c.observed){
+      document.getElementById('rp-body').innerHTML = '<span class="bad">Could not read the live certificate: '+esc(c.error||'no certificate returned')+'</span>';
+      return;
+    }
+    repinObserved = c.observed;
+    const same = c.match === true;
+    document.getElementById('rp-body').innerHTML =
+        '<div class="kv"><span>Pinned (trusted)</span><b class="mono">'+esc(fmtFp(c.pinned))+'</b></div>'
+      + '<div class="kv"><span>Now serving</span><b class="mono '+(same?'ok-txt':'bad')+'">'+esc(fmtFp(c.observed))+'</b></div>'
+      + (same ? '<p class="ok-txt small" style="margin-top:8px">The live certificate already matches the pin — nothing to do.</p>'
+              : '<p class="warn small" style="margin-top:8px">Fingerprints differ. Confirm the "now serving" value on the host itself before re-pinning.</p>');
+    document.getElementById('rp-accept').disabled = same;
+  }catch(e){
+    document.getElementById('rp-body').innerHTML = '<span class="bad">'+esc(e.message)+'</span>';
+  }
+}
+function closeRepin(){ show('repinModal', false); repinId = null; repinObserved = null; }
+async function doRepin(){
+  const m = document.getElementById('rp-msg');
+  try{
+    await API.post('nodes/'+repinId+'/repin', {expected: repinObserved});
+    m.innerHTML = '<span class="ok-txt">Certificate re-pinned. The host should recover on the next refresh.</span>';
+    document.getElementById('rp-accept').disabled = true;
+    setTimeout(()=>{ closeRepin(); refresh(); }, 900);
+  }catch(e){ m.innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
+}
+
+// ── Guests (VM/CT) console ──
+let guestsNode = null;
+const GUEST_RUNNING = ['running','poweredOn'];
+function guestType(v){ return String(v.vm_id||'').startsWith('lxc-') ? 'CT' : 'VM'; }
+function guestRunning(v){ return GUEST_RUNNING.indexOf(v.power_state) >= 0; }
+function openGuests(id){ guestsNode = id; document.getElementById('gs-msg').textContent=''; renderGuests(); show('guestsModal', true); }
+function closeGuests(){ show('guestsModal', false); guestsNode = null; }
+function renderGuests(){
+  const n = nodeById(guestsNode);
+  if(!n || !n.virt){ closeGuests(); return; }
+  document.getElementById('gs-node').textContent = n.name;
+  const list = (n.virt.vm_list||[]).slice().sort((a,b)=>String(a.name||'').localeCompare(String(b.name||'')));
+  const canAct = me && me.role!=='viewer';
+  if(!list.length){ document.getElementById('gs-body').innerHTML='<div class="muted">No guests reported.</div>'; return; }
+  const rows = list.map(v=>{
+    const run = guestRunning(v);
+    const state = '<span class="dot '+(run?'ok':'bad')+'"></span> '+esc(v.power_state||'?');
+    let acts = '<span class="muted">—</span>';
+    if(canAct){
+      const btn = (a,lbl,on,cls)=> '<button class="'+(cls||'ghost')+'" '+(on?'':'disabled')
+        + ' style="padding:3px 8px;font-size:12px" onclick="guestAction('+JSON.stringify(v.vm_id)+','+JSON.stringify(a)+','+JSON.stringify(v.name||v.vm_id)+')">'+lbl+'</button>';
+      acts = btn('start','Start',!run) + ' ' + btn('shutdown','Shutdown',run)
+           + ' ' + btn('reboot','Reboot',run) + ' ' + btn('stop','Stop',run);
+    }
+    return '<tr><td><b>'+esc(v.name||v.vm_id)+'</b>'+(v.host_name?'<br><span class="muted small">'+esc(v.host_name)+'</span>':'')
+      + '</td><td>'+guestType(v)+'</td><td>'+state+'</td><td>'+acts+'</td></tr>';
+  });
+  document.getElementById('gs-body').innerHTML =
+    '<table class="tbl"><thead><tr><th>Guest</th><th>Type</th><th>State</th><th>Actions</th></tr></thead>'
+    + '<tbody>'+rows.join('')+'</tbody></table>';
+}
+async function guestAction(vmId, action, name){
+  const hard = (action==='stop');
+  if(!confirm(action.charAt(0).toUpperCase()+action.slice(1)+' "'+name+'"?'
+      + (hard?' (this is a hard power-off — the guest is not shut down cleanly)':''))) return;
+  const msg = document.getElementById('gs-msg');
+  msg.innerHTML = 'Sending '+esc(action)+' to "'+esc(name)+'"…';
+  try{
+    await API.post('nodes/'+guestsNode+'/vm/'+encodeURIComponent(vmId)+'/'+action);
+    msg.innerHTML = '<span class="ok-txt">'+esc(action)+' sent. Power state updates on the next poll.</span>';
+    await refresh();
+    if(guestsNode) renderGuests();
+  }catch(e){ msg.innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
+}
+
+// ── Notifications ──
+let hooks = [];
+const FORMATS = ['gchat','slack','discord','ntfy','gotify'];
+const SEVS = ['critical','warning','info'];
+async function openNotify(){
+  document.getElementById('nf-msg').textContent=''; document.getElementById('nf-err').textContent='';
+  try{
+    const c = await API.get('notifications');
+    document.getElementById('nf-enabled').checked = !!c.enabled;
+    hooks = (c.webhooks||[]).map(h=>({id:h.id, name:h.name, format:h.format, min_severity:h.min_severity, url:'', url_display:h.url_display}));
+  }catch(e){ hooks=[]; }
+  renderHooks(); show('notifyModal', true);
+}
+function closeNotify(){ show('notifyModal', false); }
+function renderHooks(){
+  const el = document.getElementById('nf-hooks');
+  if(!hooks.length){ el.innerHTML = '<p class="muted small">No webhooks yet.</p>'; return; }
+  el.innerHTML = hooks.map((h,i)=>
+    '<div class="srow" style="margin-bottom:8px">'
+    + '<div class="row" style="margin:0;flex-wrap:wrap;gap:6px">'
+    + '<input placeholder="name" value="'+esc(h.name||'')+'" oninput="hooks['+i+'].name=this.value" style="width:120px">'
+    + '<select onchange="hooks['+i+'].format=this.value" style="width:auto">'+FORMATS.map(f=>'<option'+(h.format===f?' selected':'')+'>'+f+'</option>').join('')+'</select>'
+    + '<select onchange="hooks['+i+'].min_severity=this.value" style="width:auto" title="minimum severity to send">'+SEVS.map(s=>'<option'+(h.min_severity===s?' selected':'')+'>'+s+'</option>').join('')+'</select>'
+    + '<button class="x" title="remove" onclick="hooks.splice('+i+',1);renderHooks()">×</button></div>'
+    + '<input placeholder="'+(h.url_display?('webhook URL (stored: '+esc(h.url_display)+' — blank keeps it)'):'webhook URL')+'" oninput="hooks['+i+'].url=this.value" style="margin-top:6px">'
+    + '</div>').join('');
+}
+function addHook(){ hooks.push({name:'', format:'gchat', min_severity:'warning', url:'', url_display:''}); renderHooks(); }
+async function saveNotify(){
+  const body = {enabled: document.getElementById('nf-enabled').checked,
+    webhooks: hooks.map(h=>({id:h.id, name:h.name, format:h.format, min_severity:h.min_severity, url:h.url}))};
+  try{ await API.post('notifications', body);
+    document.getElementById('nf-msg').innerHTML='<span class="ok-txt">Saved.</span>';
+    await openNotify();
+  }catch(e){ document.getElementById('nf-err').textContent=e.message; }
+}
+async function testNotify(){
+  const m = document.getElementById('nf-msg'); m.textContent='Sending…';
+  try{ await API.post('notifications', {enabled: document.getElementById('nf-enabled').checked,
+        webhooks: hooks.map(h=>({id:h.id, name:h.name, format:h.format, min_severity:h.min_severity, url:h.url}))});
+    const r = await API.post('notifications/test');
+    const fails = (r.results||[]).filter(x=>!x.ok);
+    m.innerHTML = fails.length ? '<span class="bad">'+esc(fails.map(f=>f.name+': '+f.error).join('; '))+'</span>'
+      : '<span class="ok-txt">Sent to '+(r.results||[]).length+' webhook(s) — check your chat.</span>';
+    await openNotify();
+  }catch(e){ m.innerHTML='<span class="bad">'+esc(e.message)+'</span>'; }
+}
+
+// ── Controller users ──
+async function openUsers(){
+  document.getElementById('us-msg').textContent=''; document.getElementById('us-name').value='';
+  document.getElementById('us-pass').value=''; await loadUsers(); show('usersModal', true);
+}
+function closeUsers(){ show('usersModal', false); }
+async function loadUsers(){
+  const tb = document.getElementById('us-rows');
+  try{
+    const d = await API.get('users');
+    tb.innerHTML = (d.users||[]).map(u=>'<tr><td><b>'+esc(u.username)+'</b>'
+      + (u.must_change?' <span class="warn small">(must change pw)</span>':'')+'</td>'
+      + '<td>'+esc(u.role)+'</td><td style="text-align:right">'
+      + '<button class="x" title="reset password" onclick="resetUser(\''+esc(u.username)+'\')">🔑</button>'
+      + (u.username===me.user?'':'<button class="x" title="delete" onclick="delUser(\''+esc(u.username)+'\')">×</button>')
+      + '</td></tr>').join('');
+  }catch(e){ tb.innerHTML='<tr><td colspan="3" class="bad">'+esc(e.message)+'</td></tr>'; }
+}
+async function addUser(){
+  const username = document.getElementById('us-name').value.trim();
+  const role = document.getElementById('us-role').value;
+  const password = document.getElementById('us-pass').value;
+  const m = document.getElementById('us-msg');
+  try{ await API.post('users', {username, role, password});
+    m.innerHTML='<span class="ok-txt">Added '+esc(username)+'.</span>';
+    document.getElementById('us-name').value=''; document.getElementById('us-pass').value=''; loadUsers();
+  }catch(e){ m.innerHTML='<span class="bad">'+esc(e.message)+'</span>'; }
+}
+async function delUser(u){
+  if(!confirm('Delete controller user "'+u+'"?')) return;
+  try{ await API.del('users/'+encodeURIComponent(u)); loadUsers(); }
+  catch(e){ document.getElementById('us-msg').innerHTML='<span class="bad">'+esc(e.message)+'</span>'; }
+}
+async function resetUser(u){
+  const pw = prompt('New password for "'+u+'" (min 8 chars):');
+  if(!pw) return;
+  try{ await API.put('users/'+encodeURIComponent(u), {password: pw});
+    document.getElementById('us-msg').innerHTML='<span class="ok-txt">Password reset for '+esc(u)+'.</span>'; loadUsers();
+  }catch(e){ document.getElementById('us-msg').innerHTML='<span class="bad">'+esc(e.message)+'</span>'; }
 }
 
 boot();
