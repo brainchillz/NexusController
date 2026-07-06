@@ -186,13 +186,45 @@ def vm_action(host, user, password, moid, action, port=443, verify_ssl=False):
             if vm is None:
                 raise ValueError("VM %s not found" % moid)
             if action == "start":
-                return vm.PowerOnVM_Task()._moId
-            if action == "stop":
-                return vm.PowerOffVM_Task()._moId
-            if action == "reboot":
-                vm.RebootGuest()
+                task = vm.PowerOnVM_Task()
+            elif action == "stop":
+                task = vm.PowerOffVM_Task()
+            elif action == "reboot":
+                vm.RebootGuest()         # synchronous — raises on failure
                 return "RebootGuest"
-            vm.ShutdownGuest()           # action == "shutdown"
-            return "ShutdownGuest"
+            else:                        # action == "shutdown"
+                vm.ShutdownGuest()       # synchronous — raises on failure
+                return "ShutdownGuest"
+            _wait_task(task)
+            return task._moId
         finally:
             Disconnect(si)
+
+
+def _wait_task(task, timeout=10.0):
+    """Briefly poll a vSphere power task so an immediately-failing op (a
+    template that can't power on, admission failure, invalid state) surfaces
+    its real error instead of the controller reporting success-at-submission.
+    A task still running when `timeout` expires is fine — long operations keep
+    reporting success-at-accept. States compared as strings so this is
+    stub-testable without pyVmomi."""
+    import time
+    deadline = time.time() + timeout
+    while True:
+        state = str(task.info.state)
+        if state == "success":
+            return
+        if state == "error":
+            msg = _task_error(task)
+            if not msg:                  # error state can precede the fault detail
+                time.sleep(0.5)
+                msg = _task_error(task)
+            raise RuntimeError(msg or "task failed")
+        if time.time() >= deadline:
+            return
+        time.sleep(0.5)
+
+
+def _task_error(task):
+    err = getattr(task.info, "error", None)
+    return getattr(err, "localizedMessage", None) or getattr(err, "msg", None)

@@ -112,6 +112,20 @@ main{padding:20px;max-width:1200px;margin:0 auto}
 .tbl th{color:var(--muted);font-weight:600;background:var(--panel2)}
 .tbl tr:last-child td{border-bottom:0}
 .tbl.matrix td,.tbl.matrix th{text-align:center} .tbl.matrix td:first-child,.tbl.matrix th:first-child{text-align:left}
+/* Guests modal: slightly tighter cells, action buttons on one line */
+.gs-tbl th,.gs-tbl td{padding:6px 10px}
+.gs-acts{white-space:nowrap}
+/* Clickable rollup pills + host names */
+.pill.click{cursor:pointer}
+.pill.click:hover{border-color:var(--accent)}
+.hlink{cursor:pointer}
+.hlink:hover{color:var(--accent-hov);text-decoration:underline}
+/* Overview quick-filter input */
+.hostq{width:180px;padding:5px 9px;font-size:13px}
+/* Host detail grid */
+.dt-grid{display:grid;grid-template-columns:110px 1fr;gap:3px 12px;font-size:13px}
+.dt-k{color:var(--muted)}
+.dt-v{overflow-wrap:anywhere}
 .legend{margin-top:10px;color:var(--muted);font-size:12px;display:flex;gap:14px;align-items:center}
 .legend .sd{margin-right:4px}
 .big{font-size:16px;padding:12px 0}
@@ -137,7 +151,8 @@ main{padding:20px;max-width:1200px;margin:0 auto}
 .logs{margin-top:10px;max-height:340px;overflow:auto;background:var(--well);border:1px solid var(--line);border-radius:6px;padding:10px;font:12px/1.45 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;color:var(--text)}
 
 /* Modal */
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:10}
+.modal.dlg{z-index:50}   /* confirm/prompt dialogs stack above other modals */
 .modal-card{background:var(--panel);border:1px solid var(--line-strong);border-radius:12px;padding:22px;width:420px;max-width:92vw}
 .modal-card h2{margin:0 0 12px} .modal-card label{display:block;margin:8px 0;color:var(--muted)}
 .modal-card textarea{width:100%;margin-top:4px;background:var(--well);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:8px 10px;font:12px/1.4 ui-monospace,Menlo,Consolas,monospace;resize:vertical}

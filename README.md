@@ -75,7 +75,14 @@ top of them, not a replacement.
   recovery messages. Configure under **🔔 Notify** (admin).
 - **User management** — create operator / viewer / admin logins, reset
   passwords, all from the UI (**👥 Users**); first login on a new account
-  forces a password change.
+  forces a password change. Failed logins are **rate-limited** (per-account
+  and per-IP sliding windows).
+- **Audit viewer** — the controller-side audit trail (every mutation: who,
+  from where, what, result) is browsable from the UI (**📜 Audit**, admin)
+  with free-text filtering — no shell access needed.
+- **Host detail view** — click any host name for a detail panel: 24-hour CPU
+  and memory charts, availability, active health conditions (and for how
+  long), pinned certificate fingerprint, capabilities, enrollment info.
 - **History & capacity forecasting** — a 30-day SQLite ring buffer records
   every host each minute. Overview rows show a **CPU sparkline**; the Storage
   tab projects **days-to-full** per pool (and fleet-wide) from the observed
@@ -339,6 +346,12 @@ the login is then confined to hosts bearing any of those tags — its fleet
 view, rollup, history, and actions cover only those hosts, and every other
 host 404s. Blank scope = whole fleet; admins are always fleet-wide.
 
+Scopes can be named: save a **scope preset** ("role") — a named tag grouping
+like `media = nas, docker` — and bind users to it from a dropdown instead of
+typing tags. Presets resolve at request time, so editing one instantly
+re-scopes every user bound to it; deleting a preset is refused while any
+login references it.
+
 ## Security model
 
 - **No privilege:** the service runs as an unprivileged user with no sudo;
@@ -397,6 +410,8 @@ changes do matter: a node's `base_url` is stored in the registry; update it with
 | `WS` | `/nodes/<id>/ws/<path>` | drill-in websocket bridge (node console) |
 | `GET/POST/PUT/DELETE` | `/api/users…` | controller login management (admin) |
 | `GET/POST` | `/api/notifications` (+`/test`) | webhook notification config (admin) |
+| `GET` | `/api/notifications/events` | recent monitor state transitions (admin) |
+| `GET` | `/api/audit` | audit-trail tail, filterable (admin) |
 | `GET` | `/api/history/spark` | recent CPU series per host (sparklines) |
 | `GET` | `/api/history/summary` | availability % + storage forecast per host |
 | `GET` | `/api/history/<id>` | full CPU/mem series for one host |
@@ -432,4 +447,3 @@ days-to-full), **certificate review / re-pin**, tag filtering, TLS certificate
 management, an embedded-gunicorn runtime, and both systemd (`install.sh`) and
 Docker (`docker-compose.yml`) deployment. The UI matches the Nexus Dashboard
 v2 dark-grey/orange theme.
-

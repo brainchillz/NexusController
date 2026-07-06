@@ -80,3 +80,31 @@ def test_scoped_fleet_no_match_is_empty_not_error():
     out = app.scoped_fleet(_fleet(), {'nothing'})
     assert out['nodes'] == []
     assert out['rollup']['total'] == 0
+
+
+# ── scope presets (named tag groupings) ──────────────────────────────
+PRESETS = {'media': ['nas', 'docker'], 'labops': ['lab']}
+
+
+def test_preset_resolves_live():
+    rec = {'role': 'viewer', 'scope_preset': 'media'}
+    assert app.user_scope(rec, 'viewer', PRESETS) == {'nas', 'docker'}
+
+
+def test_preset_wins_over_literal_tags():
+    rec = {'role': 'viewer', 'scope_preset': 'labops', 'tags': ['prod']}
+    assert app.user_scope(rec, 'viewer', PRESETS) == {'lab'}
+
+
+def test_dangling_preset_fails_closed():
+    rec = {'role': 'operator', 'scope_preset': 'deleted-role'}
+    scope = app.user_scope(rec, 'operator', PRESETS)
+    assert scope == set()
+    # an empty scope matches no host — even untagged ones
+    assert not app.scope_allows(scope, {'tags': ['prod']})
+    assert not app.scope_allows(scope, {})
+
+
+def test_admin_ignores_presets():
+    rec = {'role': 'admin', 'scope_preset': 'media'}
+    assert app.user_scope(rec, 'admin', PRESETS) is None

@@ -62,6 +62,16 @@ def _services_down(summary):
                if sv.get('enabled') == 'enabled' and sv.get('active') != 'active')
 
 
+def health_entries(env):
+    """Warning-or-worse conditions for one envelope as structured entries
+    [{'key','severity','detail'}, …] — drives the status dot, its tooltip,
+    and the Alerts tab. Info-level conditions (version_lag) stay out: they
+    tint the version text, not the dot."""
+    return [{'key': k, 'severity': c['severity'], 'detail': c['detail']}
+            for k, c in host_conditions(env).items()
+            if c['severity'] in ('warning', 'critical')]
+
+
 def snapshot_conditions(results):
     """{host_id: {'name', 'conditions'}} for a whole fan-out result set."""
     return {r['id']: {'name': r.get('name', r['id']), 'conditions': host_conditions(r)}

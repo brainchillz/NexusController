@@ -206,3 +206,63 @@ def test_vm_action_viewer_blocked(client, monkeypatch):
     A.save_nodes({'nodes': [{'id': 'p2', 'name': 'pve', 'host_type': 'proxmox',
                              'base_url': 'https://10.0.0.5:8006'}]})
     assert client.post('/api/nodes/p2/vm/qemu-pve-100/start').status_code == 403
+
+
+# ── task-result waits: async hypervisor failures must surface ────────
+class _VmwTaskInfo:
+    def __init__(self, state, msg=None):
+        self.state = state
+        self.error = type('E', (), {'localizedMessage': msg})() if msg else None
+
+
+class _VmwTask:
+    def __init__(self, states):
+        self._states = list(states)
+
+    @property
+    def info(self):
+        return _VmwTaskInfo(*self._states.pop(0)) if len(self._states) > 1 \
+            else _VmwTaskInfo(*self._states[0])
+
+
+def test_vmware_wait_task_error_raises_with_message():
+    task = _VmwTask([('error', 'The operation is not allowed in the current state.')])
+    try:
+        vmware._wait_task(task, timeout=1)
+        assert False, 'expected RuntimeError'
+    except RuntimeError as e:
+        assert 'not allowed' in str(e)
+
+
+def test_vmware_wait_task_success_returns():
+    vmware._wait_task(_VmwTask([('running', None), ('success', None)]), timeout=5)
+
+
+def test_vmware_wait_task_still_running_at_timeout_is_ok():
+    vmware._wait_task(_VmwTask([('running', None)]), timeout=0)
+
+
+class _PxNode:
+    def __init__(self, doc):
+        self._doc = doc
+
+    def tasks(self, upid):
+        status = type('S', (), {'get': lambda s: self._doc})()
+        return type('T', (), {'status': status})()
+
+
+def test_proxmox_wait_task_failure_raises():
+    node = _PxNode({'status': 'stopped', 'exitstatus': 'CT is locked (snapshot)'})
+    try:
+        proxmox._wait_task(node, 'UPID:x', timeout=1)
+        assert False, 'expected RuntimeError'
+    except RuntimeError as e:
+        assert 'locked' in str(e)
+
+
+def test_proxmox_wait_task_ok():
+    proxmox._wait_task(_PxNode({'status': 'stopped', 'exitstatus': 'OK'}), 'UPID:x', timeout=1)
+
+
+def test_proxmox_wait_task_still_running_at_timeout_is_ok():
+    proxmox._wait_task(_PxNode({'status': 'running'}), 'UPID:x', timeout=0)

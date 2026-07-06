@@ -19,6 +19,7 @@ import time
 import socket
 import secrets
 import threading
+from collections import deque
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -53,7 +54,7 @@ urllib3.disable_warnings(InsecureRequestWarning)
 app = Flask(__name__, static_url_path='')
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = '0.6.0'
+APP_VERSION = '0.7.1'
 
 
 def env_bool(name, default):
@@ -214,13 +215,22 @@ def clean_scope_tags(v):
     return out[:32]
 
 
-def user_scope(rec, role):
+def user_scope(rec, role, presets=None):
     """Tag scope for an account. None = unscoped (sees the whole fleet):
     admins are always unscoped — someone has to manage enrollment — and an
-    operator/viewer with no tags keeps today's fleet-wide behavior. Otherwise
-    the set of tags the login is confined to."""
+    operator/viewer with no scope keeps fleet-wide behavior. A record may
+    reference a named **scope preset** (`scope_preset`) instead of literal
+    tags — presets resolve live, so editing one re-scopes every login bound
+    to it. A dangling preset reference resolves to an EMPTY scope (matches no
+    host — fail closed; deleting an in-use preset is blocked upstream)."""
     if role == 'admin' or not isinstance(rec, dict):
         return None
+    preset = rec.get('scope_preset')
+    if preset:
+        tags = (presets or {}).get(preset)
+        if tags is None:
+            return set()   # dangling reference: deny rather than open up
+        return set(clean_scope_tags(tags)) or None
     tags = clean_scope_tags(rec.get('tags') or [])
     return set(tags) or None
 
@@ -251,6 +261,12 @@ def _scope():
         return None
 
 
+def _scope_presets():
+    """Named scope presets ("roles"): {name: [tags]}, stored in the auth file."""
+    p = load_config().get('scope_presets')
+    return p if isinstance(p, dict) else {}
+
+
 # ─── AuthN / AuthZ ────────────────────────────────────────────────────
 PUBLIC_ENDPOINTS = {'api_login', 'api_me', 'index', 'static'}
 # Writes a non-admin role may still issue (sign out / change own password).
@@ -259,8 +275,10 @@ RBAC_EXEMPT = {'api_logout', 'change_password'}
 # or removing a node, and managing controller users.
 ADMIN_ONLY = {'nodes_add', 'node_delete', 'node_update', 'node_cert', 'node_repin',
               'tls_regenerate', 'tls_upload_cert',
-              'notifications_save', 'notifications_test',
-              'users_list', 'users_add', 'users_update', 'users_delete'}
+              'notifications_save', 'notifications_test', 'notifications_events',
+              'users_list', 'users_add', 'users_update', 'users_delete',
+              'audit_list',
+              'scope_presets_list', 'scope_presets_save', 'scope_presets_delete'}
 
 
 def _resolve_identity():
@@ -279,7 +297,7 @@ def require_login():
         return err('Authentication required', 401)
     g.identity_name = name
     g.identity_role = role
-    g.identity_scope = user_scope(_users().get(name), role)
+    g.identity_scope = user_scope(_users().get(name), role, _scope_presets())
     if request.endpoint in ADMIN_ONLY and role != 'admin':
         return err('Admin role required', 403)
     # viewer is read-only: no state-changing methods.
@@ -313,6 +331,36 @@ def _audit(resp):
     if request.method in ('POST', 'PUT', 'DELETE', 'PATCH') and request.endpoint not in PUBLIC_ENDPOINTS:
         audit_line(request.method, request.path, getattr(g, 'audit_target', None), resp.status_code)
     return resp
+
+
+def audit_matches(entry, q):
+    """Case-insensitive substring match across an audit entry's visible fields
+    (pure — unit-tested)."""
+    hay = ' '.join(str(entry.get(k, '')) for k in
+                   ('ts', 'user', 'ip', 'method', 'path', 'target', 'status')).lower()
+    return q in hay
+
+
+@app.route('/api/audit')
+def audit_list():
+    """Tail of the controller audit trail, newest first (admin). `q` filters by
+    substring across all fields; `limit` caps the result (default 200)."""
+    limit = min(1000, max(1, int(request.args.get('limit', 200) or 200)))
+    q = (request.args.get('q') or '').strip().lower()
+    entries = []
+    try:
+        with open(AUDIT_FILE, 'r') as f:
+            lines = deque(f, maxlen=5000)   # bounded read of an unrotated file
+        for ln in lines:
+            try:
+                entries.append(json.loads(ln))
+            except ValueError:
+                pass
+    except FileNotFoundError:
+        pass
+    if q:
+        entries = [e for e in entries if audit_matches(e, q)]
+    return jsonify({'entries': entries[-limit:][::-1]})
 
 
 # ─── Node registry ────────────────────────────────────────────────────
@@ -352,14 +400,62 @@ def index():
     return send_from_directory(APP_DIR, 'templates/index.html')
 
 
+# ─── Login throttling (in-memory sliding window) ─────────────────────
+LOGIN_WINDOW = int(os.environ.get('CONTROLLER_LOGIN_WINDOW', '900'))
+LOGIN_MAX_PER_USER = int(os.environ.get('CONTROLLER_LOGIN_MAX_USER', '5'))
+LOGIN_MAX_PER_IP = int(os.environ.get('CONTROLLER_LOGIN_MAX_IP', '20'))
+_login_fails = {}          # key tuple → [fail timestamps]
+_login_lock = threading.Lock()
+
+
+def _prune_fails(key, now):
+    ts = [t for t in _login_fails.get(key, ()) if now - t < LOGIN_WINDOW]
+    if ts:
+        _login_fails[key] = ts
+    else:
+        _login_fails.pop(key, None)
+    return ts
+
+
+def login_throttled(ip, user, now=None):
+    """True when this (ip, user) has burned its failed-attempt budget: per-user
+    (defends one account against one IP) or per-IP (defends every account
+    against one IP spraying usernames). Pure given `now` — unit-tested."""
+    now = time.time() if now is None else now
+    with _login_lock:
+        return (len(_prune_fails(('ip', ip), now)) >= LOGIN_MAX_PER_IP
+                or len(_prune_fails(('user', ip, user), now)) >= LOGIN_MAX_PER_USER)
+
+
+def login_failed(ip, user, now=None):
+    now = time.time() if now is None else now
+    with _login_lock:
+        _login_fails.setdefault(('ip', ip), []).append(now)
+        _login_fails.setdefault(('user', ip, user), []).append(now)
+
+
+def login_succeeded(ip, user):
+    with _login_lock:
+        _login_fails.pop(('user', ip, user), None)
+
+
+def _client_ip():
+    return request.headers.get('X-Forwarded-For', request.remote_addr) or '-'
+
+
 @app.route('/api/login', methods=['POST'])
 def api_login():
     data = request.get_json() or {}
     user = (data.get('username') or '').strip()
     pw = data.get('password') or ''
+    ip = _client_ip()
+    if login_throttled(ip, user):
+        return err('Too many failed attempts — try again in a few minutes', 429)
     rec = _users().get(user)
     if not rec or not check_password_hash(rec.get('password', ''), pw):
+        login_failed(ip, user)
         return err('Invalid credentials', 401)
+    login_succeeded(ip, user)
     session.permanent = True
     session['user'] = user
     return jsonify({'success': True, 'user': user, 'role': _user_role(rec),
@@ -378,9 +474,10 @@ def api_me():
     if not name:
         return jsonify({'authenticated': False}), 401
     rec = _users().get(name)
-    scope = user_scope(rec, role)
+    scope = user_scope(rec, role, _scope_presets())
     return jsonify({'authenticated': True, 'user': name, 'role': role,
                     'scope_tags': sorted(scope) if scope else None,
+                    'scope_preset': rec.get('scope_preset') if isinstance(rec, dict) else None,
                     'must_change': bool(isinstance(rec, dict) and rec.get('must_change')),
                     'version': APP_VERSION})
 
@@ -414,6 +511,7 @@ def users_list():
     """List controller logins (no password hashes). Admin-only."""
     out = [{'username': u, 'role': _user_role(r),
             'tags': clean_scope_tags(r.get('tags') or []) if isinstance(r, dict) else [],
+            'scope_preset': r.get('scope_preset') if isinstance(r, dict) else None,
             'must_change': bool(isinstance(r, dict) and r.get('must_change'))}
            for u, r in _users().items()]
     out.sort(key=lambda u: u['username'].lower())
@@ -436,15 +534,20 @@ def users_add():
     cfg = load_config()
     if user in cfg.get('users', {}):
         return err('user already exists')
-    # Optional tag scope: confines an operator/viewer to hosts bearing any of
-    # these tags. Admins are always fleet-wide — don't store a dead scope.
-    tags = clean_scope_tags(data.get('tags')) if role != 'admin' else []
-    cfg.setdefault('users', {})[user] = {
-        'password': generate_password_hash(pw), 'role': role, 'must_change': True,
-        'tags': tags}
+    # Optional scope: a named preset ("role") OR literal tags — the preset
+    # wins when both arrive. Admins are always fleet-wide — no dead scope.
+    preset = (data.get('scope_preset') or '').strip() if role != 'admin' else ''
+    if preset and preset not in _scope_presets():
+        return err('unknown scope preset: %s' % preset)
+    tags = clean_scope_tags(data.get('tags')) if (role != 'admin' and not preset) else []
+    rec = {'password': generate_password_hash(pw), 'role': role, 'must_change': True,
+           'tags': tags}
+    if preset:
+        rec['scope_preset'] = preset
+    cfg.setdefault('users', {})[user] = rec
     save_config(cfg)
     g.audit_target = 'user:%s (%s%s)' % (user, role,
-                                         ' @' + ','.join(tags) if tags else '')
+                                         ' @' + (preset or ','.join(tags)) if (preset or tags) else '')
     return jsonify({'success': True})
 
 
@@ -468,8 +571,20 @@ def users_update(user):
             return err(f'password must be at least {MIN_PASSWORD_LEN} characters')
         rec['password'] = generate_password_hash(data['password'])
         rec['must_change'] = True   # operator-set password → force a change on first login
-    if 'tags' in data:
-        rec['tags'] = clean_scope_tags(data['tags']) if rec.get('role') != 'admin' else []
+    # Scope: a named preset and literal tags are mutually exclusive — setting
+    # one clears the other; scope_preset:'' or tags:[] clears the scope.
+    if 'scope_preset' in data or 'tags' in data:
+        preset = (data.get('scope_preset') or '').strip()
+        if preset and preset not in (cfg.get('scope_presets') or {}):
+            return err('unknown scope preset: %s' % preset)
+        if rec.get('role') == 'admin':
+            preset = ''
+        if preset:
+            rec['scope_preset'] = preset
+            rec['tags'] = []
+        else:
+            rec.pop('scope_preset', None)
+            rec['tags'] = clean_scope_tags(data.get('tags')) if rec.get('role') != 'admin' else []
     cfg['users'][user] = rec
     save_config(cfg)
     g.audit_target = 'user:%s' % user
@@ -491,6 +606,48 @@ def users_delete(user):
     del users[user]
     save_config(cfg)
     g.audit_target = 'user:%s (deleted)' % user
+    return jsonify({'success': True})
+
+
+# ─── Scope presets: named tag groupings ("roles") for user scoping ────
+@app.route('/api/scope-presets')
+def scope_presets_list():
+    return jsonify({'presets': _scope_presets()})
+
+
+@app.route('/api/scope-presets', methods=['POST'])
+def scope_presets_save():
+    """Create or update one named preset (admin). Users referencing it by
+    name re-scope immediately — presets resolve at request time."""
+    data = request.get_json() or {}
+    name = (data.get('name') or '').strip()
+    if not RE_USERNAME.match(name):
+        return err('preset name must be 1–32 chars: letters, digits, . _ -')
+    tags = clean_scope_tags(data.get('tags'))
+    if not tags:
+        return err('a preset needs at least one tag')
+    cfg = load_config()
+    cfg.setdefault('scope_presets', {})[name] = tags
+    save_config(cfg)
+    g.audit_target = 'scope-preset:%s = %s' % (name, ','.join(tags))
+    return jsonify({'success': True})
+
+
+@app.route('/api/scope-presets/<name>', methods=['DELETE'])
+def scope_presets_delete(name):
+    """Remove a preset (admin) — refused while any login references it, so a
+    scoped account can never silently lose (or gain) access."""
+    cfg = load_config()
+    presets = cfg.get('scope_presets') or {}
+    if name not in presets:
+        return err('preset not found', 404)
+    holders = [u for u, r in cfg.get('users', {}).items()
+               if isinstance(r, dict) and r.get('scope_preset') == name]
+    if holders:
+        return err('preset is in use by: %s' % ', '.join(sorted(holders)))
+    del presets[name]
+    save_config(cfg)
+    g.audit_target = 'scope-preset:%s (deleted)' % name
     return jsonify({'success': True})
 
 
@@ -873,6 +1030,11 @@ def flag_version_skew(results):
     return results
 
 
+# First-seen timestamps for active health conditions: (host_id, key) → iso ts.
+_health_since = {}
+_health_lock = threading.Lock()
+
+
 def _build_fleet():
     nodes = load_nodes().get('nodes', [])
     results = []
@@ -905,6 +1067,25 @@ def _build_fleet():
     if dirty:
         save_nodes(reg)
     flag_version_skew(results)
+    # Fold each host's warning+ conditions (failed services, degraded pools,
+    # stale polls, alerts, unreachable — same set the notifier fires on) into
+    # the envelope, with a first-seen timestamp per (host, condition) so the
+    # Alerts tab can say "since when". The since-map is in-memory (resets on
+    # restart) and shared with the monitor thread — guard it.
+    now_iso = datetime.now().astimezone().isoformat(timespec='seconds')
+    with _health_lock:
+        live = set()
+        for r in results:
+            entries = monitoring.health_entries(r)
+            for e in entries:
+                k = (r['id'], e['key'])
+                live.add(k)
+                e['since'] = _health_since.setdefault(k, now_iso)
+            if entries:
+                r['health'] = entries
+        ids = {r['id'] for r in results}
+        for k in [k for k in _health_since if k[0] in ids and k not in live]:
+            del _health_since[k]   # cleared → a re-fire gets a fresh timestamp
     results.sort(key=lambda r: r['name'].lower())
     return {'nodes': results, 'rollup': compute_rollup(results),
             'generated_at': datetime.now().astimezone().isoformat(timespec='seconds')}
@@ -991,6 +1172,25 @@ def send_webhook(hook, title, text):
         return False, str(e)
 
 
+# Recent state-transition events (fired OR recovered, whether or not any
+# webhook is configured) — answers "did anything happen overnight?" from the
+# 🔔 Notify modal. In-memory ring: resets on controller restart.
+_notify_events = deque(maxlen=100)
+
+
+def _record_events(events):
+    ts = datetime.now().astimezone().isoformat(timespec='seconds')
+    for e in events:
+        _notify_events.append({**e, 'ts': ts})
+
+
+@app.route('/api/notifications/events')
+def notifications_events():
+    """Last ~100 monitor state transitions, newest first (admin)."""
+    return jsonify({'events': list(_notify_events)[::-1],
+                    'since_restart': True, 'interval': MONITOR_INTERVAL})
+
+
 def _dispatch(events):
     """Send a batch of events to every enabled webhook that wants their
     severity. Grouped into one message per webhook."""
@@ -1054,6 +1254,7 @@ def _monitor_cycle(results):
                                 'kind': 'recovered', 'severity': 'info',
                                 'detail': _COND_LABEL.get(key, key)})
                 _mon['active'].discard(pk)
+    _record_events(fire + recover)
     _dispatch(fire + recover)
 
 

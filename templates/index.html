@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Nexus Controller</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3.5' fill='%23c1550f'/%3E%3Ctext x='8' y='12.5' font-size='11' font-family='sans-serif' font-weight='bold' text-anchor='middle' fill='%23141518'%3EN%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="/css/style.css">
 </head>
 <body>
@@ -32,9 +33,10 @@
       <div class="spacer"></div>
       <span id="updated" class="muted small"></span>
       <span id="whoami" class="muted"></span>
-      <button class="ghost" onclick="openAdd()" id="addBtn">+ Add Node</button>
+      <button class="ghost" onclick="openAdd()" id="addBtn">+ Add Host</button>
       <button class="ghost" onclick="openNotify()" id="notifyBtn" title="Notifications">🔔 Notify</button>
       <button class="ghost" onclick="openUsers()" id="usersBtn" title="Users">👥 Users</button>
+      <button class="ghost" onclick="openAudit()" id="auditBtn" title="Audit trail">📜 Audit</button>
       <button class="ghost" onclick="openCert()" id="certBtn" title="TLS certificate">🔒 Cert</button>
       <button class="ghost" onclick="refresh()">Refresh</button>
       <button class="ghost" onclick="doLogout()">Sign out</button>
@@ -76,7 +78,7 @@
   <!-- Edit-node dialog -->
   <div id="editModal" class="modal" style="display:none">
     <div class="modal-card">
-      <div class="row"><h2 style="margin:0;flex:1">Edit Node</h2><button class="x" onclick="closeEdit()">×</button></div>
+      <div class="row"><h2 style="margin:0;flex:1">Edit Host</h2><button class="x" onclick="closeEdit()">×</button></div>
       <label>Name <input id="ed-name"></label>
       <label>Base URL <input id="ed-url" placeholder="https://host:8443"></label>
       <label>Tags (comma-separated) <input id="ed-tags"></label>
@@ -184,6 +186,49 @@
         <button class="ghost" onclick="closeNotify()">Cancel</button>
         <button onclick="saveNotify()">Save</button>
       </div>
+      <h3 class="small" style="margin:16px 0 4px">Recent events <span class="muted">(since controller restart)</span></h3>
+      <div id="nf-events" class="small" style="max-height:180px;overflow:auto"></div>
+    </div>
+  </div>
+
+  <!-- Audit trail dialog -->
+  <div id="auditModal" class="modal" style="display:none">
+    <div class="modal-card wide" style="width:820px">
+      <div class="row"><h2 style="margin:0;flex:1">Audit trail</h2>
+        <button class="x" onclick="closeAudit()">×</button></div>
+      <div class="row" style="margin:4px 0 10px">
+        <input id="au-q" placeholder="filter (user, host, path, status…)" style="flex:1"
+               onkeydown="if(event.key==='Enter')loadAudit()">
+        <select id="au-limit" style="width:auto" onchange="loadAudit()">
+          <option value="100">last 100</option><option value="200" selected>last 200</option>
+          <option value="500">last 500</option><option value="1000">last 1000</option>
+        </select>
+        <button class="ghost" onclick="loadAudit()">Search</button>
+      </div>
+      <div id="au-body" style="max-height:60vh;overflow:auto"></div>
+    </div>
+  </div>
+
+  <!-- Host detail dialog -->
+  <div id="detailModal" class="modal" style="display:none">
+    <div class="modal-card wide" style="width:760px">
+      <div class="row"><h2 style="margin:0;flex:1" id="dt-title"></h2>
+        <button class="x" onclick="closeDetail()">×</button></div>
+      <div id="dt-body">Loading…</div>
+    </div>
+  </div>
+
+  <!-- Generic confirm / prompt dialog (replaces native confirm()/prompt()) -->
+  <div id="dlgModal" class="modal dlg" style="display:none">
+    <div class="modal-card">
+      <h2 id="dlg-title" style="margin:0 0 10px"></h2>
+      <div id="dlg-body" class="small" style="margin-bottom:6px"></div>
+      <div id="dlg-fields"></div>
+      <div id="dlg-err" class="err"></div>
+      <div class="row end" style="margin-top:12px">
+        <button class="ghost" onclick="dlgResolve(null)">Cancel</button>
+        <button id="dlg-ok" onclick="dlgSubmit()">OK</button>
+      </div>
     </div>
   </div>
 
@@ -202,10 +247,18 @@
         <input id="us-name" placeholder="username" style="width:130px">
         <select id="us-role" style="width:auto"><option>viewer</option><option>operator</option><option>admin</option></select>
         <input id="us-pass" type="password" placeholder="initial password" style="width:170px">
-        <input id="us-tags" placeholder="scope tags (comma-sep, optional)" style="width:200px">
+        <select id="us-scope" style="width:auto" onchange="usScopeChange()"></select>
+        <input id="us-tags" placeholder="custom tags (comma-sep)" style="width:180px;display:none">
         <button onclick="addUser()">Add user</button>
       </div>
       <div id="us-msg" class="small" style="min-height:18px"></div>
+      <h3 class="small" style="margin:14px 0 4px">Scope presets <span class="muted">— named tag groupings; users bound to a preset re-scope when you edit it</span></h3>
+      <div id="pr-list" class="small" style="margin-bottom:6px"></div>
+      <div class="row" style="flex-wrap:wrap">
+        <input id="pr-name" placeholder="preset name" style="width:140px">
+        <input id="pr-tags" placeholder="tags (comma-separated)" style="width:220px">
+        <button class="ghost" onclick="savePreset()">Save preset</button>
+      </div>
     </div>
   </div>
 
@@ -228,6 +281,70 @@ const API = {
 
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function show(id,on){document.getElementById(id).style.display = on ? '' : 'none';}
+
+// ── Generic dialog (replaces native confirm()/prompt()/alert()) ──
+let dlgState = null;   // {resolve, fields, noCancel}
+function uiDialog(opts){
+  return new Promise(res=>{
+    dlgState = {resolve: res, fields: opts.fields||[], noCancel: !!opts.noCancel};
+    document.getElementById('dlg-title').textContent = opts.title || 'Confirm';
+    document.getElementById('dlg-body').textContent = opts.body || '';
+    document.getElementById('dlg-err').textContent = '';
+    document.getElementById('dlg-fields').innerHTML = (opts.fields||[]).map((f,i)=>
+      f.type==='select'
+      ? '<label>'+esc(f.label||'')+' <select id="dlg-f'+i+'">'
+        + (f.options||[]).map(o=>'<option value="'+esc(o.value)+'"'+(o.value===f.value?' selected':'')+'>'+esc(o.label)+'</option>').join('')
+        + '</select></label>'
+      : '<label>'+esc(f.label||'')+' <input id="dlg-f'+i+'" type="'+esc(f.type||'text')
+        +'" value="'+esc(f.value||'')+'" placeholder="'+esc(f.placeholder||'')
+        +'" onkeydown="if(event.key===\'Enter\')dlgSubmit()"></label>').join('');
+    const ok = document.getElementById('dlg-ok');
+    ok.textContent = opts.okLabel || 'OK';
+    ok.style.background = opts.danger ? 'var(--bad)' : '';
+    document.querySelector('#dlgModal .ghost').style.display = opts.noCancel ? 'none' : '';
+    show('dlgModal', true);
+    const f0 = document.getElementById('dlg-f0');
+    setTimeout(()=>{ (f0 || document.getElementById('dlg-ok')).focus(); }, 0);
+  });
+}
+function dlgResolve(v){
+  if(!dlgState) return;
+  if(v===null && dlgState.noCancel) return;   // forced dialogs can't be dismissed
+  const r = dlgState.resolve; dlgState = null; show('dlgModal', false); r(v);
+}
+function dlgSubmit(){
+  if(!dlgState) return;
+  const vals = dlgState.fields.map((f,i)=>document.getElementById('dlg-f'+i).value);
+  dlgResolve(vals.length ? vals : true);
+}
+async function uiConfirm(title, body, opts){
+  opts = opts || {};
+  return !!(await uiDialog({title, body, okLabel: opts.okLabel||'Confirm', danger: opts.danger}));
+}
+async function uiPrompt(title, body, field){
+  const v = await uiDialog({title, body, okLabel:'OK', fields:[field||{}]});
+  return v === null ? null : v[0];
+}
+function uiAlert(title, body){
+  return uiDialog({title, body, okLabel:'OK', noCancel:true}).then(()=>{});
+}
+
+// ── Esc closes the topmost open modal ──
+const MODAL_ORDER = ['dlgModal','detailModal','auditModal','guestsModal','repinModal',
+                     'certModal','svcModal','usersModal','notifyModal','editModal','addModal'];
+document.addEventListener('keydown', e=>{
+  if(e.key !== 'Escape') return;
+  for(const id of MODAL_ORDER){
+    const el = document.getElementById(id);
+    if(el && el.style.display !== 'none'){
+      ({dlgModal: ()=>dlgResolve(null), detailModal: closeDetail, auditModal: closeAudit,
+        guestsModal: closeGuests, repinModal: closeRepin, certModal: closeCert,
+        svcModal: closeSvc, usersModal: closeUsers, notifyModal: closeNotify,
+        editModal: closeEdit, addModal: closeAdd})[id]();
+      return;
+    }
+  }
+});
 function showLogin(){show('app',false);show('login',true);stopPoll();}
 function showApp(){show('login',false);show('app',true);}
 function hbytes(n){ n=Number(n)||0; const u=['B','K','M','G','T','P']; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;} return (i?n.toFixed(1):n)+u[i]; }
@@ -251,7 +368,7 @@ async function boot(){
   document.getElementById('whoami').textContent = me.user + ' · ' + me.role
     + (me.scope_tags && me.scope_tags.length ? ' · 🏷 ' + me.scope_tags.join(', ') : '');
   const adminUI = me.role === 'admin' ? '' : 'none';
-  ['addBtn','certBtn','notifyBtn','usersBtn'].forEach(i=>document.getElementById(i).style.display = adminUI);
+  ['addBtn','certBtn','notifyBtn','usersBtn','auditBtn'].forEach(i=>document.getElementById(i).style.display = adminUI);
   setTab(tab);
   await refresh();
   startPoll();
@@ -270,12 +387,16 @@ async function doLogin(e){
 }
 async function forceChangePassword(oldpw){
   for(;;){
-    const np = prompt('This account must set a new password before continuing (min 8 chars):');
-    if(np===null) continue;              // can't skip
-    if(np.length < 8){ alert('Too short — at least 8 characters.'); continue; }
-    if(prompt('Confirm the new password:') !== np){ alert('Passwords did not match.'); continue; }
+    const v = await uiDialog({title: 'Set a new password',
+      body: 'This account must set a new password before continuing (min 8 characters).',
+      okLabel: 'Set password', noCancel: true,
+      fields: [{label:'New password', type:'password'},
+               {label:'Confirm new password', type:'password'}]});
+    const [np, cf] = v || ['',''];
+    if(np.length < 8){ await uiAlert('Too short', 'The password must be at least 8 characters.'); continue; }
+    if(np !== cf){ await uiAlert('Mismatch', 'The passwords did not match — try again.'); continue; }
     try{ await API.post('account/password', {old_password: oldpw, new_password: np}); return; }
-    catch(e){ alert(e.message); }
+    catch(e){ await uiAlert('Error', e.message); }
   }
 }
 async function doLogout(){ try{await API.post('logout');}catch(e){} showLogin(); }
@@ -296,6 +417,12 @@ async function loadFleet(fresh){
   u.textContent = 'updated ' + new Date().toLocaleTimeString() + (data.cached ? ' (cached '+data.cache_age+'s)' : '');
   loadSparks();   // background — re-renders when it lands
   renderRollup(); render();
+  // Keep an open virt Guests modal current: its power states come from the
+  // fleet envelope, so re-render it whenever fresh fleet data lands.
+  if(guestsNode && document.getElementById('guestsModal').style.display !== 'none'){
+    const gn = nodeById(guestsNode);
+    if(gn && gn.virt) renderGuests();
+  }
 }
 async function loadSparks(){
   try{ const d = await API.get('history/spark?hours=6&buckets=24'); sparks = d.spark||{}; if(tab==='overview') render(); }
@@ -335,15 +462,22 @@ function fmtForecast(fc){
 
 function renderRollup(){
   const r = fleet.rollup;
-  let html = pill('Nodes', r.total) + pill('Healthy', r.healthy, 'ok')
-    + pill('Unreachable', r.unreachable, r.unreachable?'bad':'')
-    + pill('Degraded', r.degraded||0, r.degraded?'warn':'')
-    + pill('Alerts', r.alerts, r.alerts?'warn':'');
-  if (r.vms) html += pill('VMs', r.vms + (r.containers ? ' ('+r.containers+' CT)' : ''));
-  if (r.storage_size) html += pill('Storage', hbytes(r.storage_used)+' / '+hbytes(r.storage_size));
+  let html = pill('Nodes', r.total, '', "goOverview('')")
+    + pill('Healthy', r.healthy, 'ok', "goOverview('')")
+    + pill('Unreachable', r.unreachable, r.unreachable?'bad':'', "goOverview('bad')",
+           'show only unreachable hosts')
+    + pill('Degraded', r.degraded||0, r.degraded?'warn':'', "setTab('alerts')")
+    + pill('Alerts', r.alerts, r.alerts?'warn':'', "setTab('alerts')");
+  if (r.vms) html += pill('VMs', r.vms + (r.containers ? ' ('+r.containers+' CT)' : ''), '', "goOverview('')");
+  if (r.storage_size) html += pill('Storage', hbytes(r.storage_used)+' / '+hbytes(r.storage_size), '', "setTab('storage')");
   document.getElementById('rollup').innerHTML = html;
 }
-function pill(label,val,cls){return '<div class="pill '+(cls||'')+'"><b>'+esc(val)+'</b> '+esc(label)+'</div>';}
+function pill(label,val,cls,onclick,title){
+  return '<div class="pill '+(cls||'')+(onclick?' click':'')+'"'
+    + (onclick?' onclick="'+onclick+'"':'')+(title?' title="'+esc(title)+'"':'')
+    + '><b>'+esc(val)+'</b> '+esc(label)+'</div>';
+}
+function goOverview(status){ statusFilter = status || ''; setTab('overview'); }
 
 // ── Tabs ──
 function setTab(t){
@@ -360,6 +494,10 @@ function render(){
   else if(tab==='alerts') v.innerHTML = alertsView();
   else if(tab==='storage') v.innerHTML = storageView();
   else if(tab==='services') v.innerHTML = servicesView();
+  // Re-rendering replaces the filter input — restore its value and focus so
+  // typing survives the 15s auto-refresh.
+  const hq = document.getElementById('hostq');
+  if(hq && hostFilterFocus){ hq.focus(); hq.setSelectionRange(hq.value.length, hq.value.length); }
 }
 
 function caps(n){ return n.capabilities || []; }
@@ -373,8 +511,8 @@ function category(n){
   if(n.type==='AI') return 'AI';
   return 'General';   // Mixed, Unknown, or anything unclassified
 }
-// ── Tag filter (overview) ──
-let tagFilter = new Set();
+// ── Overview filters: tags (OR), free text, status (from the rollup pills) ──
+let tagFilter = new Set(), hostFilter = '', hostFilterFocus = false, statusFilter = '';
 function allTags(){
   const s = new Set();
   fleet.nodes.forEach(n => (n.tags||[]).forEach(t => s.add(t)));
@@ -386,27 +524,40 @@ function matchesTags(n){
   for(const t of tagFilter) if(nt.has(t)) return true;   // OR across selected tags
   return false;
 }
+function matchesText(n){
+  if(!hostFilter) return true;
+  const q = hostFilter.toLowerCase();
+  return [n.name, urlHost(n.base_url), n.version, n.host_type, (n.tags||[]).join(' ')]
+    .join(' ').toLowerCase().indexOf(q) >= 0;
+}
+function matchesStatus(n){ return statusFilter === 'bad' ? !n.ok : true; }
 function toggleTag(t){ tagFilter.has(t) ? tagFilter.delete(t) : tagFilter.add(t); render(); }
-function clearTags(){ tagFilter.clear(); render(); }
+function clearTags(){ tagFilter.clear(); statusFilter=''; render(); }
 function tagBar(){
   const tags = allTags();
-  if(!tags.length) return '';
+  const filt = '<input id="hostq" class="hostq" placeholder="filter hosts…" value="'+esc(hostFilter)
+    + '" oninput="hostFilter=this.value;render()" onfocus="hostFilterFocus=true" onblur="hostFilterFocus=false">';
   const chips = tags.map(t=>'<span class="tagf'+(tagFilter.has(t)?' on':'')+'" onclick="toggleTag('+esc(JSON.stringify(t))+')">'+esc(t)+'</span>').join('');
-  const clear = tagFilter.size ? '<span class="tagf clear" onclick="clearTags()">clear ✕</span>' : '';
-  return '<div class="tagbar"><span class="muted small">Tags:</span>'+chips+clear+'</div>';
+  const status = statusFilter ? '<span class="tagf on" onclick="statusFilter=\'\';render()" title="clear status filter">unreachable ✕</span>' : '';
+  const clear = (tagFilter.size || statusFilter) ? '<span class="tagf clear" onclick="clearTags()">clear ✕</span>' : '';
+  return '<div class="tagbar">'+filt+(tags.length?'<span class="muted small">Tags:</span>'+chips:'')+status+clear+'</div>';
 }
+// Problems first: unreachable, then warning, then healthy (name-stable within).
+function nodeRank(n){ return !n.ok ? 0 : ((n.health && n.health.length) ? 1 : 2); }
 function overviewView(){
   const groups={};
-  fleet.nodes.filter(matchesTags).forEach(n=>{ const c=category(n); (groups[c]=groups[c]||[]).push(n); });
+  fleet.nodes.filter(n=>matchesTags(n)&&matchesText(n)&&matchesStatus(n))
+    .forEach(n=>{ const c=category(n); (groups[c]=groups[c]||[]).push(n); });
   let html=tagBar();
   let any=false;
   CAT_ORDER.forEach(c=>{
     const list=groups[c]; if(!list||!list.length) return;
     any=true;
+    list.sort((a,b)=> nodeRank(a)-nodeRank(b) || String(a.name).localeCompare(String(b.name)));
     html += '<div class="hgroup"><div class="hgroup-h">'+c+' <span class="muted">('+list.length+')</span></div>'
           + list.map(nodeRow).join('') + '</div>';
   });
-  if(!any) html += '<div class="muted">'+(tagFilter.size?'No hosts match the selected tag(s).':'No hosts enrolled yet.')+'</div>';
+  if(!any) html += '<div class="muted">'+((tagFilter.size||hostFilter||statusFilter)?'No hosts match the current filter.':'No hosts enrolled yet.')+'</div>';
   return html;
 }
 function urlHost(u){ try{ return new URL(u).hostname; }catch(e){ return (u||'').replace(/^[a-z]+:\/\//,'').split(/[:\/]/)[0]; } }
@@ -430,7 +581,14 @@ function nodeRow(n){
   const sparkBad = !!(n.spark && n.spark.healthy===false);
   const virt = !!(n.host_type && n.host_type!=='nexus');
   const awaiting = virt && !n.ok && /await/i.test(n.error||'');
-  const dot = n.ok ? ((alerts||n.stale||nasBad||sparkBad)?'warn':'ok') : (awaiting?'warn':'bad');
+  // Server-computed warning+ conditions (failed services, degraded pools,
+  // stale poll, alerts — same set the notifier fires on) drive the dot; the
+  // legacy client-side signals remain as a fallback for older payloads.
+  const issues = (n.health || []).map(h=>h.detail || h);
+  const warn = issues.length || alerts || n.stale || nasBad || sparkBad;
+  const dot = n.ok ? (warn?'warn':'ok') : (awaiting?'warn':'bad');
+  const dotTitle = n.ok ? (issues.length ? issues.join(' · ') : (warn?'attention needed':'healthy'))
+                        : (awaiting ? 'awaiting first poll' : (n.error||'unreachable'));
   const rm = me && me.role==='admin';
   // version-skew warning: flagged server-side when a nexus node trails the
   // fleet's newest dashboard version.
@@ -519,8 +677,8 @@ function nodeRow(n){
           + '<button class="x" title="Remove" onclick="removeNode(\''+esc(n.id)+'\',\''+esc(n.name)+'\')">×</button>' : '');
 
   return '<div class="hrow">'
-    + '<span class="dot '+dot+'"></span>'
-    + '<div class="hr-name"><b title="'+esc(n.name)+'">'+esc(n.name)+'</b><span class="muted small">'+host+'</span></div>'
+    + '<span class="dot '+dot+'" title="'+esc(dotTitle)+'"></span>'
+    + '<div class="hr-name"><b class="hlink" title="Details — '+esc(n.name)+'" onclick="openDetail(\''+esc(n.id)+'\')">'+esc(n.name)+'</b><span class="muted small">'+host+'</span></div>'
     + mid
     + '<div class="hr-actions">'+actions+'</div></div>';
 }
@@ -531,20 +689,41 @@ function svcState(sv){
 }
 
 async function removeNode(id,name){
-  if(!confirm('Remove node "'+name+'" from the controller? (the node itself is untouched)')) return;
-  try{ await API.del('nodes/'+id); refresh(); }catch(e){ alert(e.message); }
+  if(!(await uiConfirm('Remove host', 'Remove "'+name+'" from the controller? The host itself is untouched.',
+                       {okLabel:'Remove', danger:true}))) return;
+  try{ await API.del('nodes/'+id); refresh(); }catch(e){ await uiAlert('Error', e.message); }
 }
 
-// ── Alerts view ──
+// ── Alerts view: structured health conditions, severity + since ──
+function fmtAgo(iso){
+  if(!iso) return '';
+  const s = (Date.now() - new Date(iso).getTime())/1000;
+  if(s < 90) return 'just now';
+  if(s < 3600) return Math.round(s/60)+'m';
+  if(s < 86400) return Math.round(s/3600)+'h';
+  return (s/86400).toFixed(1).replace(/\.0$/,'')+'d';
+}
 function alertsView(){
-  let rows = [];
+  const rows = [];
   fleet.nodes.forEach(n=>{
-    if(!n.ok){ rows.push(tr([esc(n.name), '<span class="bad">unreachable</span>', esc(n.error||'')])); return; }
-    (((n.summary||{}).alerts)||[]).forEach(a=> rows.push(tr([esc(n.name), '<span class="warn">alert</span>', esc(a)])));
-    ((n.nas&&n.nas.alert_list)||[]).forEach(a=> rows.push(tr([esc(n.name), '<span class="warn">alert</span>', esc(a)])));
+    (n.health||[]).forEach(h=>{
+      const crit = h.severity==='critical';
+      let detail = esc(h.detail);
+      if(h.key==='alerts'){
+        // expand the count into the actual alert messages from the host
+        const msgs = (((n.summary||{}).alerts)||[]).concat((n.nas&&n.nas.alert_list)||[]);
+        if(msgs.length) detail += '<div class="muted small" style="margin-top:2px">'+msgs.map(esc).join('<br>')+'</div>';
+      }
+      rows.push({crit, html: tr(['<b class="hlink" onclick="openDetail(\''+esc(n.id)+'\')">'+esc(n.name)+'</b>',
+        '<span class="'+(crit?'bad':'warn')+'">'+esc(h.severity)+'</span>', detail,
+        '<span class="muted" title="'+esc(h.since||'')+'">'+fmtAgo(h.since)+'</span>'])});
+    });
   });
   if(!rows.length) return '<div class="ok-txt big">✓ No alerts across the fleet.</div>';
-  return '<table class="tbl"><thead>'+tr(['Node','','Message'],'th')+'</thead><tbody>'+rows.join('')+'</tbody></table>';
+  rows.sort((a,b)=> (a.crit?0:1)-(b.crit?0:1));
+  return '<table class="tbl"><thead>'+tr(['Host','Severity','Condition','For'],'th')+'</thead>'
+    + '<tbody>'+rows.map(r=>r.html).join('')+'</tbody></table>'
+    + '<p class="muted small">"For" is how long the condition has been active (tracked since the last controller restart).</p>';
 }
 function tr(cells,th){ const t=th?'th':'td'; return '<tr>'+cells.map(c=>'<'+t+'>'+c+'</'+t+'>').join('')+'</tr>'; }
 
@@ -583,13 +762,20 @@ function nodeById(id){ return (fleet&&fleet.nodes||[]).find(n=>n.id===id); }
 function canWrite(n){ return me && me.role!=='viewer' && n && n.token_role==='admin'; }
 const ACTIONS = ['start','stop','restart','enable','disable'];
 
+let svcProblemsOnly = false;
 function servicesView(){
   const reach = fleet.nodes.filter(n=>n.ok);
   if(!reach.length) return '<div class="muted">No reachable nodes.</div>';
   const cols = {};
   reach.forEach(n=> Object.entries((n.summary||{}).services||{}).forEach(([k,sv])=> cols[k]=sv.name||k));
-  const keys = Object.keys(cols).sort();
-  if(!keys.length) return '<div class="muted">No services reported.</div>';
+  const allKeys = Object.keys(cols).sort();
+  if(!allKeys.length) return '<div class="muted">No services reported.</div>';
+  // "Problems only": hide columns where nothing is down (enabled-but-inactive).
+  const keys = !svcProblemsOnly ? allKeys : allKeys.filter(k=>
+    reach.some(n=>{ const sv=((n.summary||{}).services||{})[k]; return sv && svcState(sv)==='bad'; }));
+  const toggle = '<label class="check small" style="display:inline-flex;align-items:center;gap:6px;margin-left:auto">'
+    + '<input type="checkbox" '+(svcProblemsOnly?'checked':'')
+    + ' onchange="svcProblemsOnly=this.checked;render()"> problems only</label>';
 
   // Bulk bar (operators+ only)
   let bulk = '';
@@ -600,12 +786,16 @@ function servicesView(){
         + tags.map(t=>'<option value="'+esc(t)+'">tag: '+esc(t)+'</option>').join('')+'</select>'
       : '<input type="hidden" id="bk-tag" value="">';
     bulk = '<div class="bulk"><span class="muted">Fleet action:</span>'
-      + '<select id="bk-svc">'+keys.map(k=>'<option value="'+esc(k)+'">'+esc(cols[k])+'</option>').join('')+'</select>'
+      + '<select id="bk-svc">'+allKeys.map(k=>'<option value="'+esc(k)+'">'+esc(cols[k])+'</option>').join('')+'</select>'
       + '<select id="bk-act">'+ACTIONS.map(a=>'<option'+(a==='restart'?' selected':'')+'>'+a+'</option>').join('')+'</select>'
       + tagSel
       + '<button onclick="bulkAction()">Apply</button>'
-      + '<span id="bk-msg" class="muted small"></span></div>';
+      + '<span id="bk-msg" class="muted small"></span>'+toggle+'</div>';
+  } else {
+    bulk = '<div class="bulk">'+toggle+'</div>';
   }
+  if(!keys.length)
+    return bulk + '<div class="ok-txt big">✓ No service problems anywhere.</div>';
 
   let head = tr(['Node'].concat(keys.map(k=>esc(cols[k]))), 'th');
   let rows = reach.map(n=>{
@@ -643,7 +833,10 @@ function renderSvc(){
 }
 async function svcAction(action){
   const n = nodeById(svc.nodeId);
-  if(['stop','restart','disable'].includes(action) && !confirm(action+' '+svc.key+' on '+n.name+'?')) return;
+  if(['stop','restart','disable'].includes(action)
+     && !(await uiConfirm(action.charAt(0).toUpperCase()+action.slice(1)+' service',
+                          action+' '+svc.key+' on '+n.name+'?',
+                          {okLabel:action, danger:action!=='restart'}))) return;
   const msg = document.getElementById('sv-msg'); msg.textContent = action+'…';
   try{
     await API.post('nodes/'+svc.nodeId+'/proxy/service/'+encodeURIComponent(svc.key)+'/'+action);
@@ -665,7 +858,8 @@ async function bulkAction(){
   const tag = tagEl ? tagEl.value : '';
   const msg = document.getElementById('bk-msg');
   const where = tag ? 'every node tagged "'+tag+'" that has it' : 'every node that has it';
-  if(!confirm(action+' "'+service+'" on '+where+'?')) return;
+  if(!(await uiConfirm('Fleet action', action+' "'+service+'" on '+where+'?',
+                       {okLabel:action, danger:action==='stop'||action==='disable'}))) return;
   msg.textContent = 'Running…';
   try{
     const body = {service, action};
@@ -831,7 +1025,8 @@ async function loadCertInfo(){
   }catch(e){ el.innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
 }
 async function regenCert(){
-  if(!confirm('Generate a new self-signed certificate? You must restart the controller to apply.')) return;
+  if(!(await uiConfirm('Regenerate certificate', 'Generate a new self-signed certificate? You must restart the controller to apply.',
+                       {okLabel:'Regenerate'}))) return;
   const m = document.getElementById('cert-msg');
   try{ await API.post('tls/regenerate'); m.innerHTML='<span class="ok-txt">New self-signed cert generated — restart the controller to apply.</span>'; await loadCertInfo(); }
   catch(e){ m.innerHTML='<span class="bad">'+esc(e.message)+'</span>'; }
@@ -904,9 +1099,10 @@ function gBtn(fn, args, lbl, on){
     + ' style="padding:3px 8px;font-size:12px" onclick="'+fn+'('
     + esc(args.map(a=>JSON.stringify(a)).join(','))+')">'+lbl+'</button>';
 }
-function guestTbl(head, rows){
+function guestTbl(head, rows, cols){
+  cols = cols || ['Guest','Type','State','Actions'];
   return (head?'<h3 class="small" style="margin:10px 0 4px">'+esc(head)+'</h3>':'')
-    + '<table class="tbl"><thead><tr><th>Guest</th><th>Type</th><th>State</th><th>Actions</th></tr></thead>'
+    + '<table class="tbl gs-tbl"><thead><tr>'+cols.map(c=>'<th>'+esc(c)+'</th>').join('')+'</tr></thead>'
     + '<tbody>'+rows.join('')+'</tbody></table>';
 }
 function byName(k){ return (a,b)=>String(a[k]||'').localeCompare(String(b[k]||'')); }
@@ -940,13 +1136,15 @@ function renderGuests(){
 }
 async function guestAction(vmId, action, name){
   const hard = (action==='stop');
-  if(!confirm(action.charAt(0).toUpperCase()+action.slice(1)+' "'+name+'"?'
-      + (hard?' (this is a hard power-off — the guest is not shut down cleanly)':''))) return;
+  if(!(await uiConfirm(action.charAt(0).toUpperCase()+action.slice(1)+' guest', '"'+name+'"'
+      + (hard?' — this is a hard power-off; the guest is not shut down cleanly.':''),
+      {okLabel:action, danger:hard}))) return;
   const msg = document.getElementById('gs-msg');
   msg.innerHTML = 'Sending '+esc(action)+' to "'+esc(name)+'"…';
   try{
     await API.post('nodes/'+guestsNode+'/vm/'+encodeURIComponent(vmId)+'/'+action);
-    msg.innerHTML = '<span class="ok-txt">'+esc(action)+' sent. Power state updates on the next poll.</span>';
+    msg.innerHTML = '<span class="ok-txt">'+esc(action)+' accepted ✓</span>'
+      + ' <span class="muted">— the power state updates on the next hypervisor poll (≤60s; this list refreshes itself).</span>';
     await refresh();
     if(guestsNode) renderGuests();
   }catch(e){ msg.innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
@@ -993,11 +1191,13 @@ async function renderNexusGuests(){
           acts = btn('start','Start',!run) + ' ' + btn('stop','Stop',run)
                + ' ' + btn('restart','Restart',run);
         }
-        return '<tr><td><b>'+esc(c.name||c.id)+'</b>'+(c.image?'<br><span class="muted small">'+esc(c.image)+'</span>':'')
-          + '</td><td>Docker</td><td><span class="dot '+(c.state==='running'?'ok':(c.state==='paused'?'warn':'bad'))+'"></span> '+esc(c.status||c.state||'?')
-          + '</td><td>'+acts+'</td></tr>';
+        // Name only — the full image path is hover detail, the verbose
+        // "Up 3 days (healthy)" status likewise; keeps the table narrow.
+        return '<tr><td><b title="'+esc(c.image||'')+'">'+esc(c.name||c.id)+'</b>'
+          + '</td><td title="'+esc(c.status||'')+'"><span class="dot '+(c.state==='running'?'ok':(c.state==='paused'?'warn':'bad'))+'"></span> '+esc(c.state||'?')
+          + '</td><td class="gs-acts">'+acts+'</td></tr>';
       });
-      if(rows.length) parts.push(guestTbl('Docker containers', rows));
+      if(rows.length) parts.push(guestTbl('Docker containers', rows, ['Container','State','Actions']));
     }catch(e){ parts.push('<div class="bad small">Docker: '+esc(e.message)+'</div>'); }
   }
   if(guestsNode !== n.id) return;   // closed / switched host while loading
@@ -1006,7 +1206,9 @@ async function renderNexusGuests(){
 async function lxdAction(name, act){
   const hard = (act==='stop');
   const lbl = act==='restart' ? 'Reboot' : act.charAt(0).toUpperCase()+act.slice(1);
-  if(!confirm(lbl+' "'+name+'"?'+(hard?' (hard stop — the instance is not shut down cleanly)':''))) return;
+  if(!(await uiConfirm(lbl+' instance', '"'+name+'"'
+      + (hard?' — hard stop; the instance is not shut down cleanly.':''),
+      {okLabel:lbl, danger:hard}))) return;
   // shutdown = graceful stop; stop = forced. The node call blocks until done.
   const body = act==='start' ? {action:'start'}
     : act==='restart' ? {action:'restart', timeout:60}
@@ -1014,7 +1216,8 @@ async function lxdAction(name, act){
   await nexusGuestSend('put', 'instances/'+encodeURIComponent(name)+'/state', body, lbl+' '+name);
 }
 async function dockerAction(cid, name, act){
-  if(!confirm(act.charAt(0).toUpperCase()+act.slice(1)+' container "'+name+'"?')) return;
+  if(!(await uiConfirm(act.charAt(0).toUpperCase()+act.slice(1)+' container', '"'+name+'"?',
+                       {okLabel:act, danger:act==='stop'}))) return;
   await nexusGuestSend('post', 'docker/containers/'+encodeURIComponent(cid)+'/action',
                        {action: act}, act+' '+name);
 }
@@ -1040,6 +1243,22 @@ async function openNotify(){
     hooks = (c.webhooks||[]).map(h=>({id:h.id, name:h.name, format:h.format, min_severity:h.min_severity, url:'', url_display:h.url_display}));
   }catch(e){ hooks=[]; }
   renderHooks(); show('notifyModal', true);
+  loadNotifyEvents();   // background — fills the Recent-events section
+}
+async function loadNotifyEvents(){
+  const el = document.getElementById('nf-events');
+  try{
+    const d = await API.get('notifications/events');
+    const evs = d.events||[];
+    el.innerHTML = evs.length
+      ? evs.map(e=>'<div style="padding:2px 0;border-bottom:1px solid var(--line)">'
+          + '<span class="muted">'+esc(String(e.ts||'').replace('T',' ').slice(5,19))+'</span> '
+          + '<b>'+esc(e.host)+'</b> '
+          + (e.kind==='recovered' ? '<span class="ok-txt">recovered</span>'
+             : '<span class="'+(e.severity==='critical'?'bad':'warn')+'">firing</span>')
+          + ' — '+esc(e.detail)+'</div>').join('')
+      : '<span class="muted">No state transitions recorded since the controller started.</span>';
+  }catch(e){ el.innerHTML = '<span class="muted">'+esc(e.message)+'</span>'; }
 }
 function closeNotify(){ show('notifyModal', false); }
 function renderHooks(){
@@ -1077,24 +1296,56 @@ async function testNotify(){
 }
 
 // ── Controller users ──
+let scopePresets = {};
 async function openUsers(){
   document.getElementById('us-msg').textContent=''; document.getElementById('us-name').value='';
   document.getElementById('us-pass').value=''; document.getElementById('us-tags').value='';
+  document.getElementById('pr-name').value=''; document.getElementById('pr-tags').value='';
   await loadUsers(); show('usersModal', true);
 }
 function closeUsers(){ show('usersModal', false); }
 function parseTags(s){ return String(s||'').split(',').map(t=>t.trim()).filter(t=>t); }
+function scopeCell(u){
+  if(u.role==='admin') return 'fleet';
+  if(u.scope_preset){
+    const tags = scopePresets[u.scope_preset];
+    return tags ? '<b>'+esc(u.scope_preset)+'</b> ('+esc(tags.join(', '))+')'
+                : '<span class="bad">'+esc(u.scope_preset)+' (missing preset!)</span>';
+  }
+  return (u.tags||[]).length ? esc(u.tags.join(', ')) : 'fleet';
+}
+function usScopeChange(){
+  document.getElementById('us-tags').style.display =
+    document.getElementById('us-scope').value==='custom' ? '' : 'none';
+}
+function renderScopeSelect(){
+  const sel = document.getElementById('us-scope');
+  sel.innerHTML = '<option value="">fleet-wide</option>'
+    + Object.keys(scopePresets).sort().map(p=>'<option value="p:'+esc(p)+'">preset: '+esc(p)+'</option>').join('')
+    + '<option value="custom">custom tags…</option>';
+  usScopeChange();
+}
+function renderPresets(){
+  const names = Object.keys(scopePresets).sort();
+  document.getElementById('pr-list').innerHTML = names.length
+    ? names.map(p=>'<span class="tagf" style="cursor:default"><b>'+esc(p)+'</b> '+esc(scopePresets[p].join(', '))
+        + ' <span class="hlink" title="edit" onclick="editPreset('+esc(JSON.stringify(p))+')">✎</span>'
+        + ' <span class="hlink" title="delete" onclick="delPreset('+esc(JSON.stringify(p))+')">×</span></span>').join(' ')
+    : '<span class="muted">No presets yet — save one below, then pick it when scoping a user.</span>';
+}
 async function loadUsers(){
   const tb = document.getElementById('us-rows');
   try{
-    const d = await API.get('users');
+    const [d, p] = await Promise.all([API.get('users'), API.get('scope-presets')]);
+    scopePresets = p.presets || {};
+    renderScopeSelect(); renderPresets();
     tb.innerHTML = (d.users||[]).map(u=>'<tr><td><b>'+esc(u.username)+'</b>'
       + (u.must_change?' <span class="warn small">(must change pw)</span>':'')+'</td>'
       + '<td>'+esc(u.role)+'</td>'
-      + '<td class="muted small">'+(u.role==='admin'?'fleet':((u.tags||[]).length?esc(u.tags.join(', ')):'fleet'))+'</td>'
+      + '<td class="muted small">'+scopeCell(u)+'</td>'
       + '<td style="text-align:right">'
-      + (u.role==='admin'?'':'<button class="x" title="edit scope tags" onclick="scopeUser('
-          + esc(JSON.stringify(u.username)+','+JSON.stringify((u.tags||[]).join(', ')))+')">🏷</button>')
+      + (u.role==='admin'?'':'<button class="x" title="edit scope" onclick="scopeUser('
+          + esc(JSON.stringify(u.username)+','+JSON.stringify(u.scope_preset||'')+','+JSON.stringify((u.tags||[]).join(', ')))+')">🏷</button>')
       + '<button class="x" title="reset password" onclick="resetUser(\''+esc(u.username)+'\')">🔑</button>'
       + (u.username===me.user?'':'<button class="x" title="delete" onclick="delUser(\''+esc(u.username)+'\')">×</button>')
       + '</td></tr>').join('');
@@ -1104,32 +1355,153 @@ async function addUser(){
   const username = document.getElementById('us-name').value.trim();
   const role = document.getElementById('us-role').value;
   const password = document.getElementById('us-pass').value;
-  const tags = parseTags(document.getElementById('us-tags').value);
+  const scope = document.getElementById('us-scope').value;
   const m = document.getElementById('us-msg');
-  try{ await API.post('users', {username, role, password, tags});
+  const body = {username, role, password};
+  if(scope==='custom') body.tags = parseTags(document.getElementById('us-tags').value);
+  else if(scope.startsWith('p:')) body.scope_preset = scope.slice(2);
+  try{ await API.post('users', body);
     m.innerHTML='<span class="ok-txt">Added '+esc(username)+'.</span>';
     document.getElementById('us-name').value=''; document.getElementById('us-pass').value='';
-    document.getElementById('us-tags').value=''; loadUsers();
+    document.getElementById('us-tags').value=''; document.getElementById('us-scope').value='';
+    usScopeChange(); loadUsers();
   }catch(e){ m.innerHTML='<span class="bad">'+esc(e.message)+'</span>'; }
 }
-async function scopeUser(u, cur){
-  const s = prompt('Scope tags for "'+u+'" (comma-separated; blank = whole fleet):', cur);
-  if(s===null) return;
-  try{ await API.put('users/'+encodeURIComponent(u), {tags: parseTags(s)});
+function editPreset(name){
+  document.getElementById('pr-name').value = name;
+  document.getElementById('pr-tags').value = (scopePresets[name]||[]).join(', ');
+  document.getElementById('pr-name').focus();
+}
+async function savePreset(){
+  const name = document.getElementById('pr-name').value.trim();
+  const tags = parseTags(document.getElementById('pr-tags').value);
+  const m = document.getElementById('us-msg');
+  try{ await API.post('scope-presets', {name, tags});
+    m.innerHTML='<span class="ok-txt">Preset "'+esc(name)+'" saved.</span>';
+    document.getElementById('pr-name').value=''; document.getElementById('pr-tags').value='';
+    loadUsers();
+  }catch(e){ m.innerHTML='<span class="bad">'+esc(e.message)+'</span>'; }
+}
+async function delPreset(name){
+  if(!(await uiConfirm('Delete preset', 'Delete scope preset "'+name+'"? (refused while any user is bound to it)',
+                       {okLabel:'Delete', danger:true}))) return;
+  const m = document.getElementById('us-msg');
+  try{ await API.del('scope-presets/'+encodeURIComponent(name)); m.textContent=''; loadUsers(); }
+  catch(e){ m.innerHTML='<span class="bad">'+esc(e.message)+'</span>'; }
+}
+async function scopeUser(u, curPreset, curTags){
+  const opts = [{value:'', label:'Fleet-wide (no scope)'}]
+    .concat(Object.keys(scopePresets).sort().map(p=>({value:'p:'+p, label:'Preset: '+p+' ('+scopePresets[p].join(', ')+')'})))
+    .concat([{value:'custom', label:'Custom tags…'}]);
+  const v = await uiDialog({title:'Scope for '+u,
+    body:'The login only sees hosts bearing any of the scope tags. Presets resolve live — editing a preset re-scopes every user bound to it.',
+    okLabel:'Apply', fields:[{label:'Scope', type:'select', options:opts,
+      value: curPreset ? 'p:'+curPreset : (curTags ? 'custom' : '')}]});
+  if(v===null) return;
+  const sel = v[0];
+  let body;
+  if(sel==='custom'){
+    const s = await uiPrompt('Custom tags', 'Comma-separated tags for "'+u+'":',
+                             {label:'Tags', value: curTags});
+    if(s===null) return;
+    body = {scope_preset:'', tags: parseTags(s)};
+  } else if(sel.indexOf('p:')===0){
+    body = {scope_preset: sel.slice(2)};
+  } else {
+    body = {scope_preset:'', tags: []};
+  }
+  try{ await API.put('users/'+encodeURIComponent(u), body);
     document.getElementById('us-msg').innerHTML='<span class="ok-txt">Scope updated for '+esc(u)+'.</span>'; loadUsers();
   }catch(e){ document.getElementById('us-msg').innerHTML='<span class="bad">'+esc(e.message)+'</span>'; }
 }
 async function delUser(u){
-  if(!confirm('Delete controller user "'+u+'"?')) return;
+  if(!(await uiConfirm('Delete user', 'Delete controller user "'+u+'"?', {okLabel:'Delete', danger:true}))) return;
   try{ await API.del('users/'+encodeURIComponent(u)); loadUsers(); }
   catch(e){ document.getElementById('us-msg').innerHTML='<span class="bad">'+esc(e.message)+'</span>'; }
 }
 async function resetUser(u){
-  const pw = prompt('New password for "'+u+'" (min 8 chars):');
+  const pw = await uiPrompt('Reset password', 'New password for "'+u+'" (min 8 chars; they must change it on next login):',
+                            {label:'New password', type:'password'});
   if(!pw) return;
   try{ await API.put('users/'+encodeURIComponent(u), {password: pw});
     document.getElementById('us-msg').innerHTML='<span class="ok-txt">Password reset for '+esc(u)+'.</span>'; loadUsers();
   }catch(e){ document.getElementById('us-msg').innerHTML='<span class="bad">'+esc(e.message)+'</span>'; }
+}
+
+// ── Audit trail (admin) ──
+function openAudit(){ document.getElementById('au-q').value=''; show('auditModal', true); loadAudit(); }
+function closeAudit(){ show('auditModal', false); }
+async function loadAudit(){
+  const q = document.getElementById('au-q').value.trim();
+  const limit = document.getElementById('au-limit').value;
+  const b = document.getElementById('au-body');
+  b.innerHTML = '<div class="muted">Loading…</div>';
+  try{
+    const d = await API.get('audit?limit='+limit+(q?'&q='+encodeURIComponent(q):''));
+    const es = d.entries||[];
+    if(!es.length){ b.innerHTML = '<div class="muted">No matching entries.</div>'; return; }
+    b.innerHTML = '<table class="tbl gs-tbl"><thead>'+tr(['Time','User','IP','Action','Target','Status'],'th')+'</thead><tbody>'
+      + es.map(e=>tr([
+          '<span class="muted small" style="white-space:nowrap">'+esc(String(e.ts||'').replace('T',' ').slice(0,19))+'</span>',
+          esc(e.user), '<span class="muted small">'+esc(e.ip)+'</span>',
+          '<span class="small">'+esc((e.method||'')+' '+(e.path||''))+'</span>',
+          esc(e.target||'—'),
+          '<span class="'+((e.status|0)<400?'ok-txt':'bad')+'">'+esc(e.status)+'</span>'])).join('')
+      + '</tbody></table>';
+  }catch(e){ b.innerHTML = '<div class="bad">'+esc(e.message)+'</div>'; }
+}
+
+// ── Host detail drawer ──
+let detailId = null;
+function closeDetail(){ show('detailModal', false); detailId = null; }
+function bigChart(series, label, color){
+  const vals = (series||[]).map(p=>p.v);
+  const pts = vals.filter(v=>v!=null);
+  if(pts.length < 2) return '<div class="muted small" style="margin:8px 0">'+esc(label)+': not enough history yet</div>';
+  const w=660, h=76, n=vals.length, mx=100;
+  let d='', started=false;
+  vals.forEach((v,i)=>{ if(v==null){ started=false; return; }
+    const x=(i/(n-1))*w, y=h-(v/mx)*(h-6)-3;
+    d += (started?'L':'M')+x.toFixed(1)+' '+y.toFixed(1)+' '; started=true; });
+  const last = pts[pts.length-1];
+  return '<div class="chart"><div class="small muted" style="margin:8px 0 2px">'+esc(label)
+    + ' — last 24h · now <b>'+Math.round(last)+'%</b></div>'
+    + '<svg width="100%" height="'+h+'" viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none" style="display:block;background:var(--well);border:1px solid var(--line);border-radius:6px">'
+    + '<line x1="0" y1="'+(h/2)+'" x2="'+w+'" y2="'+(h/2)+'" stroke="var(--line)" stroke-width=".5"/>'
+    + '<path d="'+d+'" fill="none" stroke="'+color+'" stroke-width="1.6" vector-effect="non-scaling-stroke"/></svg></div>';
+}
+async function openDetail(id){
+  detailId = id; show('detailModal', true);
+  const n = nodeById(id);
+  if(!n){ closeDetail(); return; }
+  document.getElementById('dt-title').textContent = n.name;
+  const b = document.getElementById('dt-body');
+  b.innerHTML = '<div class="muted">Loading…</div>';
+  let reg = null, hist = null;
+  try{ const d = await API.get('nodes'); reg = (d.nodes||[]).find(x=>x.id===id) || {}; }catch(e){ reg = {}; }
+  try{ hist = await API.get('history/'+id+'?hours=24&buckets=96'); }catch(e){}
+  if(detailId !== id) return;   // closed / switched while loading
+  const kv = (k,v)=> v ? '<div class="dt-k">'+esc(k)+'</div><div class="dt-v">'+v+'</div>' : '';
+  const avail = hist && hist.availability!=null ? (Math.round(hist.availability*10)/10)+'% (24h)' : null;
+  const health = (n.health||[]).map(h=>'<div><span class="'+(h.severity==='critical'?'bad':'warn')+'">●</span> '
+      + esc(h.detail)+' <span class="muted small">for '+fmtAgo(h.since)+'</span></div>').join('');
+  b.innerHTML =
+    '<div class="dt-grid">'
+    + kv('Status', n.ok ? '<span class="ok-txt">reachable</span>' : '<span class="bad">'+esc(n.error||'unreachable')+'</span>')
+    + kv('Type', esc(n.type||'—') + (reg.type_pinned?' <span class="muted small">(pinned)</span>':' <span class="muted small">(auto)</span>'))
+    + kv('Host type', esc(n.host_type||'nexus'))
+    + kv('URL', '<a href="'+esc(n.base_url)+'" target="_blank" rel="noopener">'+esc(n.base_url)+'</a>')
+    + kv('Version', esc(n.version||'—'))
+    + kv('Token role', esc(n.token_role||reg.role||'—'))
+    + kv('Tags', (n.tags||[]).length ? esc(n.tags.join(', ')) : '')
+    + kv('Capabilities', (reg.capabilities||[]).length ? '<span class="small">'+esc(reg.capabilities.join(', '))+'</span>' : '')
+    + kv('Cert pin', reg.cert_fp ? '<span class="small" style="font-family:ui-monospace,monospace" title="'+esc(reg.cert_fp)+'">'+esc(String(reg.cert_fp).slice(0,32))+'…</span>' : '')
+    + kv('Enrolled', reg.added_at ? esc(String(reg.added_at).slice(0,19).replace('T',' ')) : '')
+    + kv('Last seen', reg.last_seen ? esc(String(reg.last_seen).slice(0,19).replace('T',' ')) : '')
+    + kv('Availability', avail ? esc(avail) : '')
+    + '</div>'
+    + (health ? '<div style="margin-top:10px">'+health+'</div>' : '')
+    + (hist ? bigChart(hist.cpu, 'CPU', 'var(--accent-hov)') + bigChart(hist.mem, 'Memory', '#5b9bd5') : '');
 }
 
 boot();

@@ -71,3 +71,32 @@ def test_webhook_payload_gchat_and_ntfy():
     assert n['data'] == b'body' and n['headers']['Title'] == 'T'
     g = monitoring.webhook_payload('gotify', 'T', 'body')
     assert g['json'] == {'title': 'T', 'message': 'body'}
+
+
+# ── health_entries (drives the overview status dot + Alerts tab) ─────
+def test_health_entries_folds_services_and_pools():
+    env = {'ok': True, 'summary': {
+        'services': {'smbd': {'enabled': 'enabled', 'active': 'inactive'}},
+        'zfs': {'pools': 2, 'online': False}}}
+    entries = monitoring.health_entries(env)
+    keys = {e['key'] for e in entries}
+    assert 'services_down' in keys and 'pool_degraded' in keys
+    assert all(e['severity'] in ('warning', 'critical') and e['detail'] for e in entries)
+
+
+def test_health_entries_excludes_info_level():
+    # version_lag is info — it tints the version text, not the dot.
+    env = {'ok': True, 'summary': {}, 'version_lag': '2.1.0'}
+    assert monitoring.health_entries(env) == []
+
+
+def test_health_entries_healthy_is_empty():
+    env = {'ok': True, 'summary': {
+        'services': {'smbd': {'enabled': 'enabled', 'active': 'active'}},
+        'zfs': {'pools': 1, 'online': True}}}
+    assert monitoring.health_entries(env) == []
+
+
+def test_health_entries_covers_unreachable_hosts():
+    entries = monitoring.health_entries({'ok': False, 'error': 'Connection refused'})
+    assert entries and entries[0]['key'] == 'unreachable'

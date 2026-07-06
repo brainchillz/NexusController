@@ -133,4 +133,25 @@ def vm_action(host, user, password, node_name, kind, vmid, action,
                     verify_ssl=verify_ssl, timeout=CONNECT_TIMEOUT)
     node = px.nodes(node_name)
     guest = node.qemu(vmid) if kind == "qemu" else node.lxc(vmid)
-    return getattr(guest.status, action).post()
+    upid = getattr(guest.status, action).post()
+    _wait_task(node, upid)
+    return upid
+
+
+def _wait_task(node, upid, timeout=10.0):
+    """Briefly poll a submitted task so an immediately-failing action (locked
+    guest, missing config, …) surfaces its error instead of the controller
+    reporting success-at-submission. A task still running when `timeout`
+    expires is fine — long operations keep reporting success-at-accept."""
+    import time
+    deadline = time.time() + timeout
+    while True:
+        st = node.tasks(upid).status.get() or {}
+        if (st.get("status") or "") != "running":
+            exit_ = st.get("exitstatus") or ""
+            if exit_ not in ("", "OK"):
+                raise RuntimeError("task failed: %s" % exit_)
+            return
+        if time.time() >= deadline:
+            return
+        time.sleep(0.5)

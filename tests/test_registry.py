@@ -424,3 +424,51 @@ def test_fleet_action_targets_by_tag(client, monkeypatch):
     assert 'prod' in j['scope']
     # a tag nobody has → 404
     assert client.post('/api/fleet/action', json={'service': 'smbd', 'action': 'restart', 'tags': ['nope']}).status_code == 404
+
+
+# ── login throttling (sliding window) ────────────────────────────────
+def test_login_throttle_per_user():
+    ip, user = '10.9.9.9', 'alice'
+    app._login_fails.clear()
+    t0 = 1000000.0
+    assert not app.login_throttled(ip, user, now=t0)
+    for i in range(app.LOGIN_MAX_PER_USER):
+        app.login_failed(ip, user, now=t0 + i)
+    assert app.login_throttled(ip, user, now=t0 + 10)
+    # another username from the same IP is still fine (until the IP cap)
+    assert not app.login_throttled(ip, 'bob', now=t0 + 10)
+    # the window expires
+    assert not app.login_throttled(ip, user, now=t0 + app.LOGIN_WINDOW + 60)
+    app._login_fails.clear()
+
+
+def test_login_throttle_per_ip_spray():
+    ip = '10.8.8.8'
+    app._login_fails.clear()
+    t0 = 2000000.0
+    for i in range(app.LOGIN_MAX_PER_IP):
+        app.login_failed(ip, 'user%d' % i, now=t0 + i)
+    assert app.login_throttled(ip, 'brand-new-name', now=t0 + 30)
+    app._login_fails.clear()
+
+
+def test_login_success_clears_user_budget():
+    ip, user = '10.7.7.7', 'carol'
+    app._login_fails.clear()
+    t0 = 3000000.0
+    for i in range(app.LOGIN_MAX_PER_USER):
+        app.login_failed(ip, user, now=t0 + i)
+    assert app.login_throttled(ip, user, now=t0 + 10)
+    app.login_succeeded(ip, user)
+    assert not app.login_throttled(ip, user, now=t0 + 10)
+    app._login_fails.clear()
+
+
+# ── audit entry filtering ─────────────────────────────────────────────
+def test_audit_matches_across_fields():
+    e = {'ts': '2026-07-06T10:00:00', 'user': 'admin', 'ip': '10.0.0.1',
+         'method': 'POST', 'path': '/api/nodes', 'target': 'silo', 'status': 200}
+    assert app.audit_matches(e, 'silo')
+    assert app.audit_matches(e, 'post')
+    assert app.audit_matches(e, '10.0.0.1')
+    assert not app.audit_matches(e, 'vcenter')
