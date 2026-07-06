@@ -53,7 +53,7 @@ urllib3.disable_warnings(InsecureRequestWarning)
 app = Flask(__name__, static_url_path='')
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = '0.5.4'
+APP_VERSION = '0.6.0'
 
 
 def env_bool(name, default):
@@ -201,6 +201,56 @@ def _user_role(rec):
     return 'viewer'
 
 
+# ─── Tag-scoped RBAC (pure helpers — unit-tested) ─────────────────────
+def clean_scope_tags(v):
+    """Normalize a user-supplied scope tag list: strings, trimmed, deduped."""
+    if not isinstance(v, list):
+        return []
+    out = []
+    for t in v:
+        t = str(t).strip()[:64]
+        if t and t not in out:
+            out.append(t)
+    return out[:32]
+
+
+def user_scope(rec, role):
+    """Tag scope for an account. None = unscoped (sees the whole fleet):
+    admins are always unscoped — someone has to manage enrollment — and an
+    operator/viewer with no tags keeps today's fleet-wide behavior. Otherwise
+    the set of tags the login is confined to."""
+    if role == 'admin' or not isinstance(rec, dict):
+        return None
+    tags = clean_scope_tags(rec.get('tags') or [])
+    return set(tags) or None
+
+
+def scope_allows(scope, node):
+    """May this tag scope (None or a set) see/touch this host? OR semantics,
+    matching the overview tag filter and tag-targeted fleet actions."""
+    return scope is None or bool(scope & set(node.get('tags') or []))
+
+
+def scoped_fleet(data, scope):
+    """Filter a fleet payload to a scope and recompute the rollup so a scoped
+    account's header pill reflects only the hosts it can see."""
+    if scope is None or not data:
+        return data
+    nodes = [r for r in data.get('nodes', []) if scope_allows(scope, r)]
+    return {**data, 'nodes': nodes, 'rollup': compute_rollup(nodes)}
+
+
+def _scope():
+    """The current request's tag scope (None when unscoped, or outside a
+    request — background threads, CLI paths, and direct test calls are always
+    unscoped). `g` raises RuntimeError outside an app context, which getattr's
+    default does not cover — hence the try."""
+    try:
+        return getattr(g, 'identity_scope', None)
+    except RuntimeError:
+        return None
+
+
 # ─── AuthN / AuthZ ────────────────────────────────────────────────────
 PUBLIC_ENDPOINTS = {'api_login', 'api_me', 'index', 'static'}
 # Writes a non-admin role may still issue (sign out / change own password).
@@ -229,6 +279,7 @@ def require_login():
         return err('Authentication required', 401)
     g.identity_name = name
     g.identity_role = role
+    g.identity_scope = user_scope(_users().get(name), role)
     if request.endpoint in ADMIN_ONLY and role != 'admin':
         return err('Admin role required', 403)
     # viewer is read-only: no state-changing methods.
@@ -280,9 +331,13 @@ def _public_node(n):
 
 
 def _find_node(node_id):
+    """Resolve a node id for the current request. Every per-node route (proxy,
+    drill-in, ws bridge, guest/cert actions, history detail) goes through here,
+    so the tag-scope check lives in this one spot: an out-of-scope host is
+    simply not found (404) — invisible, not merely forbidden."""
     for n in load_nodes().get('nodes', []):
         if n.get('id') == node_id:
-            return n
+            return n if scope_allows(_scope(), n) else None
     return None
 
 
@@ -323,7 +378,9 @@ def api_me():
     if not name:
         return jsonify({'authenticated': False}), 401
     rec = _users().get(name)
+    scope = user_scope(rec, role)
     return jsonify({'authenticated': True, 'user': name, 'role': role,
+                    'scope_tags': sorted(scope) if scope else None,
                     'must_change': bool(isinstance(rec, dict) and rec.get('must_change')),
                     'version': APP_VERSION})
 
@@ -356,6 +413,7 @@ RE_USERNAME = re.compile(r'^[A-Za-z0-9._-]{1,32}$')
 def users_list():
     """List controller logins (no password hashes). Admin-only."""
     out = [{'username': u, 'role': _user_role(r),
+            'tags': clean_scope_tags(r.get('tags') or []) if isinstance(r, dict) else [],
             'must_change': bool(isinstance(r, dict) and r.get('must_change'))}
            for u, r in _users().items()]
     out.sort(key=lambda u: u['username'].lower())
@@ -378,10 +436,15 @@ def users_add():
     cfg = load_config()
     if user in cfg.get('users', {}):
         return err('user already exists')
+    # Optional tag scope: confines an operator/viewer to hosts bearing any of
+    # these tags. Admins are always fleet-wide — don't store a dead scope.
+    tags = clean_scope_tags(data.get('tags')) if role != 'admin' else []
     cfg.setdefault('users', {})[user] = {
-        'password': generate_password_hash(pw), 'role': role, 'must_change': True}
+        'password': generate_password_hash(pw), 'role': role, 'must_change': True,
+        'tags': tags}
     save_config(cfg)
-    g.audit_target = 'user:%s (%s)' % (user, role)
+    g.audit_target = 'user:%s (%s%s)' % (user, role,
+                                         ' @' + ','.join(tags) if tags else '')
     return jsonify({'success': True})
 
 
@@ -405,6 +468,8 @@ def users_update(user):
             return err(f'password must be at least {MIN_PASSWORD_LEN} characters')
         rec['password'] = generate_password_hash(data['password'])
         rec['must_change'] = True   # operator-set password → force a change on first login
+    if 'tags' in data:
+        rec['tags'] = clean_scope_tags(data['tags']) if rec.get('role') != 'admin' else []
     cfg['users'][user] = rec
     save_config(cfg)
     g.audit_target = 'user:%s' % user
@@ -432,7 +497,8 @@ def users_delete(user):
 # ─── Routes: node registry (enrollment) ───────────────────────────────
 @app.route('/api/nodes')
 def nodes_list():
-    return jsonify({'nodes': [_public_node(n) for n in load_nodes().get('nodes', [])]})
+    return jsonify({'nodes': [_public_node(n) for n in load_nodes().get('nodes', [])
+                              if scope_allows(_scope(), n)]})
 
 
 @app.route('/api/host-types')
@@ -857,12 +923,16 @@ def _refresh_fleet():
 @app.route('/api/fleet/summary')
 def fleet_summary():
     fresh = request.args.get('fresh') in ('1', 'true', 'yes')
+    # The cache is shared across users — filter a per-request copy to the
+    # caller's tag scope (scoped accounts get their own rollup), never the
+    # cache itself.
     with _fleet_lock:
         age = time.time() - _fleet_cache['ts']
         if not fresh and _fleet_cache['data'] is not None and age < FLEET_CACHE_TTL:
-            return jsonify({**_fleet_cache['data'], 'cached': True, 'cache_age': round(age, 1)})
+            return jsonify({**scoped_fleet(_fleet_cache['data'], _scope()),
+                            'cached': True, 'cache_age': round(age, 1)})
     data = _refresh_fleet()
-    return jsonify({**data, 'cached': False, 'cache_age': 0})
+    return jsonify({**scoped_fleet(data, _scope()), 'cached': False, 'cache_age': 0})
 
 
 # ─── Notifications: monitor state transitions, POST to webhooks ────────
@@ -1032,6 +1102,8 @@ def history_spark():
     hist = get_history()
     out = {}
     for n in load_nodes().get('nodes', []):
+        if not scope_allows(_scope(), n):
+            continue
         pts = hist.series(n['id'], hours, buckets, metric)
         if pts:
             out[n['id']] = [round(v, 1) if v is not None else None for _, v in pts]
@@ -1053,6 +1125,8 @@ def history_summary():
     hosts = {}
     fleet_pts, fleet_size, fleet_used = {}, 0, 0
     for n in reg:
+        if not scope_allows(_scope(), n):
+            continue   # scoped accounts: their "fleet" forecast = their hosts
         hid = n['id']
         avail, nsamp = hist.availability(hid, hours)
         r = seen.get(hid) or {}
@@ -1177,7 +1251,9 @@ def fleet_action():
         return err('invalid action (start/stop/restart/enable/disable)')
     if not RE_SERVICE.match(service):
         return err('invalid service name')
-    nodes = load_nodes().get('nodes', [])
+    # A tag-scoped account can only ever reach its own hosts, whatever the
+    # selector below says (explicit ids included).
+    nodes = [n for n in load_nodes().get('nodes', []) if scope_allows(_scope(), n)]
     scope = 'all nodes'
     # Explicit node_ids win; else an optional tag set narrows the fan-out to
     # hosts bearing ANY of the given tags ("restart smbd on everything tagged

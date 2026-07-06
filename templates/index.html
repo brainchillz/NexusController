@@ -193,13 +193,16 @@
       <div class="row"><h2 style="margin:0;flex:1">Controller Users</h2>
         <button class="x" onclick="closeUsers()">×</button></div>
       <p class="muted small"><b>admin</b> manages nodes + full control · <b>operator</b> controls
-        (no enroll/remove) · <b>viewer</b> is read-only.</p>
-      <table class="tbl"><thead><tr><th>User</th><th>Role</th><th></th></tr></thead>
+        (no enroll/remove) · <b>viewer</b> is read-only. Scope tags confine an
+        operator/viewer to hosts bearing any of those tags (blank = whole fleet;
+        admins are always fleet-wide).</p>
+      <table class="tbl"><thead><tr><th>User</th><th>Role</th><th>Scope</th><th></th></tr></thead>
         <tbody id="us-rows"></tbody></table>
       <div class="row" style="margin-top:12px;flex-wrap:wrap">
         <input id="us-name" placeholder="username" style="width:130px">
         <select id="us-role" style="width:auto"><option>viewer</option><option>operator</option><option>admin</option></select>
         <input id="us-pass" type="password" placeholder="initial password" style="width:170px">
+        <input id="us-tags" placeholder="scope tags (comma-sep, optional)" style="width:200px">
         <button onclick="addUser()">Add user</button>
       </div>
       <div id="us-msg" class="small" style="min-height:18px"></div>
@@ -245,7 +248,8 @@ async function boot(){
   catch(e){ showLogin(); return; }
   showApp();
   loadHostTypes();
-  document.getElementById('whoami').textContent = me.user + ' · ' + me.role;
+  document.getElementById('whoami').textContent = me.user + ' · ' + me.role
+    + (me.scope_tags && me.scope_tags.length ? ' · 🏷 ' + me.scope_tags.join(', ') : '');
   const adminUI = me.role === 'admin' ? '' : 'none';
   ['addBtn','certBtn','notifyBtn','usersBtn'].forEach(i=>document.getElementById(i).style.display = adminUI);
   setTab(tab);
@@ -387,7 +391,7 @@ function clearTags(){ tagFilter.clear(); render(); }
 function tagBar(){
   const tags = allTags();
   if(!tags.length) return '';
-  const chips = tags.map(t=>'<span class="tagf'+(tagFilter.has(t)?' on':'')+'" onclick="toggleTag('+JSON.stringify(t)+')">'+esc(t)+'</span>').join('');
+  const chips = tags.map(t=>'<span class="tagf'+(tagFilter.has(t)?' on':'')+'" onclick="toggleTag('+esc(JSON.stringify(t))+')">'+esc(t)+'</span>').join('');
   const clear = tagFilter.size ? '<span class="tagf clear" onclick="clearTags()">clear ✕</span>' : '';
   return '<div class="tagbar"><span class="muted small">Tags:</span>'+chips+clear+'</div>';
 }
@@ -418,6 +422,9 @@ function miniMeter(label,pct){ pct=Math.max(0,Math.min(100,Math.round(pct)));
 // reaches) — not the host's self-reported system.ip, which can be a container IP.
 function nodeRow(n){
   const s = n.summary||{}, res = n.resources||{};
+  // The node's summary hook nests module blocks under the module id, so the
+  // docker counts arrive as summary.docker.docker.{containers,running,images}.
+  const dker = s.docker ? (s.docker.docker || s.docker) : null;
   const alerts = (s.alerts||[]).length + (n.nas ? (n.nas.alerts||0) : 0);
   const nasBad = !!(n.nas && n.nas.pools_degraded);
   const sparkBad = !!(n.spark && n.spark.healthy===false);
@@ -480,6 +487,9 @@ function nodeRow(n){
       if(n.instances && n.instances.total) chips.push(chip('CT',
         (n.instances.running||0)+'/'+n.instances.total,
         '', 'LXD instances (containers'+(n.instances.vms?' + '+n.instances.vms+' VM':'')+') running/total'));
+      if(dker && dker.containers) chips.push(chip('Docker',
+        (dker.running||0)+'/'+dker.containers,
+        '', 'Docker containers running/total'+(dker.images!=null?' · '+dker.images+' image(s)':'')));
       if(n.llama){ const h=n.llama.health||{}, up=!!h.ok, mt=h.metrics||{}, model=(n.llama.model||'').split('/').pop()||'(none)';
         chips.push(chip('llama', up?'up':'down', up?'':'bad'));
         chips.push(chip('model', model.length>18?model.slice(0,17)+'…':model, '', model));
@@ -497,7 +507,11 @@ function nodeRow(n){
   const openLbl = (n.nas || n.spark) ? 'Open UI ▸' : (virt ? 'Open console ▸' : 'Open dashboard ▸');
   const openable = n.host_type !== 'agent';   // the agent has no web UI
   const certChanged = !n.ok && /fingerprint changed/i.test(n.error||'');
-  const hasGuests = !!(n.ok && n.virt && (n.virt.vm_list||[]).length);
+  // Guests: virt hosts carry vm_list in the envelope; nexus nodes with the
+  // LXD (instances) or Docker module get their lists fetched on modal open.
+  const nexusGuests = !virt && n.ok
+    && (!!(n.instances && n.instances.total) || !!(dker && dker.containers));
+  const hasGuests = !!(n.ok && n.virt && (n.virt.vm_list||[]).length) || nexusGuests;
   const actions = (n.ok && openable ? '<a class="btn-open" href="'+openUrl+'" target="_blank" rel="noopener">'+openLbl+'</a>':'')
     + (hasGuests ? '<button class="btn-open" title="View / control guests" onclick="openGuests(\''+esc(n.id)+'\')">🖥 Guests</button>' : '')
     + (rm && certChanged ? '<button class="btn-open" style="border-color:var(--bad);color:var(--bad)" title="Certificate changed — review and re-pin" onclick="openRepin(\''+esc(n.id)+'\',\''+esc(n.name)+'\')">🔐 Review cert</button>' : '')
@@ -874,18 +888,40 @@ async function doRepin(){
   }catch(e){ m.innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
 }
 
-// ── Guests (VM/CT) console ──
+// ── Guests (VM/CT/Docker) console ──
+// Virt hosts (proxmox/vmware) act via the controller's vm_action endpoint on
+// the envelope's vm_list; nexus nodes act straight through the reverse-proxy
+// against the node's own LXD (instances) / Docker module endpoints — the node
+// enforces its RBAC + validators, the proxy audits the mutation.
 let guestsNode = null;
 const GUEST_RUNNING = ['running','poweredOn'];
 function guestType(v){ return String(v.vm_id||'').startsWith('lxc-') ? 'CT' : 'VM'; }
 function guestRunning(v){ return GUEST_RUNNING.indexOf(v.power_state) >= 0; }
-function openGuests(id){ guestsNode = id; document.getElementById('gs-msg').textContent=''; renderGuests(); show('guestsModal', true); }
+// Action button with JSON-encoded args, HTML-escaped so the double quotes
+// survive the double-quoted onclick attribute.
+function gBtn(fn, args, lbl, on){
+  return '<button class="ghost" '+(on?'':'disabled')
+    + ' style="padding:3px 8px;font-size:12px" onclick="'+fn+'('
+    + esc(args.map(a=>JSON.stringify(a)).join(','))+')">'+lbl+'</button>';
+}
+function guestTbl(head, rows){
+  return (head?'<h3 class="small" style="margin:10px 0 4px">'+esc(head)+'</h3>':'')
+    + '<table class="tbl"><thead><tr><th>Guest</th><th>Type</th><th>State</th><th>Actions</th></tr></thead>'
+    + '<tbody>'+rows.join('')+'</tbody></table>';
+}
+function byName(k){ return (a,b)=>String(a[k]||'').localeCompare(String(b[k]||'')); }
+function openGuests(id){
+  guestsNode = id; document.getElementById('gs-msg').textContent='';
+  const n = nodeById(id);
+  if(n && n.virt) renderGuests(); else renderNexusGuests();
+  show('guestsModal', true);
+}
 function closeGuests(){ show('guestsModal', false); guestsNode = null; }
 function renderGuests(){
   const n = nodeById(guestsNode);
   if(!n || !n.virt){ closeGuests(); return; }
   document.getElementById('gs-node').textContent = n.name;
-  const list = (n.virt.vm_list||[]).slice().sort((a,b)=>String(a.name||'').localeCompare(String(b.name||'')));
+  const list = (n.virt.vm_list||[]).slice().sort(byName('name'));
   const canAct = me && me.role!=='viewer';
   if(!list.length){ document.getElementById('gs-body').innerHTML='<div class="muted">No guests reported.</div>'; return; }
   const rows = list.map(v=>{
@@ -893,17 +929,14 @@ function renderGuests(){
     const state = '<span class="dot '+(run?'ok':'bad')+'"></span> '+esc(v.power_state||'?');
     let acts = '<span class="muted">—</span>';
     if(canAct){
-      const btn = (a,lbl,on,cls)=> '<button class="'+(cls||'ghost')+'" '+(on?'':'disabled')
-        + ' style="padding:3px 8px;font-size:12px" onclick="guestAction('+JSON.stringify(v.vm_id)+','+JSON.stringify(a)+','+JSON.stringify(v.name||v.vm_id)+')">'+lbl+'</button>';
+      const btn = (a,lbl,on)=> gBtn('guestAction',[v.vm_id,a,v.name||v.vm_id],lbl,on);
       acts = btn('start','Start',!run) + ' ' + btn('shutdown','Shutdown',run)
            + ' ' + btn('reboot','Reboot',run) + ' ' + btn('stop','Stop',run);
     }
     return '<tr><td><b>'+esc(v.name||v.vm_id)+'</b>'+(v.host_name?'<br><span class="muted small">'+esc(v.host_name)+'</span>':'')
       + '</td><td>'+guestType(v)+'</td><td>'+state+'</td><td>'+acts+'</td></tr>';
   });
-  document.getElementById('gs-body').innerHTML =
-    '<table class="tbl"><thead><tr><th>Guest</th><th>Type</th><th>State</th><th>Actions</th></tr></thead>'
-    + '<tbody>'+rows.join('')+'</tbody></table>';
+  document.getElementById('gs-body').innerHTML = guestTbl('', rows);
 }
 async function guestAction(vmId, action, name){
   const hard = (action==='stop');
@@ -916,6 +949,82 @@ async function guestAction(vmId, action, name){
     msg.innerHTML = '<span class="ok-txt">'+esc(action)+' sent. Power state updates on the next poll.</span>';
     await refresh();
     if(guestsNode) renderGuests();
+  }catch(e){ msg.innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
+}
+// Nexus nodes: LXD instances + Docker containers, fetched on open through the
+// proxy (kept out of the fan-out envelope — no payload bloat every refresh).
+async function renderNexusGuests(){
+  const n = nodeById(guestsNode);
+  if(!n){ closeGuests(); return; }
+  document.getElementById('gs-node').textContent = n.name;
+  const body = document.getElementById('gs-body');
+  body.innerHTML = '<div class="muted">Loading…</div>';
+  const wr = canWrite(n), s = n.summary||{}, parts = [];
+  const dker = s.docker ? (s.docker.docker || s.docker) : null;
+  if(has(n,'instances') && n.instances && n.instances.total){
+    try{
+      const insts = await API.get('nodes/'+n.id+'/proxy/instances');
+      const rows = (Array.isArray(insts)?insts:[]).slice().sort(byName('name')).map(i=>{
+        const st = String(i.status||'').toLowerCase();
+        const run = st==='running', stopped = st==='stopped';
+        let acts = '<span class="muted">—</span>';
+        if(wr){
+          const btn = (a,lbl,on)=> gBtn('lxdAction',[i.name,a],lbl,on);
+          acts = btn('start','Start',stopped) + ' ' + btn('shutdown','Shutdown',run)
+               + ' ' + btn('restart','Reboot',run) + ' ' + btn('stop','Stop',!stopped);
+        }
+        const ips = Array.isArray(i.ipv4) ? i.ipv4.join(', ') : (i.ipv4||'');
+        return '<tr><td><b>'+esc(i.name)+'</b>'+(ips?'<br><span class="muted small">'+esc(ips)+'</span>':'')
+          + '</td><td>'+(i.type==='virtual-machine'?'VM':'CT')
+          + '</td><td><span class="dot '+(run?'ok':(stopped?'bad':'warn'))+'"></span> '+esc(i.status||'?')
+          + '</td><td>'+acts+'</td></tr>';
+      });
+      if(rows.length) parts.push(guestTbl('LXD instances', rows));
+    }catch(e){ parts.push('<div class="bad small">LXD instances: '+esc(e.message)+'</div>'); }
+  }
+  if(has(n,'docker') && dker && dker.containers){
+    try{
+      const cts = await API.get('nodes/'+n.id+'/proxy/docker/containers');
+      const rows = (Array.isArray(cts)?cts:[]).slice().sort(byName('name')).map(c=>{
+        const run = c.state==='running' || c.state==='paused';
+        let acts = '<span class="muted">—</span>';
+        if(wr){
+          const btn = (a,lbl,on)=> gBtn('dockerAction',[c.id,c.name||c.id,a],lbl,on);
+          acts = btn('start','Start',!run) + ' ' + btn('stop','Stop',run)
+               + ' ' + btn('restart','Restart',run);
+        }
+        return '<tr><td><b>'+esc(c.name||c.id)+'</b>'+(c.image?'<br><span class="muted small">'+esc(c.image)+'</span>':'')
+          + '</td><td>Docker</td><td><span class="dot '+(c.state==='running'?'ok':(c.state==='paused'?'warn':'bad'))+'"></span> '+esc(c.status||c.state||'?')
+          + '</td><td>'+acts+'</td></tr>';
+      });
+      if(rows.length) parts.push(guestTbl('Docker containers', rows));
+    }catch(e){ parts.push('<div class="bad small">Docker: '+esc(e.message)+'</div>'); }
+  }
+  if(guestsNode !== n.id) return;   // closed / switched host while loading
+  body.innerHTML = parts.length ? parts.join('') : '<div class="muted">No guests reported.</div>';
+}
+async function lxdAction(name, act){
+  const hard = (act==='stop');
+  const lbl = act==='restart' ? 'Reboot' : act.charAt(0).toUpperCase()+act.slice(1);
+  if(!confirm(lbl+' "'+name+'"?'+(hard?' (hard stop — the instance is not shut down cleanly)':''))) return;
+  // shutdown = graceful stop; stop = forced. The node call blocks until done.
+  const body = act==='start' ? {action:'start'}
+    : act==='restart' ? {action:'restart', timeout:60}
+    : {action:'stop', force:hard, timeout:60};
+  await nexusGuestSend('put', 'instances/'+encodeURIComponent(name)+'/state', body, lbl+' '+name);
+}
+async function dockerAction(cid, name, act){
+  if(!confirm(act.charAt(0).toUpperCase()+act.slice(1)+' container "'+name+'"?')) return;
+  await nexusGuestSend('post', 'docker/containers/'+encodeURIComponent(cid)+'/action',
+                       {action: act}, act+' '+name);
+}
+async function nexusGuestSend(method, path, body, what){
+  const msg = document.getElementById('gs-msg');
+  msg.innerHTML = 'Sending '+esc(what)+'…';
+  try{
+    await API[method]('nodes/'+guestsNode+'/proxy/'+path, body);
+    msg.innerHTML = '<span class="ok-txt">'+esc(what)+' — done.</span>';
+    if(guestsNode) renderNexusGuests();   // node applied it synchronously
   }catch(e){ msg.innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
 }
 
@@ -970,30 +1079,45 @@ async function testNotify(){
 // ── Controller users ──
 async function openUsers(){
   document.getElementById('us-msg').textContent=''; document.getElementById('us-name').value='';
-  document.getElementById('us-pass').value=''; await loadUsers(); show('usersModal', true);
+  document.getElementById('us-pass').value=''; document.getElementById('us-tags').value='';
+  await loadUsers(); show('usersModal', true);
 }
 function closeUsers(){ show('usersModal', false); }
+function parseTags(s){ return String(s||'').split(',').map(t=>t.trim()).filter(t=>t); }
 async function loadUsers(){
   const tb = document.getElementById('us-rows');
   try{
     const d = await API.get('users');
     tb.innerHTML = (d.users||[]).map(u=>'<tr><td><b>'+esc(u.username)+'</b>'
       + (u.must_change?' <span class="warn small">(must change pw)</span>':'')+'</td>'
-      + '<td>'+esc(u.role)+'</td><td style="text-align:right">'
+      + '<td>'+esc(u.role)+'</td>'
+      + '<td class="muted small">'+(u.role==='admin'?'fleet':((u.tags||[]).length?esc(u.tags.join(', ')):'fleet'))+'</td>'
+      + '<td style="text-align:right">'
+      + (u.role==='admin'?'':'<button class="x" title="edit scope tags" onclick="scopeUser('
+          + esc(JSON.stringify(u.username)+','+JSON.stringify((u.tags||[]).join(', ')))+')">🏷</button>')
       + '<button class="x" title="reset password" onclick="resetUser(\''+esc(u.username)+'\')">🔑</button>'
       + (u.username===me.user?'':'<button class="x" title="delete" onclick="delUser(\''+esc(u.username)+'\')">×</button>')
       + '</td></tr>').join('');
-  }catch(e){ tb.innerHTML='<tr><td colspan="3" class="bad">'+esc(e.message)+'</td></tr>'; }
+  }catch(e){ tb.innerHTML='<tr><td colspan="4" class="bad">'+esc(e.message)+'</td></tr>'; }
 }
 async function addUser(){
   const username = document.getElementById('us-name').value.trim();
   const role = document.getElementById('us-role').value;
   const password = document.getElementById('us-pass').value;
+  const tags = parseTags(document.getElementById('us-tags').value);
   const m = document.getElementById('us-msg');
-  try{ await API.post('users', {username, role, password});
+  try{ await API.post('users', {username, role, password, tags});
     m.innerHTML='<span class="ok-txt">Added '+esc(username)+'.</span>';
-    document.getElementById('us-name').value=''; document.getElementById('us-pass').value=''; loadUsers();
+    document.getElementById('us-name').value=''; document.getElementById('us-pass').value='';
+    document.getElementById('us-tags').value=''; loadUsers();
   }catch(e){ m.innerHTML='<span class="bad">'+esc(e.message)+'</span>'; }
+}
+async function scopeUser(u, cur){
+  const s = prompt('Scope tags for "'+u+'" (comma-separated; blank = whole fleet):', cur);
+  if(s===null) return;
+  try{ await API.put('users/'+encodeURIComponent(u), {tags: parseTags(s)});
+    document.getElementById('us-msg').innerHTML='<span class="ok-txt">Scope updated for '+esc(u)+'.</span>'; loadUsers();
+  }catch(e){ document.getElementById('us-msg').innerHTML='<span class="bad">'+esc(e.message)+'</span>'; }
 }
 async function delUser(u){
   if(!confirm('Delete controller user "'+u+'"?')) return;

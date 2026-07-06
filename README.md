@@ -26,7 +26,8 @@ top of them, not a replacement.
   test captures the node's TLS cert fingerprint, role, version, and
   capabilities) and you get storage/share/service chips and alerts in the fleet
   view, fleet-wide service actions, **drill-in to the node's full SPA through
-  the controller** (websocket consoles included), and LXD instance counts.
+  the controller** (websocket consoles included), and LXD instance / Docker
+  container counts with lifecycle control (see *Guest control*).
 - **Virtualization hosts too** — enroll **Proxmox VE, VMware vCenter, or
   standalone ESXi** hosts (username/password) right alongside Nexus nodes. Their
   row shows host count, running/total **VMs & containers**, CPU/RAM, and
@@ -90,10 +91,17 @@ top of them, not a replacement.
   reporting.
 - **Tags** — label hosts (`prod`, `storage`, `rack-3`) and **filter the overview**
   to just those hosts, or **target a fleet action** at a single tag.
+- **Tag-scoped accounts** — confine an operator or viewer login to hosts
+  bearing any of a set of tags. Scoped accounts get a fleet view, rollup,
+  history, and action surface containing **only** their hosts — everything
+  else is invisible (404), enforced server-side. Admins are always fleet-wide.
 - **Guest control** — start / stop / shut down / reboot **VMs and containers**
   on Proxmox and VMware hosts straight from the controller (🖥 Guests), with the
-  same pin-verify + audit trail as every other action. Power operations only —
-  no create or destroy.
+  same pin-verify + audit trail as every other action. Nexus Dashboard nodes
+  running the **LXD (instances)** or **Docker** module get the same modal —
+  their guest lists load on demand and actions go through the authenticated
+  reverse-proxy, so the node's own RBAC, validators, and audit still apply.
+  Power operations only — no create or destroy.
 - **Drill-in** — "Open dashboard ▸" opens a node's *own* dashboard SPA **through**
   the controller; the node's token stays server-side, and every action is audited
   on the controller in addition to the node. This includes the node's
@@ -115,10 +123,11 @@ reverse-proxy**. Nodes never call back — communication is pull-only, so the
 controller's own IP can change without breaking anything (see *Networking*).
 
 Host-type support lives in the **`adapters/` package** — one self-contained
-module per host type (Nexus node, Proxmox, vCenter, ESXi, TrueNAS, SparkDash).
-Each adapter describes its own enrollment UI (label, credential fields,
-placeholders), served to the SPA via `GET /api/host-types`, so **adding a host
-type is one new module + one registry line** — no route or frontend changes.
+module per host type (Nexus node, Proxmox, vCenter, ESXi, TrueNAS, Synology,
+ZimaOS, Unraid, OpenMediaVault, SparkDash, Nexus Agent). Each adapter
+describes its own enrollment UI (label, credential fields, placeholders),
+served to the SPA via `GET /api/host-types`, so **adding a host type is one
+new module + one registry line** — no route or frontend changes.
 
 ## Requirements
 
@@ -279,6 +288,13 @@ returned through the API.
   login is separate from the box's SSH/system accounts). Managed filesystems
   appear as pools, mdadm array state folds into pool health, and SMART
   problems on monitored disks raise alerts.
+- **SparkDash (DGX Spark cluster)** — base URL (`https://head-node:7862`).
+  An API token is optional: blank enrolls monitor-only (SparkDash reads are
+  public); a token is validated at probe and arms write actions through the
+  proxy.
+- **Nexus Agent** — base URL (`https://host:9143`) + the token the agent
+  minted on first start (printed by the installer; `na_…`). Read-only by
+  design — the row shows OS, mounts, load, and uptime, with no Open link.
 
 Virtualization and NAS hosts are polled in the background (default every 60s);
 their row shows the last poll. **Open console ▸** / **Open UI ▸** links to the
@@ -317,6 +333,11 @@ Controller logins have a role: **admin** (manage nodes + full control),
 **operator** (control, no enroll/remove), **viewer** (read-only). Write controls
 are also gated by the *node's* enrolled token role — a node enrolled with a
 readonly token shows as read-only.
+
+An operator or viewer can additionally carry **scope tags** (👥 Users → 🏷):
+the login is then confined to hosts bearing any of those tags — its fleet
+view, rollup, history, and actions cover only those hosts, and every other
+host 404s. Blank scope = whole fleet; admins are always fleet-wide.
 
 ## Security model
 
@@ -367,10 +388,18 @@ changes do matter: a node's `base_url` is stored in the registry; update it with
 | `DELETE` | `/api/nodes/<id>` | un-enroll (admin) |
 | `GET` | `/api/host-types` | adapter descriptors (drive the Add/Edit modal) |
 | `GET` | `/api/fleet/summary` | fan-out rollup (`?fresh=1` bypasses cache) |
-| `POST` | `/api/fleet/action` | fleet-wide service action |
+| `POST` | `/api/fleet/action` | fleet-wide service action (`node_ids` or `tags` selector) |
+| `POST` | `/api/nodes/<id>/vm/<vm_id>/<action>` | guest start/stop/shutdown/reboot (Proxmox/VMware) |
+| `GET` | `/api/nodes/<id>/cert` | pinned vs. now-serving cert fingerprints (admin) |
+| `POST` | `/api/nodes/<id>/repin` | accept a changed cert as the new pin (admin) |
 | `*` | `/api/nodes/<id>/proxy/<path>` | reverse-proxy to a node's `/api/<path>` |
 | `GET` | `/nodes/<id>/` | drill-in: the node's SPA, retargeted |
 | `WS` | `/nodes/<id>/ws/<path>` | drill-in websocket bridge (node console) |
+| `GET/POST/PUT/DELETE` | `/api/users…` | controller login management (admin) |
+| `GET/POST` | `/api/notifications` (+`/test`) | webhook notification config (admin) |
+| `GET` | `/api/history/spark` | recent CPU series per host (sparklines) |
+| `GET` | `/api/history/summary` | availability % + storage forecast per host |
+| `GET` | `/api/history/<id>` | full CPU/mem series for one host |
 | `GET` | `/api/tls/info` | current serving certificate metadata |
 | `POST` | `/api/tls/regenerate` | regenerate the self-signed cert (admin) |
 | `POST` | `/api/tls/cert` | install a supplied cert + key (admin) |
@@ -384,17 +413,23 @@ CONTROLLER_TLS=0 ./venv/bin/python app.py     # HTTP on :9080 for local dev
 ```
 
 Conventions mirror the node app: one Flask app + vanilla-JS SPA, no build step,
-atomic JSON writes, `escapeHtml`/`jsArg`, central RBAC guard.
+atomic JSON writes, `esc()` on all server text, central RBAC guard.
 
 ## Status
 
 Implemented: enrollment + in-UI editing + encrypted registry, in-handshake
 cert-pinning `NodeClient`, cached fan-out fleet view, alerts/storage/services
-aggregation, fleet-wide service actions, drill-in reverse-proxy **incl. a
-websocket bridge for the node's Containers console**, AI/llama status, **LXD
-instance counts for v2 nodes**, node-type classification, **version-skew
-warnings**, a **self-describing host-adapter package** (Proxmox / vCenter /
-ESXi virtualization + TrueNAS NAS, read-only JSON-RPC 2.0 WebSocket, API-key
-auth), TLS certificate management, an embedded-gunicorn runtime, and both
-systemd (`install.sh`) and Docker (`docker-compose.yml`) deployment. The UI
-matches the Nexus Dashboard v2 dark-grey/orange theme.
+aggregation, fleet-wide service actions (tag-targetable), drill-in
+reverse-proxy **incl. a websocket bridge for the node's Containers console**,
+AI/llama status, node-type classification, **version-skew warnings**, a
+**self-describing host-adapter package** (Proxmox / vCenter / ESXi
+virtualization; TrueNAS / Synology / ZimaOS / Unraid / OpenMediaVault NAS;
+SparkDash DGX clusters; Linux + Windows agents), **guest lifecycle control**
+(Proxmox/VMware VMs, and LXD instances + Docker containers on nodes), **push
+notifications** (webhooks, debounced state transitions), **user management**
+with **tag-scoped RBAC**, **history + capacity forecasting** (sparklines,
+days-to-full), **certificate review / re-pin**, tag filtering, TLS certificate
+management, an embedded-gunicorn runtime, and both systemd (`install.sh`) and
+Docker (`docker-compose.yml`) deployment. The UI matches the Nexus Dashboard
+v2 dark-grey/orange theme.
+
