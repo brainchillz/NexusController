@@ -222,8 +222,14 @@ sudo, no external binaries). A `Dockerfile` + `docker-compose.yml` are included.
 # from a checkout on the Docker host:
 echo "CONTROLLER_BIND_IP=192.168.1.10"        >  .env   # host IP to expose on (optional)
 echo "CONTROLLER_ADMIN_PASSWORD=choose-one"   >> .env   # first run only
-docker compose up -d --build
+docker compose pull && docker compose up -d    # prebuilt image (amd64/arm64)
+# or build from source instead:  docker compose up -d --build
 ```
+
+A prebuilt image is published automatically to
+`ghcr.io/brainchillz/nexuscontroller` (`:latest` plus a pinned `sha-` tag per
+commit) on every push to this repo, so pulling is the fastest way to install
+or upgrade.
 
 - State persists in the **`./data`** bind mount (`CONTROLLER_DATA_DIR=/data`):
   the encrypted registry, credentials, audit log, and TLS cert. Back it up by
@@ -231,7 +237,7 @@ docker compose up -d --build
 - Runs as a **non-root** user (uid 10001) with a healthcheck on the SPA root.
 - **Bind to one interface:** set `CONTROLLER_BIND_IP` to publish HTTPS only on a
   specific host IP (default `0.0.0.0`).
-- **Upgrade:** `git pull && docker compose up -d --build` — `./data` survives.
+- **Upgrade:** `git pull && docker compose pull && docker compose up -d` — `./data` survives.
 - **Migrating an existing install:** copy the source controller's
   `controller-auth.json` **and** `nodes.json` into `./data` (keep them together —
   the Fernet key in the auth file decrypts the node tokens), `chown 10001:10001

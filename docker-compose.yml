@@ -14,7 +14,10 @@
 services:
   controller:
     build: .
-    image: nexus-controller:latest
+    # Prebuilt image published by GitHub Actions on every push (amd64+arm64).
+    # `docker compose pull` fetches it; `docker compose up -d --build` still
+    # builds from source.
+    image: ghcr.io/brainchillz/nexuscontroller:latest
     container_name: nexus-controller
     restart: unless-stopped
     # Publish HTTPS only on the chosen host interface (default all).
