@@ -54,7 +54,7 @@ urllib3.disable_warnings(InsecureRequestWarning)
 app = Flask(__name__, static_url_path='')
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = '0.7.1'
+APP_VERSION = '0.7.2'
 
 
 def env_bool(name, default):

@@ -14,9 +14,9 @@
 services:
   controller:
     build: .
-    # Prebuilt image published by GitHub Actions on every push (amd64+arm64).
-    # `docker compose pull` fetches it; `docker compose up -d --build` still
-    # builds from source.
+    # Image name matches the public prebuilt image on ghcr.io (built by the
+    # GitHub mirror's Actions workflow). A local --build tags over it; public
+    # installs can `docker compose pull` instead.
     image: ghcr.io/brainchillz/nexuscontroller:latest
     container_name: nexus-controller
     restart: unless-stopped

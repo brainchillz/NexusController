@@ -6,7 +6,7 @@ import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from .base import (HostAdapter, NodeError, base_envelope, cert_fingerprint,
+from .base import (HostAdapter, NodeError, base_envelope, envelope_error, cert_fingerprint,
                    _split_host_port, decrypt_secret, load_nodes,
                    FANOUT_WORKERS, VIRT_POLL_INTERVAL)
 
@@ -147,7 +147,7 @@ class VirtAdapter(HostAdapter):
             return self.envelope(node, metrics)
         except Exception as e:
             out = base_envelope(node)
-            out['error'] = str(e)
+            out['error'] = envelope_error(node, e)
             out['type_auto'] = self.default_type
             return out
 

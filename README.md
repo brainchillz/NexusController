@@ -228,8 +228,8 @@ docker compose pull && docker compose up -d    # prebuilt image (amd64/arm64)
 
 A prebuilt image is published automatically to
 `ghcr.io/brainchillz/nexuscontroller` (`:latest` plus a pinned `sha-` tag per
-commit) on every push to this repo, so pulling is the fastest way to install
-or upgrade.
+commit) on every push to the GitHub mirror, so pulling is the fastest way to
+install or upgrade.
 
 - State persists in the **`./data`** bind mount (`CONTROLLER_DATA_DIR=/data`):
   the encrypted registry, credentials, audit log, and TLS cert. Back it up by
@@ -453,3 +453,5 @@ days-to-full), **certificate review / re-pin**, tag filtering, TLS certificate
 management, an embedded-gunicorn runtime, and both systemd (`install.sh`) and
 Docker (`docker-compose.yml`) deployment. The UI matches the Nexus Dashboard
 v2 dark-grey/orange theme.
+
+Roadmap: fan-out rate-limiting for very large fleets.

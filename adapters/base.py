@@ -9,8 +9,11 @@ import os
 import ssl
 import socket
 import hashlib
+import logging
 
 import requests
+
+log = logging.getLogger('controller.adapters')
 
 # Per-node call timeout (connect, read) seconds; short so a slow node never
 # blocks the fleet view.
@@ -46,6 +49,52 @@ def load_nodes():
 
 class NodeError(Exception):
     pass
+
+
+# Transport-failure patterns → the terse reason shown in the UI (the row
+# renders "Unreachable: <reason>"). Order matters: a requests exception often
+# contains several of these ("Max retries exceeded … No route to host") and
+# the most specific must win.
+_FRIENDLY_PATTERNS = (
+    ('no route to host', 'no route to host'),
+    ('connection refused', 'connection refused'),
+    ('name or service not known', 'DNS lookup failed'),
+    ('failed to resolve', 'DNS lookup failed'),
+    ('getaddrinfo', 'DNS lookup failed'),
+    ('timed out', 'timed out'),
+    ('timeout', 'timed out'),
+    ('connection aborted', 'connection dropped'),
+    ('connection reset', 'connection dropped'),
+    ('certificate', 'TLS error'),
+    ('ssl', 'TLS error'),
+    ('newconnectionerror', 'connection failed'),
+    ('max retries exceeded', 'connection failed'),
+)
+
+
+def friendly_error(err):
+    """Condense a transport-level exception into a short UI-safe reason.
+    Pure. Messages other layers key off pass through verbatim: 'fingerprint
+    changed' (cert-review flow + monitoring), 'await…' (first-poll warmup),
+    and anything already short (e.g. 'HTTP 503')."""
+    s = str(err or '').strip()
+    low = s.lower()
+    if 'fingerprint changed' in low or low.startswith('await'):
+        return s
+    for pat, reason in _FRIENDLY_PATTERNS:
+        if pat in low:
+            return reason
+    return s if len(s) <= 120 else s[:117] + '…'
+
+
+def envelope_error(node, exc):
+    """Fan-out/poll error → the condensed message for the envelope; the full
+    exception text goes to the log (that's the only place it should appear)."""
+    msg = friendly_error(exc)
+    if msg != str(exc or '').strip():
+        log.warning('%s (%s): %s', node.get('name') or node.get('id'),
+                    node.get('base_url', ''), exc)
+    return msg
 
 
 def _split_host_port(base_url):

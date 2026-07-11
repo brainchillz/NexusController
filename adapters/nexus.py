@@ -2,7 +2,7 @@
 REST API, plus the node-type classification heuristics."""
 import re
 
-from .base import (HostAdapter, NodeClient, NodeError, base_envelope,
+from .base import (HostAdapter, NodeClient, NodeError, base_envelope, envelope_error,
                    cert_fingerprint, pinned_request, _split_host_port,
                    NODE_TIMEOUT)
 
@@ -186,8 +186,8 @@ class NexusAdapter(HostAdapter):
             out['type_auto'] = classify_node(out['summary'], out.get('capabilities'),
                                              out.get('llama'), out.get('instances'))
         except NodeError as e:
-            out['error'] = str(e)
+            out['error'] = envelope_error(node, e)
         except Exception as e:
             # Defense in depth: one node must never crash the whole fan-out.
-            out['error'] = str(e)
+            out['error'] = envelope_error(node, e)
         return out

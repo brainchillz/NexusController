@@ -13,7 +13,7 @@ Integration surface (all sparkdash-native — its API is not reshaped):
   * HTTPS self-signed by default → TOFU fingerprint pinning, asserted
     in-handshake on every poll (pinned_request), same as nexus nodes.
 """
-from .base import (NodeError, base_envelope, cert_fingerprint,
+from .base import (NodeError, base_envelope, envelope_error, cert_fingerprint,
                    _split_host_port, pinned_request, NODE_TIMEOUT)
 from .virt import VirtAdapter
 
@@ -121,7 +121,7 @@ class SparkDashAdapter(VirtAdapter):
             return build_spark_envelope(node, snap)
         except Exception as e:
             out = base_envelope(node)
-            out['error'] = str(e)
+            out['error'] = envelope_error(node, e)
             out['type_auto'] = self.default_type
             return out
 

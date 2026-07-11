@@ -4,7 +4,7 @@ machinery, but authenticates with an API key via ``auth.login_with_api_key``
 (not username/password), classifies as Storage, and normalizes into the `nas`
 envelope. Read-only — the poller only ever calls read methods (+ one reporting
 read). Collector: collectors/truenas.py (lazy websocket-client)."""
-from .base import NodeError, base_envelope, cert_fingerprint, _split_host_port, decrypt_secret
+from .base import NodeError, base_envelope, envelope_error, cert_fingerprint, _split_host_port, decrypt_secret
 from .virt import VirtAdapter
 
 
@@ -85,7 +85,7 @@ class TrueNasAdapter(VirtAdapter):
             return build_nas_envelope(node, metrics)
         except Exception as e:
             out = base_envelope(node)
-            out['error'] = str(e)
+            out['error'] = envelope_error(node, e)
             out['type_auto'] = self.default_type
             return out
 

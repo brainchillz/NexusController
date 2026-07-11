@@ -6,7 +6,7 @@ monitored disks surface as alerts.
 
 Scheme-aware like ZimaOS/Unraid: OMV serves plain HTTP on :80 by default
 (http:// → no cert pin); an https:// URL gets the normal TOFU pin."""
-from .base import NodeError, base_envelope, cert_fingerprint, _split_host_port, decrypt_secret
+from .base import NodeError, base_envelope, envelope_error, cert_fingerprint, _split_host_port, decrypt_secret
 from .virt import VirtAdapter
 from .truenas import build_nas_envelope
 from .zimaos import _scheme
@@ -63,7 +63,7 @@ class OmvAdapter(VirtAdapter):
             return build_nas_envelope(node, metrics)
         except Exception as e:
             out = base_envelope(node)
-            out['error'] = str(e)
+            out['error'] = envelope_error(node, e)
             out['type_auto'] = self.default_type
             return out
 

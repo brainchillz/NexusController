@@ -6,7 +6,7 @@ Token auth + self-signed TLS → the same TOFU in-handshake pinning as a
 dashboard node. Reading /proc is instant, so the agent is fetched LIVE in the
 fan-out (polled=False — the background poller must skip it). An http:// base
 URL (agent behind a TLS proxy with AGENT_TLS=0) skips pinning, like ZimaOS."""
-from .base import (HostAdapter, NodeError, base_envelope, cert_fingerprint,
+from .base import (HostAdapter, NodeError, base_envelope, envelope_error, cert_fingerprint,
                    _split_host_port, pinned_request, decrypt_secret,
                    NODE_TIMEOUT)
 
@@ -102,9 +102,9 @@ class AgentAdapter(HostAdapter):
             payload = self._metrics(node['base_url'], node.get('cert_fp'), token)
             return build_agent_envelope(node, payload)
         except NodeError as e:
-            out['error'] = str(e)
+            out['error'] = envelope_error(node, e)
         except Exception as e:
-            out['error'] = str(e)   # one host must never crash the fan-out
+            out['error'] = envelope_error(node, e)   # one host must never crash the fan-out
         return out
 
     def native_url(self, node):
