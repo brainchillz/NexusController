@@ -472,3 +472,30 @@ def test_audit_matches_across_fields():
     assert app.audit_matches(e, 'post')
     assert app.audit_matches(e, '10.0.0.1')
     assert not app.audit_matches(e, 'vcenter')
+
+
+# ── clean_type (manual type / custom overview category) ──────────────
+def test_clean_type_accepts_builtin_and_custom():
+    assert app.clean_type('Storage') == 'Storage'
+    assert app.clean_type('Backup') == 'Backup'
+    assert app.clean_type('Edge Nodes') == 'Edge Nodes'
+
+
+def test_clean_type_collapses_whitespace():
+    assert app.clean_type('  Edge   Nodes ') == 'Edge Nodes'
+
+
+def test_clean_type_rejects_auto_sentinel():
+    # 'auto' (any case) is the un-pin sentinel, never a stored type.
+    assert app.clean_type('auto') is None
+    assert app.clean_type('AUTO') is None
+    assert app.clean_type(' Auto ') is None
+
+
+def test_clean_type_rejects_unusable():
+    assert app.clean_type('') is None
+    assert app.clean_type('   ') is None
+    assert app.clean_type(None) is None
+    assert app.clean_type(42) is None
+    assert app.clean_type('x' * 25) is None
+    assert app.clean_type('x' * 24) == 'x' * 24

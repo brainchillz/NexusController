@@ -54,7 +54,7 @@ urllib3.disable_warnings(InsecureRequestWarning)
 app = Flask(__name__, static_url_path='')
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = '0.7.2'
+APP_VERSION = '0.7.3'
 
 
 def env_bool(name, default):
@@ -213,6 +213,19 @@ def clean_scope_tags(v):
         if t and t not in out:
             out.append(t)
     return out[:32]
+
+
+def clean_type(v):
+    """Validate a manual host type: a short printable label. Built-ins
+    (Storage/AI/…) and custom labels alike — a custom label becomes its own
+    overview category. Returns the cleaned label, or None if unusable
+    ('auto' is the un-pin sentinel, never a stored type)."""
+    if not isinstance(v, str):
+        return None
+    v = ' '.join(v.split())
+    if not v or len(v) > 24 or v.lower() == 'auto':
+        return None
+    return v
 
 
 def user_scope(rec, role, presets=None):
@@ -715,6 +728,11 @@ def nodes_add():
         return err('name and base_url are required')
     if host_type not in ADAPTERS:
         return err('unknown host type: %s' % host_type)
+    manual_type = None
+    if data.get('type') and data['type'] != 'auto':
+        manual_type = clean_type(data['type'])
+        if not manual_type:
+            return err('invalid type')
     creds = {'token': token,
              'username': (data.get('username') or '').strip(),
              'password': data.get('password') or '',
@@ -764,10 +782,9 @@ def nodes_add():
             pass
     else:
         type_auto = adapter.default_type
-    pinned = bool(data.get('type'))
-    node['type'] = data.get('type') if pinned else type_auto
+    node['type'] = manual_type or type_auto
     node['type_auto'] = type_auto
-    node['type_pinned'] = pinned
+    node['type_pinned'] = bool(manual_type)
     if host_type != 'nexus' and info.get('metrics'):
         _virt_seed_cache(node, info['metrics'])  # so the card renders immediately
     reg.setdefault('nodes', []).append(node)
@@ -792,13 +809,17 @@ def node_update(node_id):
         if 'tags' in data and isinstance(data['tags'], list):
             n['tags'] = [str(t) for t in data['tags']]
         if 'type' in data:
-            # 'auto' un-pins (effective type reverts to type_auto); a concrete
-            # type pins the manual override.
+            # 'auto' un-pins (effective type reverts to type_auto); any other
+            # cleaned label pins the manual override — a custom label becomes
+            # its own overview category.
             if data['type'] == 'auto':
                 n['type_pinned'] = False
                 n['type'] = n.get('type_auto', 'Unknown')
-            elif data['type'] in ('Storage', 'AI', 'Mixed', 'Virtualization', 'Unknown'):
-                n['type'] = data['type']
+            else:
+                label = clean_type(data['type'])
+                if not label:
+                    return err('invalid type')
+                n['type'] = label
                 n['type_pinned'] = True
 
         # A base_url/credential change → re-probe to validate and refresh the

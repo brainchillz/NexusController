@@ -63,6 +63,10 @@
       <label class="nd-userpass">Password <input id="nd-pass" type="password" placeholder="host account password"></label>
       <label class="nd-verify check"><input id="nd-verify" type="checkbox"> Verify the host's TLS certificate</label>
       <label>Tags (comma-separated) <input id="nd-tags" placeholder="prod, storage"></label>
+      <label>Type
+        <select id="nd-type" onchange="typeCustom('nd')"></select>
+      </label>
+      <label id="nd-type-c" style="display:none">Custom category <input id="nd-type-custom" placeholder="Backup"></label>
       <div class="row">
         <button class="ghost" onclick="testNode()">Test connection</button>
         <span id="nd-test" class="muted"></span>
@@ -83,15 +87,10 @@
       <label>Base URL <input id="ed-url" placeholder="https://host:8443"></label>
       <label>Tags (comma-separated) <input id="ed-tags"></label>
       <label>Type
-        <select id="ed-type">
-          <option value="auto">Auto (follow detection)</option>
-          <option value="Storage">Storage</option>
-          <option value="AI">AI</option>
-          <option value="Mixed">Mixed</option>
-          <option value="Virtualization">Virtualization</option>
-          <option value="Unknown">Unknown</option>
-        </select>
+        <!-- options built at open: auto + built-ins + custom categories in the fleet -->
+        <select id="ed-type" onchange="typeCustom('ed')"></select>
       </label>
+      <label id="ed-type-c" style="display:none">Custom category <input id="ed-type-custom" placeholder="Backup"></label>
       <label class="ed-secret"><span id="ed-secret-l">New API token</span> <input id="ed-secret" type="password" placeholder="leave blank to keep the current one"></label>
       <label class="ed-userpass">Username <input id="ed-user" placeholder="root@pam"></label>
       <label class="ed-userpass">New password <input id="ed-pass" type="password" placeholder="leave blank to keep current password"></label>
@@ -505,11 +504,32 @@ function has(n,c){ return caps(n).indexOf(c) >= 0; }
 
 // ── Overview: hosts grouped by category into compact horizontal rows ──
 const CAT_ORDER = ['Storage','Virtualization','AI','General'];
+const BUILTIN_TYPES = ['Storage','AI','Mixed','Virtualization','Unknown'];
 function category(n){
-  if(n.type==='Storage') return 'Storage';
-  if(n.type==='Virtualization') return 'Virtualization';
-  if(n.type==='AI') return 'AI';
-  return 'General';   // Mixed, Unknown, or anything unclassified
+  const t = n.type;
+  if(!t || t==='Mixed' || t==='Unknown') return 'General';
+  return t;   // Storage/Virtualization/AI, or a custom pinned label
+}
+// Type-select options: auto + built-ins + custom categories already in the
+// fleet + "Custom…" (reveals a free-text input → its own overview group).
+function typeOptions(sel, current){
+  const known = new Set(BUILTIN_TYPES);
+  const custom = [...new Set(((fleet&&fleet.nodes)||[]).map(n=>n.type).filter(t=>t&&!known.has(t)))].sort();
+  if(current && current!=='auto' && !known.has(current) && custom.indexOf(current)<0) custom.push(current);
+  const opt = t=>'<option value="'+esc(t)+'">'+esc(t)+'</option>';
+  sel.innerHTML = '<option value="auto">Auto (follow detection)</option>'
+    + BUILTIN_TYPES.map(opt).join('') + custom.map(opt).join('')
+    + '<option value="__custom">Custom…</option>';
+  sel.value = current || 'auto';
+}
+function typeCustom(p){
+  const on = document.getElementById(p+'-type').value==='__custom';
+  document.getElementById(p+'-type-c').style.display = on ? '' : 'none';
+  if(on) document.getElementById(p+'-type-custom').focus();
+}
+function typeValue(p){   // '' = Custom… picked but no name entered yet
+  const v = document.getElementById(p+'-type').value;
+  return v==='__custom' ? document.getElementById(p+'-type-custom').value.trim() : v;
 }
 // ── Overview filters: tags (OR), free text, status (from the rollup pills) ──
 let tagFilter = new Set(), hostFilter = '', hostFilterFocus = false, statusFilter = '';
@@ -550,7 +570,9 @@ function overviewView(){
     .forEach(n=>{ const c=category(n); (groups[c]=groups[c]||[]).push(n); });
   let html=tagBar();
   let any=false;
-  CAT_ORDER.forEach(c=>{
+  // Custom categories slot between the built-ins and the General catch-all.
+  const extras = Object.keys(groups).filter(c=>CAT_ORDER.indexOf(c)<0).sort();
+  CAT_ORDER.slice(0,-1).concat(extras,'General').forEach(c=>{
     const list=groups[c]; if(!list||!list.length) return;
     any=true;
     list.sort((a,b)=> nodeRank(a)-nodeRank(b) || String(a.name).localeCompare(String(b.name)));
@@ -896,7 +918,8 @@ function openAdd(){
   const sel = document.getElementById('nd-htype');
   const kinds = HT_ORDER.length ? HT_ORDER : ['nexus'];
   sel.innerHTML = kinds.map(k=>'<option value="'+esc(k)+'">'+esc(htDesc(k).label||k)+'</option>').join('');
-  ['nd-name','nd-url','nd-secret','nd-user','nd-pass','nd-tags'].forEach(i=>document.getElementById(i).value='');
+  ['nd-name','nd-url','nd-secret','nd-user','nd-pass','nd-tags','nd-type-custom'].forEach(i=>document.getElementById(i).value='');
+  typeOptions(document.getElementById('nd-type'), 'auto'); typeCustom('nd');
   document.getElementById('nd-verify').checked=false; sel.value=kinds[0]; updateAddFields();
   document.getElementById('nd-test').textContent=''; document.getElementById('nd-err').textContent=''; show('addModal',true); }
 function closeAdd(){ show('addModal',false); }
@@ -908,6 +931,9 @@ function nodeForm(){
     base_url: document.getElementById('nd-url').value.trim(),
     tags: document.getElementById('nd-tags').value.split(',').map(t=>t.trim()).filter(Boolean),
   };
+  const t = typeValue('nd');
+  if(t!=='auto') f.type = t;   // may be '' — saveNode rejects that
+
   if(d.auth==='token'){ f.token = document.getElementById('nd-secret').value.trim(); }
   else { f.username = document.getElementById('nd-user').value.trim();
          f.password = document.getElementById('nd-pass').value; }
@@ -935,7 +961,9 @@ async function testNode(){
   }catch(e){ el.textContent=''; document.getElementById('nd-err').textContent = e.message; }
 }
 async function saveNode(){
-  try{ await API.post('nodes', nodeForm()); closeAdd(); refresh(); }
+  const f = nodeForm();
+  if(f.type===''){ document.getElementById('nd-err').textContent = 'Enter a name for the custom category.'; return; }
+  try{ await API.post('nodes', f); closeAdd(); refresh(); }
   catch(e){ document.getElementById('nd-err').textContent = e.message; }
 }
 
@@ -952,7 +980,8 @@ function openEdit(id){
   document.getElementById('ed-name').value = n.name || '';
   document.getElementById('ed-url').value = n.base_url || '';
   document.getElementById('ed-tags').value = (n.tags || []).join(', ');
-  document.getElementById('ed-type').value = n.type_pinned ? (n.type || 'auto') : 'auto';
+  typeOptions(document.getElementById('ed-type'), n.type_pinned ? (n.type || 'auto') : 'auto');
+  document.getElementById('ed-type-custom').value = ''; typeCustom('ed');
   document.getElementById('ed-secret').value = '';
   document.getElementById('ed-user').value = n.username || '';
   document.getElementById('ed-pass').value = '';
@@ -966,7 +995,7 @@ function editForm(){
     name: document.getElementById('ed-name').value.trim(),
     base_url: document.getElementById('ed-url').value.trim(),
     tags: document.getElementById('ed-tags').value.split(',').map(t=>t.trim()).filter(Boolean),
-    type: document.getElementById('ed-type').value,
+    type: typeValue('ed'),   // may be '' — saveEdit rejects that
   };
   const d = htDesc(editType);
   if(d.auth==='token'){ f.token = document.getElementById('ed-secret').value.trim(); }
@@ -993,6 +1022,7 @@ async function testEdit(){
 }
 async function saveEdit(){
   const f = editForm(); const n = nodeById(editId); const d = htDesc(editType);
+  if(f.type===''){ document.getElementById('ed-err').textContent = 'Enter a name for the custom category.'; return; }
   const body = {name: f.name, tags: f.tags, type: f.type};
   if(n && f.base_url && f.base_url !== n.base_url) body.base_url = f.base_url;  // re-probes server-side
   if(d.auth==='token'){ if(f.token) body.token = f.token; }
