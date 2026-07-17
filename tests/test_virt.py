@@ -191,7 +191,7 @@ def test_vm_action_rejected_on_nonvirt_host(client, monkeypatch):
     cfg = A.load_config(); cfg.setdefault('users', {})['admin'] = {
         'password': A.generate_password_hash('x' * 10), 'role': 'admin'}
     A.save_config(cfg)
-    A.save_nodes({'nodes': [{'id': 'a1', 'name': 'silo', 'host_type': 'agent',
+    A.save_nodes({'nodes': [{'id': 'a1', 'name': 'node1', 'host_type': 'agent',
                              'base_url': 'https://10.0.0.6:9143'}]})
     assert client.post('/api/nodes/a1/vm/x/start').status_code == 400
 

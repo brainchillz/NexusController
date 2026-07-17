@@ -56,7 +56,7 @@
         <!-- options are built from /api/host-types (adapter descriptors) -->
         <select id="nd-htype" onchange="updateAddFields()"></select>
       </label>
-      <label>Name <input id="nd-name" placeholder="silo"></label>
+      <label>Name <input id="nd-name" placeholder="node1"></label>
       <label>Base URL <input id="nd-url" placeholder="https://192.168.1.88:8443"></label>
       <label class="nd-secret"><span id="nd-secret-l">API token</span> <input id="nd-secret" type="password"></label>
       <label class="nd-userpass">Username <input id="nd-user" placeholder="root@pam"></label>
@@ -601,13 +601,14 @@ function nodeRow(n){
   const alerts = (s.alerts||[]).length + (n.nas ? (n.nas.alerts||0) : 0);
   const nasBad = !!(n.nas && n.nas.pools_degraded);
   const sparkBad = !!(n.spark && n.spark.healthy===false);
+  const dnsmaqBad = !!(n.dnsmaq && n.dnsmaq.running===false);
   const virt = !!(n.host_type && n.host_type!=='nexus');
   const awaiting = virt && !n.ok && /await/i.test(n.error||'');
   // Server-computed warning+ conditions (failed services, degraded pools,
   // stale poll, alerts — same set the notifier fires on) drive the dot; the
   // legacy client-side signals remain as a fallback for older payloads.
   const issues = (n.health || []).map(h=>h.detail || h);
-  const warn = issues.length || alerts || n.stale || nasBad || sparkBad;
+  const warn = issues.length || alerts || n.stale || nasBad || sparkBad || dnsmaqBad;
   const dot = n.ok ? (warn?'warn':'ok') : (awaiting?'warn':'bad');
   const dotTitle = n.ok ? (issues.length ? issues.join(' · ') : (warn?'attention needed':'healthy'))
                         : (awaiting ? 'awaiting first poll' : (n.error||'unreachable'));
@@ -657,6 +658,21 @@ function nodeRow(n){
       if(x.model){ const m=String(x.model).split('/').pop();
         chips.push(chip('model', m.length>22?m.slice(0,21)+'…':m, '', x.model)); }
       if(x.recipe && !x.model) chips.push(chip('recipe', x.recipe, x.recipe_running?'':'bad'));
+    } else if(n.dnsmaq){
+      const x=n.dnsmaq;
+      // Headline chip: which instance is primary vs a read-only secondary.
+      if(x.role==='secondary') chips.push(chip('Mirror','⬇ secondary','',
+        'read-only replica'+(x.mirror_from?' — synced from '+x.mirror_from:'')));
+      else if(x.role==='primary') chips.push(chip('Mirror','⬆ primary'+(x.peers_total?' '+x.peers_ok+'/'+x.peers_total:''),
+        (x.peers_total&&x.peers_ok<x.peers_total)?'bad':'',
+        'authoritative — pushing to '+x.peers_total+' mirror(s), '+x.peers_ok+' in sync'));
+      else if(x.role==='relay') chips.push(chip('Mirror','⇄ relay','','receives and re-pushes'));
+      else chips.push(chip('Mirror','standalone','','no mirroring configured'));
+      chips.push(chip('DNS', x.dns_enabled?(x.running?'up':'down'):'off',
+        (x.dns_enabled&&!x.running)?'bad':'', 'dnsmasq '+(x.running?'running':'stopped')+(x.mode?' ('+x.mode+' mode)':'')));
+      if(x.hit_ratio!=null) chips.push(chip('hit', Math.round(x.hit_ratio)+'%', '', 'DNS cache hit ratio'));
+      if(x.dhcp_enabled) chips.push(chip('DHCP', (x.active_leases!=null?x.active_leases:0)+' lease'+(x.active_leases===1?'':'s')));
+      if(x.dnsmasq_version) chips.push(chip('dnsmasq','v'+x.dnsmasq_version));
     } else {
       const zfs=s.zfs||{}, disks=s.disks||{};
       if(zfs.pools) chips.push(chip('ZFS', zfs.pools+' pool'+(zfs.pools>1?'s':'')+(zfs.online===false?' ⚠':''), zfs.online===false?'bad':''));
@@ -684,7 +700,7 @@ function nodeRow(n){
   }
 
   const openUrl = virt ? esc(n.base_url)+'/' : '/nodes/'+esc(n.id)+'/';
-  const openLbl = (n.nas || n.spark) ? 'Open UI ▸' : (virt ? 'Open console ▸' : 'Open dashboard ▸');
+  const openLbl = (n.nas || n.spark || n.dnsmaq) ? 'Open UI ▸' : (virt ? 'Open console ▸' : 'Open dashboard ▸');
   const openable = n.host_type !== 'agent';   // the agent has no web UI
   const certChanged = !n.ok && /fingerprint changed/i.test(n.error||'');
   // Guests: virt hosts carry vm_list in the envelope; nexus nodes with the
@@ -795,7 +811,7 @@ function servicesView(){
   // "Problems only": hide columns where nothing is down (enabled-but-inactive).
   const keys = !svcProblemsOnly ? allKeys : allKeys.filter(k=>
     reach.some(n=>{ const sv=((n.summary||{}).services||{})[k]; return sv && svcState(sv)==='bad'; }));
-  const toggle = '<label class="check small" style="display:inline-flex;align-items:center;gap:6px;margin-left:auto">'
+  const toggle = '<label class="check small" style="display:inline-flex;align-items:center;gap:6px;margin-left:auto;white-space:nowrap;flex-shrink:0">'
     + '<input type="checkbox" '+(svcProblemsOnly?'checked':'')
     + ' onchange="svcProblemsOnly=this.checked;render()"> problems only</label>';
 

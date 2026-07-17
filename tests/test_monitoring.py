@@ -43,12 +43,12 @@ def test_host_conditions_services_down():
 
 
 def test_diff_fires_and_recovers():
-    down = {'ok': False, 'id': 'n1', 'name': 'silo', 'error': 'refused'}
-    up = {'ok': True, 'id': 'n1', 'name': 'silo', 'summary': {}}
+    down = {'ok': False, 'id': 'n1', 'name': 'node1', 'error': 'refused'}
+    up = {'ok': True, 'id': 'n1', 'name': 'node1', 'summary': {}}
     prev = monitoring.snapshot_conditions([up])
     cur = monitoring.snapshot_conditions([down])
     ev = monitoring.diff_snapshots(prev, cur)
-    assert len(ev) == 1 and ev[0]['kind'] == 'firing' and ev[0]['host'] == 'silo'
+    assert len(ev) == 1 and ev[0]['kind'] == 'firing' and ev[0]['host'] == 'node1'
     ev2 = monitoring.diff_snapshots(cur, prev)
     assert ev2[0]['kind'] == 'recovered'
 
@@ -59,9 +59,9 @@ def test_diff_ignores_vanished_hosts():
 
 
 def test_format_event():
-    ev = {'host': 'silo', 'key': 'unreachable', 'kind': 'firing',
+    ev = {'host': 'node1', 'key': 'unreachable', 'kind': 'firing',
           'severity': 'critical', 'detail': 'host unreachable'}
-    assert 'silo' in monitoring.format_event(ev) and 'unreachable' in monitoring.format_event(ev)
+    assert 'node1' in monitoring.format_event(ev) and 'unreachable' in monitoring.format_event(ev)
 
 
 def test_webhook_payload_gchat_and_ntfy():

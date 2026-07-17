@@ -55,7 +55,7 @@ def test_store_record_series_availability(tmp_path):
     # 10 cycles: host up 8, down 2; cpu ramps
     for i in range(10):
         ok = i not in (3, 4)
-        env = {'id': 'n1', 'name': 'silo', 'ok': ok,
+        env = {'id': 'n1', 'name': 'node1', 'ok': ok,
                'resources': {'cpu_pct': float(i * 5), 'memory': {'pct': 40.0}} if ok else {},
                'used_bytes': (50 + i) * GB if ok else 0, 'size_bytes': 100 * GB if ok else 0}
         store.record([env], now=now - (10 - i) * 60)

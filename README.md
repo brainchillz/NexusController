@@ -62,6 +62,14 @@ top of them, not a replacement.
   disk/CPU/memory; the dot goes amber when the cluster reports unhealthy. An
   API token is optional (reads are public) — supply one to arm write actions
   through the controller's proxy.
+- **dnsmasq managers too** — enroll a
+  [DNSMAQ-MGR](https://github.com/brainchillz/nexus-dnsmasq-mgr) instance (the
+  DNS/DHCP management appliance) with a read-only API token. The row shows the
+  dnsmasq service state, DNS cache hit ratio, active DHCP leases, and — the
+  headline chip — its **mirror role**: **⬆ primary** (with N/N mirrors in sync)
+  or **⬇ secondary** (a read-only replica, synced from its primary). dnsmasq
+  itself also appears on the **Services** page with a green/red status dot.
+  Same token/self-signed-TLS-pinning model as a Nexus node.
 - **Fleet Overview** — hosts as compact horizontal rows **grouped by type**
   (Storage / Virtualization / AI / General): each row shows reachability, the
   reachable IP, CPU/mem/storage mini-bars, and type-specific chips (ZFS/shares/
@@ -131,7 +139,7 @@ controller's own IP can change without breaking anything (see *Networking*).
 
 Host-type support lives in the **`adapters/` package** — one self-contained
 module per host type (Nexus node, Proxmox, vCenter, ESXi, TrueNAS, Synology,
-ZimaOS, Unraid, OpenMediaVault, SparkDash, Nexus Agent). Each adapter
+ZimaOS, Unraid, OpenMediaVault, SparkDash, Nexus Agent, DNSMAQ-MGR). Each adapter
 describes its own enrollment UI (label, credential fields, placeholders),
 served to the SPA via `GET /api/host-types`, so **adding a host type is one
 new module + one registry line** — no route or frontend changes.
@@ -308,6 +316,11 @@ returned through the API.
 - **Nexus Agent** — base URL (`https://host:9143`) + the token the agent
   minted on first start (printed by the installer; `na_…`). Read-only by
   design — the row shows OS, mounts, load, and uptime, with no Open link.
+- **DNSMAQ-MGR** — base URL (`https://host:8443`) + a **read-only** API token
+  (Settings → API Tokens on the instance). Self-signed TLS is pinned on the
+  test-connection, like a Nexus node. The row shows dnsmasq up/down, cache hit
+  ratio, active leases, and the primary/secondary mirror role; **Open UI ▸**
+  deep-links to the instance's own web UI.
 
 Virtualization and NAS hosts are polled in the background (default every 60s);
 their row shows the last poll. **Open console ▸** / **Open UI ▸** links to the

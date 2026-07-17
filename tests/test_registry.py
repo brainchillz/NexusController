@@ -54,10 +54,10 @@ def test_classify_idle_falls_back_to_capabilities():
 
 # ── registry never leaks the token ───────────────────────────────────
 def test_public_node_strips_token():
-    n = {'id': 'a1', 'name': 'silo', 'token_enc': 'SECRET', 'cert_fp': 'ab'}
+    n = {'id': 'a1', 'name': 'node1', 'token_enc': 'SECRET', 'cert_fp': 'ab'}
     pub = app._public_node(n)
     assert 'token_enc' not in pub
-    assert pub['name'] == 'silo' and pub['cert_fp'] == 'ab'
+    assert pub['name'] == 'node1' and pub['cert_fp'] == 'ab'
 
 
 # ── token encryption at rest ─────────────────────────────────────────
@@ -207,7 +207,7 @@ def test_fetch_one_unreachable_pinned_node_returns_envelope(monkeypatch):
     def boom(method, url, fingerprint, **kw):
         raise adapters.base.NodeError('Connection refused')
     monkeypatch.setattr(adapters.base, 'pinned_request', boom)
-    node = {'id': 'n1', 'name': 'silo', 'base_url': 'https://10.0.0.1:8443',
+    node = {'id': 'n1', 'name': 'node1', 'base_url': 'https://10.0.0.1:8443',
             'cert_fp': 'deadbeef' * 8, 'role': 'admin'}
     out = app._fetch_one(node)
     assert out['ok'] is False
@@ -240,7 +240,7 @@ def test_classify_running_instances_is_virtualization():
 
 
 def test_classify_storage_outranks_instances():
-    # silo: ZFS pools + LXD → stays Storage (containers are secondary).
+    # node1: ZFS pools + LXD → stays Storage (containers are secondary).
     s = {'zfs': {'pools': [{'name': 'tank'}]}}
     assert app.classify_node(s, ['zfs', 'instances'], None, {'running': 3, 'total': 4}) == 'Storage'
 
@@ -302,7 +302,7 @@ def test_adapter_descriptors_complete():
     assert kinds[0] == 'nexus'   # first option in the Add-Host dropdown
     assert set(kinds) == {'nexus', 'proxmox', 'vcenter', 'esxi', 'truenas',
                           'synology', 'zimaos', 'unraid', 'omv', 'sparkdash',
-                          'agent'}
+                          'agent', 'dnsmaq'}
     for d in ds:
         for k in ('kind', 'label', 'auth', 'secret_label', 'url_placeholder',
                   'username_placeholder', 'verify_tls', 'default_type', 'polled'):
@@ -361,7 +361,7 @@ def _admin(client):
 def test_node_cert_reports_mismatch(client, monkeypatch):
     import app as A
     _admin(client)
-    A.save_nodes({'nodes': [{'id': 'c1', 'name': 'silo', 'host_type': 'nexus',
+    A.save_nodes({'nodes': [{'id': 'c1', 'name': 'node1', 'host_type': 'nexus',
                              'base_url': 'https://10.0.0.9:9143', 'cert_fp': 'aa' * 32}]})
     monkeypatch.setattr(A, 'cert_fingerprint', lambda h, p: 'bb' * 32)
     j = client.get('/api/nodes/c1/cert').get_json()
@@ -381,7 +381,7 @@ def test_node_cert_http_has_no_certificate(client, monkeypatch):
 def test_node_repin_accepts_reviewed_fp(client, monkeypatch):
     import app as A
     _admin(client)
-    A.save_nodes({'nodes': [{'id': 'c2', 'name': 'silo', 'host_type': 'nexus',
+    A.save_nodes({'nodes': [{'id': 'c2', 'name': 'node1', 'host_type': 'nexus',
                              'base_url': 'https://10.0.0.9:9143', 'cert_fp': 'aa' * 32}]})
     monkeypatch.setattr(A, 'cert_fingerprint', lambda h, p: 'bb' * 32)
     r = client.post('/api/nodes/c2/repin', json={'expected': 'bb' * 32})
@@ -396,7 +396,7 @@ def test_node_repin_rejects_stale_review(client, monkeypatch):
     rather than trusting whatever is served at click time."""
     import app as A
     _admin(client)
-    A.save_nodes({'nodes': [{'id': 'c3', 'name': 'silo', 'host_type': 'nexus',
+    A.save_nodes({'nodes': [{'id': 'c3', 'name': 'node1', 'host_type': 'nexus',
                              'base_url': 'https://10.0.0.9:9143', 'cert_fp': 'aa' * 32}]})
     monkeypatch.setattr(A, 'cert_fingerprint', lambda h, p: 'cc' * 32)  # now a 3rd cert
     r = client.post('/api/nodes/c3/repin', json={'expected': 'bb' * 32})
@@ -467,8 +467,8 @@ def test_login_success_clears_user_budget():
 # ── audit entry filtering ─────────────────────────────────────────────
 def test_audit_matches_across_fields():
     e = {'ts': '2026-07-06T10:00:00', 'user': 'admin', 'ip': '10.0.0.1',
-         'method': 'POST', 'path': '/api/nodes', 'target': 'silo', 'status': 200}
-    assert app.audit_matches(e, 'silo')
+         'method': 'POST', 'path': '/api/nodes', 'target': 'node1', 'status': 200}
+    assert app.audit_matches(e, 'node1')
     assert app.audit_matches(e, 'post')
     assert app.audit_matches(e, '10.0.0.1')
     assert not app.audit_matches(e, 'vcenter')

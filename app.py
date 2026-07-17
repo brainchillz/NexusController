@@ -41,7 +41,7 @@ import history
 from adapters import (   # host-type seam — see adapters/__init__.py
     NodeError, NodeClient, classify_node, parse_human_bytes, _serves_ai,
     probe_node, build_virt_envelope, build_nas_envelope, build_spark_envelope,
-    build_agent_envelope,
+    build_agent_envelope, build_dnsmaq_envelope,
     cert_fingerprint, _split_host_port, start_virt_poller, ADAPTERS,
     NODE_TIMEOUT, PROXY_TIMEOUT, FANOUT_WORKERS, VIRT_POLL_INTERVAL)
 from adapters import adapter_for as _adapter_for, probe_host as _probe_host
@@ -54,7 +54,7 @@ urllib3.disable_warnings(InsecureRequestWarning)
 app = Flask(__name__, static_url_path='')
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = '0.7.3'
+APP_VERSION = '0.7.5'
 
 
 def env_bool(name, default):
