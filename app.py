@@ -94,6 +94,9 @@ PORT = int(os.environ.get('CONTROLLER_PORT', '9443' if TLS_ENABLED else '9080'))
 FLEET_CACHE_TTL = 12
 
 MIN_PASSWORD_LEN = 8
+# Compared against when a username is unknown, so a missing user costs the same
+# time as a wrong password — no login-timing oracle to enumerate usernames.
+_DUMMY_HASH = generate_password_hash('nexus-controller-dummy')
 # Controller roles, most→least privilege. admin manages nodes + full control;
 # operator controls existing nodes but can't enroll/remove; viewer is read-only.
 ROLES = ('admin', 'operator', 'viewer')
@@ -297,7 +300,12 @@ ADMIN_ONLY = {'nodes_add', 'node_delete', 'node_update', 'node_cert', 'node_repi
 def _resolve_identity():
     user = session.get('user')
     if user:
-        return user, _user_role(_users().get(user))
+        rec = _users().get(user)
+        # A session whose user no longer exists (deleted/renamed) is no longer
+        # valid — reject it rather than granting the leftover cookie any role.
+        if rec is None:
+            return None, None
+        return user, _user_role(rec)
     return None, None
 
 
@@ -465,7 +473,11 @@ def api_login():
     if login_throttled(ip, user):
         return err('Too many failed attempts — try again in a few minutes', 429)
     rec = _users().get(user)
-    if not rec or not check_password_hash(rec.get('password', ''), pw):
+    if not rec:
+        check_password_hash(_DUMMY_HASH, pw)   # equalize timing for unknown users
+        login_failed(ip, user)
+        return err('Invalid credentials', 401)
+    if not check_password_hash(rec.get('password', ''), pw):
         login_failed(ip, user)
         return err('Invalid credentials', 401)
     login_succeeded(ip, user)

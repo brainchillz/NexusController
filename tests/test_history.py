@@ -83,6 +83,10 @@ def test_history_endpoints(client, monkeypatch):
     import app as A
     with client.session_transaction() as s:
         s['user'] = 'admin'
+    # seed a real admin user (a session for a non-existent user is now rejected)
+    cfg = A.load_config(); cfg.setdefault('users', {})['admin'] = {
+        'password': A.generate_password_hash('x' * 10), 'role': 'admin'}
+    A.save_config(cfg)
     # a node in the registry + a seeded history row
     A.save_nodes({'nodes': [{'id': 'h1', 'name': 'box', 'base_url': 'https://x:9143',
                              'host_type': 'agent'}]})
