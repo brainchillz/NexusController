@@ -32,3 +32,23 @@ def test_login_hashes_once_per_path(client, monkeypatch):
     calls['n'] = 0
     client.post('/api/login', json={'username': 'admin', 'password': 'wrong'})
     assert calls['n'] == 1
+
+
+def test_xforwarded_for_only_trusted_from_configured_proxy(client, monkeypatch):
+    """A spoofed X-Forwarded-For must not change the client IP the login
+    throttle keys on — otherwise the throttle is trivially bypassed."""
+    import app as A
+    # No trusted proxy: XFF is ignored, the socket peer wins.
+    monkeypatch.setattr(A, '_TRUSTED_PROXY', '')
+    with A.app.test_request_context('/', environ_base={'REMOTE_ADDR': '203.0.113.5'},
+                                    headers={'X-Forwarded-For': '9.9.9.9'}):
+        assert A._client_ip() == '203.0.113.5'
+
+    # Trusted proxy configured: XFF honoured ONLY when the peer is that proxy.
+    monkeypatch.setattr(A, '_TRUSTED_PROXY', '10.0.0.1')
+    with A.app.test_request_context('/', environ_base={'REMOTE_ADDR': '10.0.0.1'},
+                                    headers={'X-Forwarded-For': '9.9.9.9'}):
+        assert A._client_ip() == '9.9.9.9'
+    with A.app.test_request_context('/', environ_base={'REMOTE_ADDR': '203.0.113.5'},
+                                    headers={'X-Forwarded-For': '9.9.9.9'}):
+        assert A._client_ip() == '203.0.113.5'   # XFF from a non-proxy peer ignored

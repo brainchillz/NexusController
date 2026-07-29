@@ -8,6 +8,15 @@
   <link rel="stylesheet" href="/css/style.css">
 </head>
 <body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+  <symbol id="i-key" viewBox="0 0 24 24"><path d="m21 2-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.78 7.78 5.5 5.5 0 0 1 7.78-7.78zm0 0L15.5 7.5m3 3L22 7l-3-3"/></symbol>
+  <symbol id="i-tag" viewBox="0 0 24 24"><path d="M20.59 13.41 11 3H4v7l9.59 10.59a2 2 0 0 0 2.82 0l4.18-4.18a2 2 0 0 0 0-2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></symbol>
+  <symbol id="i-mon" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></symbol>
+</defs></svg>
   <!-- Login -->
   <div id="login" class="login-wrap" style="display:none">
     <form class="login-card" onsubmit="doLogin(event)">
@@ -34,10 +43,10 @@
       <span id="updated" class="muted small"></span>
       <span id="whoami" class="muted"></span>
       <button class="ghost" onclick="openAdd()" id="addBtn">+ Add Host</button>
-      <button class="ghost" onclick="openNotify()" id="notifyBtn" title="Notifications">🔔 Notify</button>
-      <button class="ghost" onclick="openUsers()" id="usersBtn" title="Users">👥 Users</button>
-      <button class="ghost" onclick="openAudit()" id="auditBtn" title="Audit trail">📜 Audit</button>
-      <button class="ghost" onclick="openCert()" id="certBtn" title="TLS certificate">🔒 Cert</button>
+      <button class="ghost" onclick="openNotify()" id="notifyBtn" title="Notifications"><svg class="ico ico-sm"><use href="#i-bell"/></svg> Notify</button>
+      <button class="ghost" onclick="openUsers()" id="usersBtn" title="Users"><svg class="ico ico-sm"><use href="#i-users"/></svg> Users</button>
+      <button class="ghost" onclick="openAudit()" id="auditBtn" title="Audit trail"><svg class="ico ico-sm"><use href="#i-list"/></svg> Audit</button>
+      <button class="ghost" onclick="openCert()" id="certBtn" title="TLS certificate"><svg class="ico ico-sm"><use href="#i-lock"/></svg> Cert</button>
       <button class="ghost" onclick="refresh()">Refresh</button>
       <button class="ghost" onclick="doLogout()">Sign out</button>
     </header>
@@ -365,7 +374,7 @@ async function boot(){
   showApp();
   loadHostTypes();
   document.getElementById('whoami').textContent = me.user + ' · ' + me.role
-    + (me.scope_tags && me.scope_tags.length ? ' · 🏷 ' + me.scope_tags.join(', ') : '');
+    + (me.scope_tags && me.scope_tags.length ? ' · <svg class="ico ico-sm"><use href="#i-tag"/></svg> ' + me.scope_tags.join(', ') : '');
   const adminUI = me.role === 'admin' ? '' : 'none';
   ['addBtn','certBtn','notifyBtn','usersBtn','auditBtn'].forEach(i=>document.getElementById(i).style.display = adminUI);
   setTab(tab);
@@ -709,8 +718,8 @@ function nodeRow(n){
     && (!!(n.instances && n.instances.total) || !!(dker && dker.containers));
   const hasGuests = !!(n.ok && n.virt && (n.virt.vm_list||[]).length) || nexusGuests;
   const actions = (n.ok && openable ? '<a class="btn-open" href="'+openUrl+'" target="_blank" rel="noopener">'+openLbl+'</a>':'')
-    + (hasGuests ? '<button class="btn-open" title="View / control guests" onclick="openGuests(\''+esc(n.id)+'\')">🖥 Guests</button>' : '')
-    + (rm && certChanged ? '<button class="btn-open" style="border-color:var(--bad);color:var(--bad)" title="Certificate changed — review and re-pin" onclick="openRepin(\''+esc(n.id)+'\',\''+esc(n.name)+'\')">🔐 Review cert</button>' : '')
+    + (hasGuests ? '<button class="btn-open" title="View / control guests" onclick="openGuests(\''+esc(n.id)+'\')"><svg class="ico ico-sm"><use href="#i-mon"/></svg> Guests</button>' : '')
+    + (rm && certChanged ? '<button class="btn-open" style="border-color:var(--bad);color:var(--bad)" title="Certificate changed — review and re-pin" onclick="openRepin(\''+esc(n.id)+'\',\''+esc(n.name)+'\')"><svg class="ico ico-sm"><use href="#i-lock"/></svg> Review cert</button>' : '')
     + (rm ? '<button class="x edit" title="Edit" onclick="openEdit(\''+esc(n.id)+'\')">✎</button>'
           + '<button class="x" title="Remove" onclick="removeNode(\''+esc(n.id)+'\',\''+esc(n.name)+'\')">×</button>' : '');
 
@@ -1391,8 +1400,8 @@ async function loadUsers(){
       + '<td class="muted small">'+scopeCell(u)+'</td>'
       + '<td style="text-align:right">'
       + (u.role==='admin'?'':'<button class="x" title="edit scope" onclick="scopeUser('
-          + esc(JSON.stringify(u.username)+','+JSON.stringify(u.scope_preset||'')+','+JSON.stringify((u.tags||[]).join(', ')))+')">🏷</button>')
-      + '<button class="x" title="reset password" onclick="resetUser(\''+esc(u.username)+'\')">🔑</button>'
+          + esc(JSON.stringify(u.username)+','+JSON.stringify(u.scope_preset||'')+','+JSON.stringify((u.tags||[]).join(', ')))+')"><svg class="ico ico-sm"><use href="#i-tag"/></svg></button>')
+      + '<button class="x" title="reset password" onclick="resetUser(\''+esc(u.username)+'\')"><svg class="ico ico-sm"><use href="#i-key"/></svg></button>'
       + (u.username===me.user?'':'<button class="x" title="delete" onclick="delUser(\''+esc(u.username)+'\')">×</button>')
       + '</td></tr>').join('');
   }catch(e){ tb.innerHTML='<tr><td colspan="4" class="bad">'+esc(e.message)+'</td></tr>'; }

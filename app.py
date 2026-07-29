@@ -338,7 +338,7 @@ def audit_line(method, path, target, status):
         entry = {
             'ts': datetime.now().astimezone().isoformat(timespec='seconds'),
             'user': getattr(g, 'identity_name', '-'),
-            'ip': request.headers.get('X-Forwarded-For', request.remote_addr) or '-',
+            'ip': _client_ip(),
             'method': method, 'path': path, 'target': target or '-', 'status': status,
         }
         with open(os.open(AUDIT_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), 'a') as f:
@@ -460,8 +460,22 @@ def login_succeeded(ip, user):
         _login_fails.pop(('user', ip, user), None)
 
 
+# X-Forwarded-For is client-controlled: trusting it blindly lets an attacker
+# bypass the login throttle (a fresh bucket per spoofed IP) or lock a victim
+# out by forging their address. Honour it ONLY when the request actually comes
+# from a configured reverse proxy; otherwise use the unspoofable socket peer.
+_TRUSTED_PROXY = os.environ.get('CONTROLLER_TRUSTED_PROXY', '').strip()
+
+
 def _client_ip():
-    return request.headers.get('X-Forwarded-For', request.remote_addr) or '-'
+    """Real client IP for the login throttle and audit log. Trusts
+    X-Forwarded-For only from the configured trusted proxy."""
+    peer = request.remote_addr or '-'
+    if _TRUSTED_PROXY and peer == _TRUSTED_PROXY:
+        first = request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+        if first:
+            return first
+    return peer
 
 
 @app.route('/api/login', methods=['POST'])
