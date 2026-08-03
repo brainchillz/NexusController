@@ -53,6 +53,17 @@ def build_spark_envelope(node, snap):
                        'gpu_util_pct': n.get('gpu_util_pct'),
                        'vram_used_mb': n.get('vram_used_mb')} for n in nodes],
     }
+    # Synthetic Services-matrix entries (same trick as the dnsmaq adapter's
+    # dnsmasq row): vLLM always — serving models is the cluster's job, so a
+    # down vLLM reads as enabled-but-inactive (red) — and Ray only when the
+    # snapshot reports a multi-node cluster (solo installs hide Ray).
+    services = {'vllm': {'name': 'vLLM', 'enabled': 'enabled',
+                         'active': 'active' if vllm.get('healthy') else 'inactive'}}
+    if ray.get('nodes_total'):
+        alive = ray.get('nodes_alive') or 0
+        services['ray'] = {'name': 'Ray', 'enabled': 'enabled',
+                           'active': 'active' if alive >= ray['nodes_total'] else 'inactive'}
+    out['summary'] = {'services': services}
     out['type_auto'] = 'AI'
     return out
 

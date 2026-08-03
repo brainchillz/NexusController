@@ -75,3 +75,25 @@ def test_sparkdash_adapter_registered():
     assert a.default_type == 'AI' and a.polled
     d = a.descriptor()
     assert d['label'].startswith('SparkDash') and not d['verify_tls']
+
+
+def test_spark_envelope_services_matrix_entries():
+    # vLLM (and Ray on multi-node clusters) surface in the Services matrix,
+    # same synthetic-entry trick as the dnsmaq adapter.
+    env = app.build_spark_envelope(NODE, SNAP)
+    svcs = env['summary']['services']
+    assert svcs['vllm'] == {'name': 'vLLM', 'enabled': 'enabled', 'active': 'active'}
+    assert svcs['ray'] == {'name': 'Ray', 'enabled': 'enabled', 'active': 'active'}
+
+
+def test_spark_envelope_services_down_states():
+    snap = dict(SNAP)
+    snap['vllm'] = {'healthy': False}
+    snap['ray'] = {'nodes_alive': 1, 'nodes_total': 2}
+    env = app.build_spark_envelope(NODE, snap)
+    svcs = env['summary']['services']
+    assert svcs['vllm']['active'] == 'inactive'   # enabled-but-down → red cell
+    assert svcs['ray']['active'] == 'inactive'
+    # solo install: no ray entry at all
+    snap['ray'] = {}
+    assert 'ray' not in app.build_spark_envelope(NODE, snap)['summary']['services']

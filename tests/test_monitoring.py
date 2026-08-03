@@ -111,3 +111,46 @@ def test_host_conditions_disabled_is_silent():
            'nas': {'pools_degraded': 1}}
     assert monitoring.host_conditions(env) == {}
     assert monitoring.health_entries(env) == []
+
+
+# ── public wallboard state ───────────────────────────────────────────
+def test_board_state_grey_red_green():
+    assert monitoring.board_state({'disabled': True, 'ok': False}) == ('grey', [])
+    s, issues = monitoring.board_state({'ok': False, 'error': 'no route to host'})
+    assert s == 'red' and issues == ['no route to host']
+    s, issues = monitoring.board_state(
+        {'ok': True, 'health': [{'key': 'alerts', 'severity': 'warning', 'detail': '2 active alert(s)'}]})
+    assert s == 'red' and issues == ['2 active alert(s)']
+    assert monitoring.board_state({'ok': True, 'summary': {}})[0] == 'green'
+
+
+def test_board_state_amber_resources():
+    env = {'ok': True, 'summary': {}, 'resources': {'cpu_pct': 97, 'memory': {'pct': 50}}}
+    s, issues = monitoring.board_state(env)
+    assert s == 'amber' and 'high CPU (97%)' in issues
+    env = {'ok': True, 'summary': {}, 'resources': {'memory': {'pct': 95}}}
+    assert monitoring.board_state(env)[0] == 'amber'
+    env = {'ok': True, 'summary': {}, 'used_bytes': 95, 'size_bytes': 100}
+    s, issues = monitoring.board_state(env)
+    assert s == 'amber' and issues == ['storage 95% full']
+
+
+def test_board_state_memory_exemptions():
+    # AI hosts, ZFS hosts, and TrueNAS keep memory pinned by design — high
+    # memory alone must not amber them.
+    mem = {'resources': {'memory': {'pct': 95}}}
+    assert monitoring.board_state({'ok': True, 'type': 'AI', 'summary': {}, **mem})[0] == 'green'
+    assert monitoring.board_state(
+        {'ok': True, 'summary': {'zfs': {'pools': 2}}, **mem})[0] == 'green'
+    assert monitoring.board_state(
+        {'ok': True, 'host_type': 'truenas', 'summary': {}, **mem})[0] == 'green'
+    # …but CPU still ambers them
+    env = {'ok': True, 'type': 'AI', 'summary': {},
+           'resources': {'cpu_pct': 99, 'memory': {'pct': 95}}}
+    s, issues = monitoring.board_state(env)
+    assert s == 'amber' and issues == ['high CPU (99%)']
+
+
+def test_board_state_warmup_is_amber_not_red():
+    s, issues = monitoring.board_state({'ok': False, 'error': 'awaiting first poll'})
+    assert s == 'amber' and issues == ['awaiting first poll']

@@ -166,3 +166,36 @@ def test_check_monitor_envs_unpinned_only(monkeypatch):
     finally:
         with app._check_lock:
             app._check_results.clear()
+
+
+# ── public status endpoint ───────────────────────────────────────────
+def test_api_status_is_public_and_minimal(client, monkeypatch):
+    monkeypatch.setattr(app, 'load_checks', lambda: {'checks': [
+        {'id': 'c9', 'name': 'DNS @ ns', 'service': 'dns', 'target': 'x',
+         'port': 53, 'node_id': None}]})
+    with app._check_lock:
+        app._check_results['c9'] = {'ok': False, 'detail': 'timed out', 'ts': 't'}
+    with app._fleet_lock:
+        saved = app._fleet_cache['data']
+        app._fleet_cache['data'] = {'nodes': [
+            {'id': 'n1', 'name': 'node1', 'type': 'Storage', 'ok': True,
+             'base_url': 'https://secret:9', 'summary': {}},
+            {'id': 'n2', 'name': 'node2', 'ok': False, 'error': 'connection refused'}],
+            'generated_at': 'T'}
+    try:
+        r = client.get('/api/status')   # NO login — must still be 200
+        assert r.status_code == 200
+        d = r.get_json()
+        assert {h['name']: h['state'] for h in d['hosts']} == \
+            {'node1': 'green', 'node2': 'red'}
+        red = next(h for h in d['hosts'] if h['name'] == 'node2')
+        assert red['issues'] == ['connection refused']
+        assert d['checks'][0]['state'] == 'red' and d['checks'][0]['detail'] == 'timed out'
+        # nothing sensitive leaks: no urls/ids/versions in the payload
+        body = r.get_data(as_text=True)
+        assert 'base_url' not in body and 'secret' not in body
+    finally:
+        with app._fleet_lock:
+            app._fleet_cache['data'] = saved
+        with app._check_lock:
+            app._check_results.clear()

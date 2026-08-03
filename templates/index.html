@@ -26,7 +26,23 @@
       <input id="lg-pass" type="password" placeholder="Password" autocomplete="current-password">
       <button type="submit">Sign in</button>
       <div id="lg-err" class="err"></div>
+      <div class="small" style="margin-top:12px;text-align:center">
+        <span class="hlink muted" onclick="show('login',false);showPublic()">← status board</span>
+      </div>
     </form>
+  </div>
+
+  <!-- Public status board (unauthenticated landing) -->
+  <div id="public" style="display:none">
+    <div class="pub-wrap">
+      <div class="row" style="align-items:center;margin-bottom:16px">
+        <div class="brand" style="font-size:22px">Nexus <span>Controller</span></div>
+        <span id="pub-updated" class="muted small" style="margin-left:12px"></span>
+        <div class="spacer"></div>
+        <button class="ghost" onclick="pubSignIn()">Sign in</button>
+      </div>
+      <div id="pub-board" class="muted">Loading status…</div>
+    </div>
   </div>
 
   <!-- App -->
@@ -394,7 +410,7 @@ document.addEventListener('keydown', e=>{
   }
 });
 function showLogin(){show('app',false);show('login',true);stopPoll();}
-function showApp(){show('login',false);show('app',true);}
+function showApp(){ if(typeof pubEnd==='function') pubEnd(); show('login',false);show('app',true);}
 function hbytes(n){ n=Number(n)||0; const u=['B','K','M','G','T','P']; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;} return (i?n.toFixed(1):n)+u[i]; }
 
 let me = null, fleet = null, tab = 'overview', poller = null;
@@ -410,7 +426,7 @@ async function loadHostTypes(){
 
 async function boot(){
   try { me = await API.get('me'); }
-  catch(e){ showLogin(); return; }
+  catch(e){ showPublic(); return; }   // unauthenticated → public status board
   showApp();
   loadHostTypes();
   document.getElementById('whoami').textContent = me.user + ' · ' + me.role
@@ -465,6 +481,7 @@ async function loadFleet(fresh){
   u.textContent = 'updated ' + new Date().toLocaleTimeString() + (data.cached ? ' (cached '+data.cache_age+'s)' : '');
   loadSparks();   // background — re-renders when it lands
   if(tab==='checks') loadChecks().then(()=>{ if(tab==='checks') render(); });
+  if(tab==='alerts') loadStatus().then(()=>{ if(tab==='alerts') render(); });
   renderRollup(); render();
   // Keep an open virt Guests modal current: its power states come from the
   // fleet envelope, so re-render it whenever fresh fleet data lands.
@@ -537,6 +554,7 @@ function setTab(t){
   render();
   if(t==='storage') loadHistSummary().then(()=>{ if(tab==='storage') render(); });
   if(t==='checks') loadChecks().then(()=>{ if(tab==='checks') render(); });
+  if(t==='alerts') loadStatus().then(()=>{ if(tab==='alerts') render(); });
   if(t==='settings') setSection(settingsSection);
 }
 function render(){
@@ -808,6 +826,66 @@ async function removeNode(id,name){
   catch(e){ await uiAlert('Error', e.message); }
 }
 
+// ── Status board: colored host pills by category + checks + issue box.
+//    Shared by the public (unauthenticated) landing and the Alerts tab. ──
+let statusData = null;
+async function loadStatus(){
+  try{ statusData = await API.get('status'); }catch(e){ statusData = null; }
+}
+const BOARD_RANK = {red:0, amber:1, grey:2, green:3};
+function bpill(name, state, title){
+  return '<span class="bpill '+esc(state)+'"'+(title?' title="'+esc(title)+'"':'')+'>'+esc(name)+'</span>';
+}
+function statusBoard(d){
+  if(!d) return '<div class="muted">Loading status…</div>';
+  if(d.warming) return '<div class="muted">Controller is warming up — first poll in progress…</div>';
+  const groups = {};
+  (d.hosts||[]).forEach(h=>{ (groups[h.category]=groups[h.category]||[]).push(h); });
+  const extras = Object.keys(groups).filter(c=>CAT_ORDER.indexOf(c)<0 && c!=='Paused').sort();
+  let html = '<div class="board">';
+  CAT_ORDER.slice(0,-1).concat(extras,'General','Paused').forEach(c=>{
+    const list = groups[c]; if(!list||!list.length) return;
+    list.sort((a,b)=> (BOARD_RANK[a.state]-BOARD_RANK[b.state]) || a.name.localeCompare(b.name));
+    html += '<div class="bd-box"><div class="bd-h">'+esc(c)+'</div><div class="bd-pills">'
+      + list.map(h=>bpill(h.name, h.state, (h.issues||[]).join(' · ')
+          || (h.state==='grey'?'monitoring paused':''))).join('')
+      + '</div></div>';
+  });
+  if((d.checks||[]).length){
+    const cks = d.checks.slice().sort((a,b)=>(BOARD_RANK[a.state]-BOARD_RANK[b.state])||a.name.localeCompare(b.name));
+    html += '<div class="bd-box"><div class="bd-h">Service checks</div><div class="bd-pills">'
+      + cks.map(c=>bpill(c.name, c.state, c.detail||'')).join('')+'</div></div>';
+  }
+  html += '</div>';
+  // Red-header detail box: the text behind every red pill, so a red dot can
+  // be explained without signing in.
+  const bad = (d.hosts||[]).filter(h=>h.state==='red');
+  const badC = (d.checks||[]).filter(c=>c.state==='red');
+  if(bad.length || badC.length){
+    html += '<div class="bd-issues"><div class="bd-issues-h">Active issues</div>'
+      + bad.map(h=>'<div class="bd-issue"><b>'+esc(h.name)+'</b> — '+esc((h.issues||[]).join(' · ')||'down')+'</div>').join('')
+      + badC.map(c=>'<div class="bd-issue"><b>check · '+esc(c.name)+'</b> — '+esc(c.detail||'failing')+'</div>').join('')
+      + '</div>';
+  }
+  return html;
+}
+// Public (unauthenticated) mode: board + Sign in, polled gently.
+let pubPoller = null;
+async function showPublic(){
+  show('login', false); show('app', false); show('public', true);
+  const draw = async ()=>{
+    await loadStatus();
+    document.getElementById('pub-board').innerHTML = statusBoard(statusData);
+    const g = statusData && statusData.generated_at;
+    document.getElementById('pub-updated').textContent = g ? 'as of '+new Date(g).toLocaleTimeString() : '';
+  };
+  await draw();
+  if(pubPoller) clearInterval(pubPoller);
+  pubPoller = setInterval(()=>{ if(!document.hidden) draw(); }, 30000);
+}
+function pubEnd(){ if(pubPoller){ clearInterval(pubPoller); pubPoller = null; } show('public', false); }
+function pubSignIn(){ pubEnd(); showLogin(); }
+
 // ── Alerts view: structured health conditions, severity + since ──
 function fmtAgo(iso){
   if(!iso) return '';
@@ -818,6 +896,9 @@ function fmtAgo(iso){
   return (s/86400).toFixed(1).replace(/\.0$/,'')+'d';
 }
 function alertsView(){
+  // Status board first (same one the public landing shows), then the
+  // structured condition table for whatever needs attention.
+  let html = statusBoard(statusData);
   const rows = [];
   fleet.nodes.forEach(n=>{
     (n.health||[]).forEach(h=>{
@@ -833,9 +914,11 @@ function alertsView(){
         '<span class="muted" title="'+esc(h.since||'')+'">'+fmtAgo(h.since)+'</span>'])});
     });
   });
-  if(!rows.length) return '<div class="ok-txt big">✓ No alerts across the fleet.</div>';
+  if(!rows.length) return html + '<div class="ok-txt" style="margin-top:2px">✓ No active conditions across the fleet.</div>';
   rows.sort((a,b)=> (a.crit?0:1)-(b.crit?0:1));
-  return '<table class="tbl"><thead>'+tr(['Host','Severity','Condition','For'],'th')+'</thead>'
+  return html
+    + '<h3 class="small" style="margin:4px 0 6px">Condition detail</h3>'
+    + '<table class="tbl"><thead>'+tr(['Host','Severity','Condition','For'],'th')+'</thead>'
     + '<tbody>'+rows.map(r=>r.html).join('')+'</tbody></table>'
     + '<p class="muted small">"For" is how long the condition has been active (tracked since the last controller restart).</p>';
 }
@@ -984,7 +1067,7 @@ function servicesView(){
   // "Problems only": hide columns where nothing is down (enabled-but-inactive).
   const keys = !svcProblemsOnly ? allKeys : allKeys.filter(k=>
     reach.some(n=>{ const sv=((n.summary||{}).services||{})[k]; return sv && svcState(sv)==='bad'; }));
-  const toggle = '<label class="check small" style="display:inline-flex;align-items:center;gap:6px;margin-left:auto;white-space:nowrap;flex-shrink:0">'
+  const toggle = '<label class="probonly">'
     + '<input type="checkbox" '+(svcProblemsOnly?'checked':'')
     + ' onchange="svcProblemsOnly=this.checked;render()"> problems only</label>';
 

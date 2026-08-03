@@ -81,6 +81,54 @@ def health_entries(env):
             if c['severity'] in ('warning', 'critical')]
 
 
+# Wallboard resource thresholds (percent). A host that is otherwise healthy
+# turns amber when any of these are breached.
+BOARD_CPU_PCT = 90
+BOARD_MEM_PCT = 90
+BOARD_STORAGE_PCT = 90
+
+
+def board_state(env):
+    """Public wallboard state for one host envelope → (state, issues).
+    'grey'  = monitoring paused on purpose
+    'red'   = unreachable OR any warning+ health condition (incl. failing
+              pinned checks) — the issues list carries the detail text
+    'amber' = healthy but resource-constrained (CPU/memory/storage too high).
+              Memory pressure is IGNORED for AI hosts (models pinned in RAM)
+              and ZFS/TrueNAS storage hosts (ARC eats free memory by design).
+    'green' = everything green. Pure → unit-tested."""
+    if env.get('disabled'):
+        return 'grey', []
+    if not env.get('ok'):
+        err = env.get('error') or ''
+        if err.lower().startswith('await'):
+            # first-poll warmup after a (re)start — transient, not a failure
+            return 'amber', ['awaiting first poll']
+        return 'red', [err or 'unreachable']
+    issues = [e['detail'] for e in env.get('health') or []]
+    if issues:
+        return 'red', issues
+    amber = []
+    res = env.get('resources') or {}
+    cpu = res.get('cpu_pct')
+    if cpu is not None and cpu >= BOARD_CPU_PCT:
+        amber.append('high CPU (%d%%)' % round(cpu))
+    mem = (res.get('memory') or {}).get('pct')
+    zfs = (env.get('summary') or {}).get('zfs') or {}
+    mem_exempt = (env.get('type') == 'AI' or bool(zfs.get('pools'))
+                  or env.get('host_type') == 'truenas')
+    if mem is not None and mem >= BOARD_MEM_PCT and not mem_exempt:
+        amber.append('high memory (%d%%)' % round(mem))
+    size = env.get('size_bytes') or 0
+    if size:
+        pct = (env.get('used_bytes') or 0) * 100.0 / size
+        if pct >= BOARD_STORAGE_PCT:
+            amber.append('storage %d%% full' % round(pct))
+    if amber:
+        return 'amber', amber
+    return 'green', []
+
+
 def snapshot_conditions(results):
     """{host_id: {'name', 'conditions'}} for a whole fan-out result set."""
     return {r['id']: {'name': r.get('name', r['id']), 'conditions': host_conditions(r)}

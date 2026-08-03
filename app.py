@@ -55,7 +55,7 @@ urllib3.disable_warnings(InsecureRequestWarning)
 app = Flask(__name__, static_url_path='')
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = '0.9.2'
+APP_VERSION = '0.10.1'
 
 
 def env_bool(name, default):
@@ -287,7 +287,7 @@ def _scope_presets():
 
 
 # ─── AuthN / AuthZ ────────────────────────────────────────────────────
-PUBLIC_ENDPOINTS = {'api_login', 'api_me', 'index', 'static'}
+PUBLIC_ENDPOINTS = {'api_login', 'api_me', 'index', 'static', 'api_status'}
 # Writes a non-admin role may still issue (sign out / change own password).
 RBAC_EXEMPT = {'api_logout', 'change_password'}
 # Endpoints that require the top (admin) role regardless of method — enrolling
@@ -1388,6 +1388,46 @@ def checks_run(check_id):
     result = _store_check_result(c)
     g.audit_target = c['name']
     return jsonify({'success': True, 'result': result})
+
+
+# ─── Public status board (unauthenticated wallboard) ──────────────────
+
+def _board_category(env):
+    """Overview grouping, server-side (mirrors the SPA's category())."""
+    if env.get('disabled'):
+        return 'Paused'
+    t = env.get('type')
+    if not t or t in ('Mixed', 'Unknown'):
+        return 'General'
+    return t
+
+
+@app.route('/api/status')
+def api_status():
+    """PUBLIC up/down wallboard: host names, colored states, and issue text,
+    plus the service checks. Deliberately serves the shared fleet cache only
+    (never triggers a fan-out) so anonymous hits are cheap. Exposes NO
+    addresses, credentials, versions, or metric values — names, states, and
+    the terse issue descriptions the operator asked to surface."""
+    with _fleet_lock:
+        data = _fleet_cache['data']
+    hosts = []
+    for r in (data or {}).get('nodes', []):
+        state, issues = monitoring.board_state(r)
+        hosts.append({'name': r['name'], 'category': _board_category(r),
+                      'state': state, 'issues': issues})
+    with _check_lock:
+        res = dict(_check_results)
+    cks = []
+    for c in load_checks().get('checks', []):
+        rr = res.get(c['id']) or {}
+        state = ('grey' if rr.get('paused') or rr.get('ok') is None
+                 else 'green' if rr.get('ok') else 'red')
+        cks.append({'name': c['name'], 'state': state,
+                    'detail': (rr.get('detail') or '') if state == 'red' else ''})
+    return jsonify({'hosts': hosts, 'checks': cks,
+                    'generated_at': (data or {}).get('generated_at'),
+                    'warming': data is None})
 
 
 # ─── Notifications: monitor state transitions, POST to webhooks ────────
