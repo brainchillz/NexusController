@@ -42,6 +42,7 @@ SERVICES = [
     {'id': 'ftp',       'label': 'FTP',              'port': 21,    'kind': 'tcp', 'expect': '220'},
     {'id': 'smb',       'label': 'SMB / CIFS',       'port': 445,   'kind': 'tcp'},
     {'id': 'nfs',       'label': 'NFS',              'port': 2049,  'kind': 'tcp'},
+    {'id': 'dlna',      'label': 'DLNA / miniDLNA',  'port': 8200,  'kind': 'http'},
     {'id': 'iscsi',     'label': 'iSCSI',            'port': 3260,  'kind': 'tcp'},
     {'id': 'rdp',       'label': 'RDP',              'port': 3389,  'kind': 'tcp'},
     {'id': 'vnc',       'label': 'VNC',              'port': 5900,  'kind': 'tcp', 'expect': 'RFB'},

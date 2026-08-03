@@ -546,6 +546,7 @@ function has(n,c){ return caps(n).indexOf(c) >= 0; }
 const CAT_ORDER = ['Storage','Virtualization','AI','General'];
 const BUILTIN_TYPES = ['Storage','AI','Mixed','Virtualization','Unknown'];
 function category(n){
+  if(n.disabled) return 'Paused';   // paused hosts gather in one bottom group
   const t = n.type;
   if(!t || t==='Mixed' || t==='Unknown') return 'General';
   return t;   // Storage/Virtualization/AI, or a custom pinned label
@@ -610,9 +611,10 @@ function overviewView(){
     .forEach(n=>{ const c=category(n); (groups[c]=groups[c]||[]).push(n); });
   let html=tagBar();
   let any=false;
-  // Custom categories slot between the built-ins and the General catch-all.
-  const extras = Object.keys(groups).filter(c=>CAT_ORDER.indexOf(c)<0).sort();
-  CAT_ORDER.slice(0,-1).concat(extras,'General').forEach(c=>{
+  // Custom categories slot between the built-ins and the General catch-all;
+  // the Paused group (disabled hosts) is pinned to the very bottom.
+  const extras = Object.keys(groups).filter(c=>CAT_ORDER.indexOf(c)<0 && c!=='Paused').sort();
+  CAT_ORDER.slice(0,-1).concat(extras,'General','Paused').forEach(c=>{
     const list=groups[c]; if(!list||!list.length) return;
     any=true;
     list.sort((a,b)=> nodeRank(a)-nodeRank(b) || String(a.name).localeCompare(String(b.name)));

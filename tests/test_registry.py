@@ -536,3 +536,9 @@ def test_monitor_cycle_pause_is_silent_not_recovery():
     finally:
         with app._mon_lock:
             app._mon.update(saved)
+
+
+def test_clean_type_rejects_paused_reserved_group():
+    # 'Paused' is the reserved overview group for disabled hosts.
+    assert app.clean_type('Paused') is None
+    assert app.clean_type('paused') is None

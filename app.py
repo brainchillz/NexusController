@@ -55,7 +55,7 @@ urllib3.disable_warnings(InsecureRequestWarning)
 app = Flask(__name__, static_url_path='')
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = '0.8.0'
+APP_VERSION = '0.8.1'
 
 
 def env_bool(name, default):
@@ -224,11 +224,12 @@ def clean_type(v):
     """Validate a manual host type: a short printable label. Built-ins
     (Storage/AI/…) and custom labels alike — a custom label becomes its own
     overview category. Returns the cleaned label, or None if unusable
-    ('auto' is the un-pin sentinel, never a stored type)."""
+    ('auto' is the un-pin sentinel; 'paused' is the reserved bottom group
+    for disabled hosts — neither is ever a stored type)."""
     if not isinstance(v, str):
         return None
     v = ' '.join(v.split())
-    if not v or len(v) > 24 or v.lower() == 'auto':
+    if not v or len(v) > 24 or v.lower() in ('auto', 'paused'):
         return None
     return v
 
