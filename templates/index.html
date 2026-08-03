@@ -39,15 +39,12 @@
         <button class="tab" data-tab="storage" onclick="setTab('storage')">Storage</button>
         <button class="tab" data-tab="services" onclick="setTab('services')">Services</button>
         <button class="tab" data-tab="checks" onclick="setTab('checks')">Checks</button>
+        <button class="tab" data-tab="settings" onclick="setTab('settings')" id="settingsTab">Settings</button>
       </nav>
       <div class="spacer"></div>
       <span id="updated" class="muted small"></span>
       <span id="whoami" class="muted"></span>
       <button class="ghost" onclick="openAdd()" id="addBtn">+ Add Host</button>
-      <button class="ghost" onclick="openNotify()" id="notifyBtn" title="Notifications"><svg class="ico ico-sm"><use href="#i-bell"/></svg> Notify</button>
-      <button class="ghost" onclick="openUsers()" id="usersBtn" title="Users"><svg class="ico ico-sm"><use href="#i-users"/></svg> Users</button>
-      <button class="ghost" onclick="openAudit()" id="auditBtn" title="Audit trail"><svg class="ico ico-sm"><use href="#i-list"/></svg> Audit</button>
-      <button class="ghost" onclick="openCert()" id="certBtn" title="TLS certificate"><svg class="ico ico-sm"><use href="#i-lock"/></svg> Cert</button>
       <button class="ghost" onclick="refresh()">Refresh</button>
       <button class="ghost" onclick="doLogout()">Sign out</button>
     </header>
@@ -55,6 +52,103 @@
     <main>
       <div id="rollup" class="rollup"></div>
       <div id="view"></div>
+
+      <!-- Settings page (admin) — a persistent pane, NOT re-rendered by the
+           15s poll, so in-progress form input is never wiped. Sections carry
+           the element ids their JS has always used. -->
+      <div id="settingsPane" style="display:none">
+        <div class="setnav">
+          <button class="setsec" data-sec="users" onclick="setSection('users')"><svg class="ico ico-sm"><use href="#i-users"/></svg> Users</button>
+          <button class="setsec" data-sec="notify" onclick="setSection('notify')"><svg class="ico ico-sm"><use href="#i-bell"/></svg> Notifications</button>
+          <button class="setsec" data-sec="cert" onclick="setSection('cert')"><svg class="ico ico-sm"><use href="#i-lock"/></svg> Certificate</button>
+          <button class="setsec" data-sec="audit" onclick="setSection('audit')"><svg class="ico ico-sm"><use href="#i-list"/></svg> Audit</button>
+          <button class="setsec" data-sec="tuning" onclick="setSection('tuning')">Tuning</button>
+        </div>
+
+        <div id="set-users" class="set-sec">
+          <h2>Controller Users</h2>
+          <p class="muted small"><b>admin</b> manages nodes + full control · <b>operator</b> controls
+            (no enroll/remove) · <b>viewer</b> is read-only. Scope tags confine an
+            operator/viewer to hosts bearing any of those tags (blank = whole fleet;
+            admins are always fleet-wide).</p>
+          <table class="tbl"><thead><tr><th>User</th><th>Role</th><th>Scope</th><th></th></tr></thead>
+            <tbody id="us-rows"></tbody></table>
+          <div class="row" style="margin-top:12px;flex-wrap:wrap">
+            <input id="us-name" placeholder="username" style="width:130px">
+            <select id="us-role" style="width:auto"><option>viewer</option><option>operator</option><option>admin</option></select>
+            <input id="us-pass" type="password" placeholder="initial password" style="width:170px">
+            <select id="us-scope" style="width:auto" onchange="usScopeChange()"></select>
+            <input id="us-tags" placeholder="custom tags (comma-sep)" style="width:180px;display:none">
+            <button onclick="addUser()">Add user</button>
+          </div>
+          <div id="us-msg" class="small" style="min-height:18px"></div>
+          <h3 class="small" style="margin:14px 0 4px">Scope presets <span class="muted">— named tag groupings; users bound to a preset re-scope when you edit it</span></h3>
+          <div id="pr-list" class="small" style="margin-bottom:6px"></div>
+          <div class="row" style="flex-wrap:wrap">
+            <input id="pr-name" placeholder="preset name" style="width:140px">
+            <input id="pr-tags" placeholder="tags (comma-separated)" style="width:220px">
+            <button class="ghost" onclick="savePreset()">Save preset</button>
+          </div>
+        </div>
+
+        <div id="set-notify" class="set-sec" style="display:none">
+          <h2>Notifications</h2>
+          <p class="muted small">Post fleet state changes (host down/up, degraded pool, alerts,
+            certificate change, version drift, failing checks) to a chat webhook. Supports
+            Google&nbsp;Chat, Slack, Discord, ntfy, and Gotify.</p>
+          <label class="check"><input id="nf-enabled" type="checkbox"> Enable notifications</label>
+          <div id="nf-hooks"></div>
+          <div class="row"><button class="ghost" onclick="addHook()">+ Add webhook</button>
+            <button class="ghost" onclick="testNotify()">Send test</button>
+            <button onclick="saveNotify()">Save</button>
+            <span id="nf-msg" class="muted small"></span></div>
+          <div id="nf-err" class="err"></div>
+          <h3 class="small" style="margin:16px 0 4px">Recent events <span class="muted">(since controller restart)</span></h3>
+          <div id="nf-events" class="small" style="max-height:180px;overflow:auto"></div>
+        </div>
+
+        <div id="set-cert" class="set-sec" style="display:none">
+          <h2>TLS Certificate</h2>
+          <div id="cert-current" class="muted small" style="margin:6px 0 12px"></div>
+          <p class="muted small">Replace the certificate with your own PEM (e.g. from Let's Encrypt).
+            The key must match the certificate. <b>Restart the controller to apply.</b></p>
+          <label>Certificate (PEM)<textarea id="cert-pem" rows="6" placeholder="-----BEGIN CERTIFICATE-----"></textarea></label>
+          <label>Private key (PEM)<textarea id="cert-key" rows="6" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></label>
+          <div id="cert-msg" class="small" style="min-height:18px"></div>
+          <div class="row end">
+            <button class="ghost" onclick="regenCert()">Regenerate self-signed</button>
+            <button onclick="uploadCert()">Install certificate</button>
+          </div>
+        </div>
+
+        <div id="set-audit" class="set-sec" style="display:none">
+          <h2>Audit trail</h2>
+          <div class="row" style="margin:4px 0 10px">
+            <input id="au-q" placeholder="filter (user, host, path, status…)" style="flex:1"
+                   onkeydown="if(event.key==='Enter')loadAudit()">
+            <select id="au-limit" style="width:auto" onchange="loadAudit()">
+              <option value="100">last 100</option><option value="200" selected>last 200</option>
+              <option value="500">last 500</option><option value="1000">last 1000</option>
+            </select>
+            <button class="ghost" onclick="loadAudit()">Search</button>
+          </div>
+          <div id="au-body" style="max-height:65vh;overflow:auto"></div>
+        </div>
+
+        <div id="set-tuning" class="set-sec" style="display:none">
+          <h2>Monitor Tuning</h2>
+          <p class="muted small">Cadence knobs for the background monitor. Saved values apply on the
+            <b>next monitor cycle — no restart needed</b>; blank a field to revert to its default.</p>
+          <label>Monitor interval (seconds) — fleet refresh, checks, and notification cadence
+            <input id="tn-interval" type="number" min="10" max="3600" style="width:120px"></label>
+          <label>Check timeout (seconds) — how long one service probe may take
+            <input id="tn-timeout" type="number" min="1" max="60" style="width:120px"></label>
+          <label>Flap cycles — consecutive failing cycles before a notification fires (recovery is immediate)
+            <input id="tn-flap" type="number" min="1" max="20" style="width:120px"></label>
+          <div id="tn-msg" class="small" style="min-height:18px"></div>
+          <div class="row end"><button onclick="saveTuning()">Save tuning</button></div>
+        </div>
+      </div>
     </main>
   </div>
 
@@ -156,23 +250,6 @@
   </div>
 
   <!-- TLS certificate dialog -->
-  <div id="certModal" class="modal" style="display:none">
-    <div class="modal-card wide">
-      <div class="row"><h2 style="margin:0;flex:1">TLS Certificate</h2>
-        <button class="x" onclick="closeCert()">×</button></div>
-      <div id="cert-current" class="muted small" style="margin:6px 0 12px"></div>
-      <p class="muted small">Replace the certificate with your own PEM (e.g. from Let's Encrypt).
-        The key must match the certificate. <b>Restart the controller to apply.</b></p>
-      <label>Certificate (PEM)<textarea id="cert-pem" rows="6" placeholder="-----BEGIN CERTIFICATE-----"></textarea></label>
-      <label>Private key (PEM)<textarea id="cert-key" rows="6" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></label>
-      <div id="cert-msg" class="small" style="min-height:18px"></div>
-      <div class="row end">
-        <button class="ghost" onclick="regenCert()">Regenerate self-signed</button>
-        <button onclick="uploadCert()">Install certificate</button>
-      </div>
-    </div>
-  </div>
-
   <!-- Node cert re-pin dialog -->
   <div id="repinModal" class="modal" style="display:none">
     <div class="modal-card wide">
@@ -201,47 +278,6 @@
     </div>
   </div>
 
-  <!-- Notifications dialog -->
-  <div id="notifyModal" class="modal" style="display:none">
-    <div class="modal-card wide">
-      <div class="row"><h2 style="margin:0;flex:1">Notifications</h2>
-        <button class="x" onclick="closeNotify()">×</button></div>
-      <p class="muted small">Post fleet state changes (host down/up, degraded pool, alerts,
-        certificate change, version drift) to a chat webhook. Supports Google&nbsp;Chat, Slack,
-        Discord, ntfy, and Gotify.</p>
-      <label class="check"><input id="nf-enabled" type="checkbox"> Enable notifications</label>
-      <div id="nf-hooks"></div>
-      <div class="row"><button class="ghost" onclick="addHook()">+ Add webhook</button>
-        <button class="ghost" onclick="testNotify()">Send test</button>
-        <span id="nf-msg" class="muted small"></span></div>
-      <div id="nf-err" class="err"></div>
-      <div class="row end">
-        <button class="ghost" onclick="closeNotify()">Cancel</button>
-        <button onclick="saveNotify()">Save</button>
-      </div>
-      <h3 class="small" style="margin:16px 0 4px">Recent events <span class="muted">(since controller restart)</span></h3>
-      <div id="nf-events" class="small" style="max-height:180px;overflow:auto"></div>
-    </div>
-  </div>
-
-  <!-- Audit trail dialog -->
-  <div id="auditModal" class="modal" style="display:none">
-    <div class="modal-card wide" style="width:820px">
-      <div class="row"><h2 style="margin:0;flex:1">Audit trail</h2>
-        <button class="x" onclick="closeAudit()">×</button></div>
-      <div class="row" style="margin:4px 0 10px">
-        <input id="au-q" placeholder="filter (user, host, path, status…)" style="flex:1"
-               onkeydown="if(event.key==='Enter')loadAudit()">
-        <select id="au-limit" style="width:auto" onchange="loadAudit()">
-          <option value="100">last 100</option><option value="200" selected>last 200</option>
-          <option value="500">last 500</option><option value="1000">last 1000</option>
-        </select>
-        <button class="ghost" onclick="loadAudit()">Search</button>
-      </div>
-      <div id="au-body" style="max-height:60vh;overflow:auto"></div>
-    </div>
-  </div>
-
   <!-- Host detail dialog -->
   <div id="detailModal" class="modal" style="display:none">
     <div class="modal-card wide" style="width:760px">
@@ -261,36 +297,6 @@
       <div class="row end" style="margin-top:12px">
         <button class="ghost" onclick="dlgResolve(null)">Cancel</button>
         <button id="dlg-ok" onclick="dlgSubmit()">OK</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- Users dialog -->
-  <div id="usersModal" class="modal" style="display:none">
-    <div class="modal-card wide">
-      <div class="row"><h2 style="margin:0;flex:1">Controller Users</h2>
-        <button class="x" onclick="closeUsers()">×</button></div>
-      <p class="muted small"><b>admin</b> manages nodes + full control · <b>operator</b> controls
-        (no enroll/remove) · <b>viewer</b> is read-only. Scope tags confine an
-        operator/viewer to hosts bearing any of those tags (blank = whole fleet;
-        admins are always fleet-wide).</p>
-      <table class="tbl"><thead><tr><th>User</th><th>Role</th><th>Scope</th><th></th></tr></thead>
-        <tbody id="us-rows"></tbody></table>
-      <div class="row" style="margin-top:12px;flex-wrap:wrap">
-        <input id="us-name" placeholder="username" style="width:130px">
-        <select id="us-role" style="width:auto"><option>viewer</option><option>operator</option><option>admin</option></select>
-        <input id="us-pass" type="password" placeholder="initial password" style="width:170px">
-        <select id="us-scope" style="width:auto" onchange="usScopeChange()"></select>
-        <input id="us-tags" placeholder="custom tags (comma-sep)" style="width:180px;display:none">
-        <button onclick="addUser()">Add user</button>
-      </div>
-      <div id="us-msg" class="small" style="min-height:18px"></div>
-      <h3 class="small" style="margin:14px 0 4px">Scope presets <span class="muted">— named tag groupings; users bound to a preset re-scope when you edit it</span></h3>
-      <div id="pr-list" class="small" style="margin-bottom:6px"></div>
-      <div class="row" style="flex-wrap:wrap">
-        <input id="pr-name" placeholder="preset name" style="width:140px">
-        <input id="pr-tags" placeholder="tags (comma-separated)" style="width:220px">
-        <button class="ghost" onclick="savePreset()">Save preset</button>
       </div>
     </div>
   </div>
@@ -363,17 +369,16 @@ function uiAlert(title, body){
 }
 
 // ── Esc closes the topmost open modal ──
-const MODAL_ORDER = ['dlgModal','detailModal','auditModal','guestsModal','repinModal',
-                     'certModal','svcModal','usersModal','notifyModal','editModal','addModal',
-                     'checkModal'];
+const MODAL_ORDER = ['dlgModal','detailModal','guestsModal','repinModal',
+                     'svcModal','editModal','addModal','checkModal'];
 document.addEventListener('keydown', e=>{
   if(e.key !== 'Escape') return;
   for(const id of MODAL_ORDER){
     const el = document.getElementById(id);
     if(el && el.style.display !== 'none'){
-      ({dlgModal: ()=>dlgResolve(null), detailModal: closeDetail, auditModal: closeAudit,
-        guestsModal: closeGuests, repinModal: closeRepin, certModal: closeCert,
-        svcModal: closeSvc, usersModal: closeUsers, notifyModal: closeNotify,
+      ({dlgModal: ()=>dlgResolve(null), detailModal: closeDetail,
+        guestsModal: closeGuests, repinModal: closeRepin,
+        svcModal: closeSvc,
         editModal: closeEdit, addModal: closeAdd, checkModal: closeCheck})[id]();
       return;
     }
@@ -402,7 +407,7 @@ async function boot(){
   document.getElementById('whoami').textContent = me.user + ' · ' + me.role
     + (me.scope_tags && me.scope_tags.length ? ' · <svg class="ico ico-sm"><use href="#i-tag"/></svg> ' + me.scope_tags.join(', ') : '');
   const adminUI = me.role === 'admin' ? '' : 'none';
-  ['addBtn','certBtn','notifyBtn','usersBtn','auditBtn'].forEach(i=>document.getElementById(i).style.display = adminUI);
+  ['addBtn','settingsTab'].forEach(i=>document.getElementById(i).style.display = adminUI);
   setTab(tab);
   await refresh();
   startPoll();
@@ -523,8 +528,14 @@ function setTab(t){
   render();
   if(t==='storage') loadHistSummary().then(()=>{ if(tab==='storage') render(); });
   if(t==='checks') loadChecks().then(()=>{ if(tab==='checks') render(); });
+  if(t==='settings') setSection(settingsSection);
 }
 function render(){
+  // The Settings pane is a persistent DOM node (form input must survive the
+  // 15s poll) — render() only toggles it, never rewrites it.
+  const pane = document.getElementById('settingsPane');
+  pane.style.display = tab==='settings' ? '' : 'none';
+  if(tab==='settings'){ document.getElementById('view').innerHTML=''; return; }
   if(!fleet){ document.getElementById('view').innerHTML='<div class="muted">Loading fleet…</div>'; return; }
   const v = document.getElementById('view');
   if(tab==='checks'){ v.innerHTML = checksView(); return; }   // checks don't need enrolled hosts
@@ -1206,11 +1217,45 @@ async function saveEdit(){
 }
 
 // ── TLS certificate ──
-async function openCert(){
-  document.getElementById('cert-pem').value=''; document.getElementById('cert-key').value='';
-  document.getElementById('cert-msg').textContent=''; await loadCertInfo(); show('certModal', true);
+// ── Settings page: one pane, five sections; each activation runs its loader ──
+let settingsSection = 'users';
+const SECTION_LOAD = {users: ()=>loadUsersSection(), notify: ()=>loadNotifySection(),
+                      cert: ()=>loadCertSection(), audit: ()=>loadAudit(),
+                      tuning: ()=>loadTuning()};
+function setSection(s){
+  settingsSection = s;
+  document.querySelectorAll('.setsec').forEach(b=>b.classList.toggle('active', b.dataset.sec===s));
+  document.querySelectorAll('.set-sec').forEach(d=>d.style.display = d.id==='set-'+s ? '' : 'none');
+  (SECTION_LOAD[s]||(()=>{}))();
 }
-function closeCert(){ show('certModal', false); }
+async function loadCertSection(){
+  document.getElementById('cert-msg').textContent='';
+  await loadCertInfo();
+}
+async function loadTuning(){
+  const m = document.getElementById('tn-msg'); m.textContent='';
+  try{
+    const t = await API.get('tuning');
+    document.getElementById('tn-interval').value = t.monitor_interval;
+    document.getElementById('tn-timeout').value = t.check_timeout;
+    document.getElementById('tn-flap').value = t.flap_cycles;
+    const d = t.defaults||{};
+    m.innerHTML = '<span class="muted">Defaults: interval '+esc(d.monitor_interval)+'s · timeout '
+      + esc(d.check_timeout)+'s · '+esc(d.flap_cycles)+' cycles. Re-fire cooldown: '
+      + esc(t.cooldown)+'s (env).</span>';
+  }catch(e){ m.innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
+}
+async function saveTuning(){
+  const m = document.getElementById('tn-msg');
+  const body = {};   // blank field = key omitted = revert to default
+  const take = (id,key)=>{ const v = document.getElementById(id).value.trim(); if(v!=='') body[key]=v; };
+  take('tn-interval','monitor_interval'); take('tn-timeout','check_timeout'); take('tn-flap','flap_cycles');
+  try{
+    await API.post('tuning', body);
+    await loadTuning();
+    m.innerHTML = '<span class="ok-txt">Saved — applies on the next monitor cycle.</span>' + m.innerHTML;
+  }catch(e){ m.innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
+}
 async function loadCertInfo(){
   const el = document.getElementById('cert-current');
   try{
@@ -1435,14 +1480,14 @@ async function nexusGuestSend(method, path, body, what){
 let hooks = [];
 const FORMATS = ['gchat','slack','discord','ntfy','gotify'];
 const SEVS = ['critical','warning','info'];
-async function openNotify(){
+async function loadNotifySection(){
   document.getElementById('nf-msg').textContent=''; document.getElementById('nf-err').textContent='';
   try{
     const c = await API.get('notifications');
     document.getElementById('nf-enabled').checked = !!c.enabled;
     hooks = (c.webhooks||[]).map(h=>({id:h.id, name:h.name, format:h.format, min_severity:h.min_severity, url:'', url_display:h.url_display}));
   }catch(e){ hooks=[]; }
-  renderHooks(); show('notifyModal', true);
+  renderHooks();
   loadNotifyEvents();   // background — fills the Recent-events section
 }
 async function loadNotifyEvents(){
@@ -1460,7 +1505,6 @@ async function loadNotifyEvents(){
       : '<span class="muted">No state transitions recorded since the controller started.</span>';
   }catch(e){ el.innerHTML = '<span class="muted">'+esc(e.message)+'</span>'; }
 }
-function closeNotify(){ show('notifyModal', false); }
 function renderHooks(){
   const el = document.getElementById('nf-hooks');
   if(!hooks.length){ el.innerHTML = '<p class="muted small">No webhooks yet.</p>'; return; }
@@ -1479,8 +1523,8 @@ async function saveNotify(){
   const body = {enabled: document.getElementById('nf-enabled').checked,
     webhooks: hooks.map(h=>({id:h.id, name:h.name, format:h.format, min_severity:h.min_severity, url:h.url}))};
   try{ await API.post('notifications', body);
+    await loadNotifySection();
     document.getElementById('nf-msg').innerHTML='<span class="ok-txt">Saved.</span>';
-    await openNotify();
   }catch(e){ document.getElementById('nf-err').textContent=e.message; }
 }
 async function testNotify(){
@@ -1489,21 +1533,19 @@ async function testNotify(){
         webhooks: hooks.map(h=>({id:h.id, name:h.name, format:h.format, min_severity:h.min_severity, url:h.url}))});
     const r = await API.post('notifications/test');
     const fails = (r.results||[]).filter(x=>!x.ok);
-    m.innerHTML = fails.length ? '<span class="bad">'+esc(fails.map(f=>f.name+': '+f.error).join('; '))+'</span>'
+    const verdict = fails.length ? '<span class="bad">'+esc(fails.map(f=>f.name+': '+f.error).join('; '))+'</span>'
       : '<span class="ok-txt">Sent to '+(r.results||[]).length+' webhook(s) — check your chat.</span>';
-    await openNotify();
+    await loadNotifySection();
+    m.innerHTML = verdict;
   }catch(e){ m.innerHTML='<span class="bad">'+esc(e.message)+'</span>'; }
 }
 
 // ── Controller users ──
 let scopePresets = {};
-async function openUsers(){
-  document.getElementById('us-msg').textContent=''; document.getElementById('us-name').value='';
-  document.getElementById('us-pass').value=''; document.getElementById('us-tags').value='';
-  document.getElementById('pr-name').value=''; document.getElementById('pr-tags').value='';
-  await loadUsers(); show('usersModal', true);
+async function loadUsersSection(){
+  document.getElementById('us-msg').textContent='';
+  await loadUsers();
 }
-function closeUsers(){ show('usersModal', false); }
 function parseTags(s){ return String(s||'').split(',').map(t=>t.trim()).filter(t=>t); }
 function scopeCell(u){
   if(u.role==='admin') return 'fleet';
@@ -1629,8 +1671,6 @@ async function resetUser(u){
 }
 
 // ── Audit trail (admin) ──
-function openAudit(){ document.getElementById('au-q').value=''; show('auditModal', true); loadAudit(); }
-function closeAudit(){ show('auditModal', false); }
 async function loadAudit(){
   const q = document.getElementById('au-q').value.trim();
   const limit = document.getElementById('au-limit').value;

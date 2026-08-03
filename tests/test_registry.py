@@ -542,3 +542,27 @@ def test_clean_type_rejects_paused_reserved_group():
     # 'Paused' is the reserved overview group for disabled hosts.
     assert app.clean_type('Paused') is None
     assert app.clean_type('paused') is None
+
+
+# ── monitor tunables (Settings → Tuning) ─────────────────────────────
+def test_clean_tuning_validates_and_ranges():
+    rec, e = app.clean_tuning({'monitor_interval': 30, 'check_timeout': 3, 'flap_cycles': 1})
+    assert e is None
+    assert rec == {'monitor_interval': 30, 'check_timeout': 3, 'flap_cycles': 1}
+    assert app.clean_tuning({'monitor_interval': 5})[1]      # below floor
+    assert app.clean_tuning({'monitor_interval': 9999})[1]   # above ceiling
+    assert app.clean_tuning({'check_timeout': 'abc'})[1]
+    assert app.clean_tuning({'flap_cycles': 0})[1]
+    rec, e = app.clean_tuning({'unknown': 1})
+    assert e is None and rec == {}     # unknown keys ignored, empty = all defaults
+
+
+def test_tuning_effective_values(monkeypatch):
+    monkeypatch.setattr(app, 'load_config', lambda: {})
+    assert app.tuning() == app.tuning_defaults()
+    monkeypatch.setattr(app, 'load_config',
+                        lambda: {'tuning': {'monitor_interval': 30, 'flap_cycles': 99}})
+    t = app.tuning()
+    assert t['monitor_interval'] == 30
+    assert t['flap_cycles'] == 20      # stored garbage clamps to the ceiling
+    assert t['check_timeout'] == app.tuning_defaults()['check_timeout']

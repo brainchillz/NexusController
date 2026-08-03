@@ -68,6 +68,16 @@ main{padding:20px;max-width:1200px;margin:0 auto}
 .hr-status.err{color:var(--bad)}
 .hr-actions{display:flex;align-items:center;gap:6px;margin-left:auto;flex:none}
 
+/* Settings page: section nav + card-like sections */
+.setnav{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+.setnav .setsec{background:var(--panel2);color:var(--muted);border:1px solid var(--line);border-radius:20px;padding:5px 14px;font-size:13px}
+.setnav .setsec:hover{border-color:var(--accent);color:var(--text);background:var(--panel2)}
+.setnav .setsec.active{background:var(--panel);color:var(--text);border-color:var(--accent)}
+.set-sec{background:var(--panel);border:1px solid var(--line-strong);border-radius:10px;padding:16px 18px;max-width:860px}
+.set-sec h2{margin:0 0 8px;font-size:17px}
+#set-tuning label{display:block;margin:12px 0 0}
+#set-tuning label input{display:block;margin-top:4px}
+
 /* Checks table row actions (run/edit/delete) — quiet inline icons, one line */
 .ck-acts{white-space:nowrap}
 .ck-acts .x{background:transparent;color:var(--muted);padding:2px 5px;font-size:15px;line-height:1}

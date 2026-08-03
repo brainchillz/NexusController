@@ -55,7 +55,7 @@ urllib3.disable_warnings(InsecureRequestWarning)
 app = Flask(__name__, static_url_path='')
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = '0.8.1'
+APP_VERSION = '0.9.0'
 
 
 def env_bool(name, default):
@@ -293,7 +293,7 @@ RBAC_EXEMPT = {'api_logout', 'change_password'}
 # Endpoints that require the top (admin) role regardless of method — enrolling
 # or removing a node, and managing controller users.
 ADMIN_ONLY = {'nodes_add', 'node_delete', 'node_update', 'node_cert', 'node_repin',
-              'checks_add', 'checks_update', 'checks_delete',
+              'checks_add', 'checks_update', 'checks_delete', 'tuning_save',
               'tls_regenerate', 'tls_upload_cert',
               'notifications_save', 'notifications_test', 'notifications_events',
               'users_list', 'users_add', 'users_update', 'users_delete',
@@ -1212,11 +1212,12 @@ def _now_iso():
     return datetime.now().astimezone().isoformat(timespec='seconds')
 
 
-def _run_one_check(c, disabled_ids):
+def _run_one_check(c, disabled_ids, timeout=None):
     if c.get('node_id') in disabled_ids:
         return c['id'], {'ok': None, 'paused': True, 'latency_ms': None,
                          'detail': 'pinned host is paused', 'ts': _now_iso()}
-    return c['id'], {**checks.run_check(c), 'ts': _now_iso()}
+    timeout = timeout or tuning()['check_timeout']
+    return c['id'], {**checks.run_check(c, timeout=timeout), 'ts': _now_iso()}
 
 
 def _run_all_checks():
@@ -1228,8 +1229,9 @@ def _run_all_checks():
             _check_results.clear()
         return
     disabled_ids = {n['id'] for n in load_nodes().get('nodes', []) if n.get('disabled')}
+    timeout = tuning()['check_timeout']
     with ThreadPoolExecutor(max_workers=FANOUT_WORKERS) as pool:
-        results = dict(pool.map(lambda c: _run_one_check(c, disabled_ids), cfg))
+        results = dict(pool.map(lambda c: _run_one_check(c, disabled_ids, timeout), cfg))
     live = {c['id'] for c in cfg}
     with _check_lock:
         for k in [k for k in _check_results if k not in live]:
@@ -1296,7 +1298,7 @@ def checks_list():
     out = [{**c, 'node_name': names.get(c.get('node_id')),
             'result': res.get(c['id'])} for c in cfg]
     return jsonify({'checks': out, 'services': checks.SERVICES,
-                    'interval': MONITOR_INTERVAL})
+                    'interval': tuning()['monitor_interval']})
 
 
 def _store_check_result(check):
@@ -1401,6 +1403,69 @@ FLAP_CYCLES = int(os.environ.get('CONTROLLER_FLAP_CYCLES', '2'))
 NOTIFY_COOLDOWN = int(os.environ.get('CONTROLLER_NOTIFY_COOLDOWN', '1800'))
 WEBHOOK_TIMEOUT = (5, 10)
 
+# ─── Tunables: monitor cadence knobs, adjustable from the Settings page ─
+# Stored in the auth-file config under 'tuning' (absent key = env/default).
+# Read live each cycle — a save applies on the next monitor pass, no restart.
+TUNING_BOUNDS = {'monitor_interval': (10, 3600), 'check_timeout': (1, 60),
+                 'flap_cycles': (1, 20)}
+
+
+def clean_tuning(data):
+    """Validate a tunables payload → (dict, None) or (None, error). Only known
+    keys, integer values, clamped ranges; a missing key means 'revert to the
+    default'. Pure → unit-tested."""
+    out = {}
+    for key, (lo, hi) in TUNING_BOUNDS.items():
+        if key not in (data or {}):
+            continue
+        try:
+            v = int(data[key])
+        except (TypeError, ValueError):
+            return None, 'invalid %s' % key
+        if not lo <= v <= hi:
+            return None, '%s must be %d-%d' % (key, lo, hi)
+        out[key] = v
+    return out, None
+
+
+def tuning_defaults():
+    return {'monitor_interval': MONITOR_INTERVAL,
+            'check_timeout': checks.CHECK_TIMEOUT, 'flap_cycles': FLAP_CYCLES}
+
+
+def tuning():
+    """Effective tunables: stored override else env/default, always clamped."""
+    stored = load_config().get('tuning') or {}
+    out = {}
+    for key, (lo, hi) in TUNING_BOUNDS.items():
+        try:
+            v = int(stored.get(key, tuning_defaults()[key]))
+        except (TypeError, ValueError):
+            v = tuning_defaults()[key]
+        out[key] = max(lo, min(hi, v))
+    return out
+
+
+@app.route('/api/tuning')
+def tuning_get():
+    return jsonify({**tuning(), 'defaults': tuning_defaults(),
+                    'bounds': {k: list(v) for k, v in TUNING_BOUNDS.items()},
+                    'cooldown': NOTIFY_COOLDOWN})
+
+
+@app.route('/api/tuning', methods=['POST'])
+def tuning_save():
+    """Save the monitor tunables (admin). The payload replaces the stored set:
+    omit a key to revert it to its default."""
+    rec, e = clean_tuning(request.get_json() or {})
+    if e:
+        return err(e)
+    cfg = load_config()
+    cfg['tuning'] = rec
+    save_config(cfg)
+    g.audit_target = 'tuning ' + json.dumps(rec, sort_keys=True)
+    return jsonify({'success': True, **tuning()})
+
 _mon = {'present_streak': {}, 'active': set(), 'last_fire': {}, 'seeded': False}
 _mon_lock = threading.Lock()
 
@@ -1429,7 +1494,7 @@ def _public_notify_config():
                       'min_severity': h.get('min_severity', 'warning'),
                       'url_display': _mask_url(h.get('url', ''))})
     return {'enabled': bool(cfg.get('enabled')), 'webhooks': hooks,
-            'interval': MONITOR_INTERVAL}
+            'interval': tuning()['monitor_interval']}
 
 
 def send_webhook(hook, title, text):
@@ -1460,7 +1525,7 @@ def _record_events(events):
 def notifications_events():
     """Last ~100 monitor state transitions, newest first (admin)."""
     return jsonify({'events': list(_notify_events)[::-1],
-                    'since_restart': True, 'interval': MONITOR_INTERVAL})
+                    'since_restart': True, 'interval': tuning()['monitor_interval']})
 
 
 def _dispatch(events):
@@ -1490,6 +1555,7 @@ def _monitor_cycle(results):
     present = {(hid, key) for hid, e in snap.items() for key in e['conditions']}
     paused = {r['id'] for r in results if r.get('disabled')}
     now = time.time()
+    flap = tuning()['flap_cycles']
     fire, recover = [], []
     with _mon_lock:
         streak = _mon['present_streak']
@@ -1515,7 +1581,7 @@ def _monitor_cycle(results):
             return
         # fire: present, stable, not already active, cooldown elapsed
         for pk in present:
-            if pk in _mon['active'] or streak.get(pk, 0) < FLAP_CYCLES:
+            if pk in _mon['active'] or streak.get(pk, 0) < flap:
                 continue
             if now - _mon['last_fire'].get(pk, 0) < NOTIFY_COOLDOWN:
                 continue
@@ -1573,7 +1639,7 @@ def _monitor_loop():
                 print('history: record failed: %s' % e, flush=True)
         except Exception as e:
             print('monitor: cycle failed: %s' % e, flush=True)
-        time.sleep(MONITOR_INTERVAL)
+        time.sleep(tuning()['monitor_interval'])
 
 
 @app.route('/api/history/spark')
