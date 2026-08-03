@@ -55,7 +55,7 @@ urllib3.disable_warnings(InsecureRequestWarning)
 app = Flask(__name__, static_url_path='')
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = '0.10.1'
+APP_VERSION = '0.10.2'
 
 
 def env_bool(name, default):
@@ -1411,9 +1411,15 @@ def api_status():
     the terse issue descriptions the operator asked to surface."""
     with _fleet_lock:
         data = _fleet_cache['data']
+    # Paused (deliberately-offline) hosts are an operator concern: logged-in
+    # viewers get the grey Paused box, anonymous visitors don't even receive
+    # the names.
+    authed = bool(_resolve_identity()[0])
     hosts = []
     for r in (data or {}).get('nodes', []):
         state, issues = monitoring.board_state(r)
+        if state == 'grey' and not authed:
+            continue
         hosts.append({'name': r['name'], 'category': _board_category(r),
                       'state': state, 'issues': issues})
     with _check_lock:

@@ -199,3 +199,18 @@ def test_api_status_is_public_and_minimal(client, monkeypatch):
             app._fleet_cache['data'] = saved
         with app._check_lock:
             app._check_results.clear()
+
+
+def test_api_status_hides_paused_from_anonymous(client):
+    with app._fleet_lock:
+        saved = app._fleet_cache['data']
+        app._fleet_cache['data'] = {'nodes': [
+            {'id': 'n1', 'name': 'node1', 'type': 'Storage', 'ok': True, 'summary': {}},
+            {'id': 'n3', 'name': 'node3', 'ok': False, 'disabled': True,
+             'error': 'monitoring disabled'}], 'generated_at': 'T'}
+    try:
+        d = client.get('/api/status').get_json()   # anonymous
+        assert [h['name'] for h in d['hosts']] == ['node1']
+    finally:
+        with app._fleet_lock:
+            app._fleet_cache['data'] = saved
