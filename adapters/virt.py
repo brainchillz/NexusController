@@ -183,7 +183,11 @@ def _is_virt(node):
 
 def _poll_once():
     from . import adapter_for   # runtime import — registry lives in the package root
-    nodes = [n for n in load_nodes().get('nodes', []) if _is_virt(n)]
+    # Disabled (paused-monitoring) hosts are never contacted; leaving them out
+    # of `ids` also drops their stale cache entry, so a re-enable gets a fresh
+    # poll instead of serving pre-maintenance data.
+    nodes = [n for n in load_nodes().get('nodes', [])
+             if _is_virt(n) and not n.get('disabled')]
     ids = {n['id'] for n in nodes}
     if nodes:
         with ThreadPoolExecutor(max_workers=FANOUT_WORKERS) as pool:

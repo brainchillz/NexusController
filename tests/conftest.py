@@ -7,6 +7,7 @@ import tempfile
 _tmp = tempfile.mkdtemp(prefix='nexusctl-test-')
 os.environ.setdefault('CONTROLLER_AUTH_FILE', os.path.join(_tmp, 'controller-auth.json'))
 os.environ.setdefault('CONTROLLER_NODES_FILE', os.path.join(_tmp, 'nodes.json'))
+os.environ.setdefault('CONTROLLER_CHECKS_FILE', os.path.join(_tmp, 'checks.json'))
 os.environ.setdefault('CONTROLLER_AUDIT_FILE', os.path.join(_tmp, 'audit.log'))
 os.environ.setdefault('CONTROLLER_HISTORY_FILE', os.path.join(_tmp, 'history.db'))
 

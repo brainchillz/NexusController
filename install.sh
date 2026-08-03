@@ -52,7 +52,7 @@ fi
 #    are never touched here — this is what makes re-running a safe upgrade).
 echo "==> installing app files -> $DIR"
 mkdir -p "$DIR"
-cp "$SRC/app.py" "$SRC/monitoring.py" "$SRC/history.py" "$SRC/requirements.txt" "$DIR/"
+cp "$SRC/app.py" "$SRC/monitoring.py" "$SRC/history.py" "$SRC/checks.py" "$SRC/requirements.txt" "$DIR/"
 rm -rf "$DIR/templates" "$DIR/static" "$DIR/adapters" "$DIR/collectors"
 cp -r "$SRC/templates" "$SRC/static" "$SRC/adapters" "$SRC/collectors" "$DIR/"
 

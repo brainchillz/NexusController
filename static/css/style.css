@@ -45,6 +45,7 @@ main{padding:20px;max-width:1200px;margin:0 auto}
 .card-h .x:hover{background:transparent;color:var(--bad)}
 .dot{width:10px;height:10px;border-radius:50%;display:inline-block;background:var(--muted)}
 .dot.ok{background:var(--ok)} .dot.warn{background:var(--warn)} .dot.bad{background:var(--bad)}
+.dot.off{background:var(--muted);opacity:.55}   /* paused (monitoring disabled) */
 .kv{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--line)}
 .kv span{color:var(--muted)}
 
@@ -66,6 +67,12 @@ main{padding:20px;max-width:1200px;margin:0 auto}
 .hr-status{flex:1;min-width:120px}
 .hr-status.err{color:var(--bad)}
 .hr-actions{display:flex;align-items:center;gap:6px;margin-left:auto;flex:none}
+
+/* Checks table row actions (run/edit/delete) — quiet inline icons, one line */
+.ck-acts{white-space:nowrap}
+.ck-acts .x{background:transparent;color:var(--muted);padding:2px 5px;font-size:15px;line-height:1}
+.ck-acts .x:hover{background:transparent;color:var(--bad)}
+.ck-acts .x.edit:hover{color:var(--accent)}
 .mm{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);white-space:nowrap}
 .mm-l{width:36px}
 .mm-bar{width:54px;height:6px;background:var(--well);border:1px solid var(--line);border-radius:4px;overflow:hidden}

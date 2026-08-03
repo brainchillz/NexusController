@@ -38,6 +38,7 @@
         <button class="tab" data-tab="alerts" onclick="setTab('alerts')">Alerts</button>
         <button class="tab" data-tab="storage" onclick="setTab('storage')">Storage</button>
         <button class="tab" data-tab="services" onclick="setTab('services')">Services</button>
+        <button class="tab" data-tab="checks" onclick="setTab('checks')">Checks</button>
       </nav>
       <div class="spacer"></div>
       <span id="updated" class="muted small"></span>
@@ -104,6 +105,7 @@
       <label class="ed-userpass">Username <input id="ed-user" placeholder="root@pam"></label>
       <label class="ed-userpass">New password <input id="ed-pass" type="password" placeholder="leave blank to keep current password"></label>
       <label class="ed-verify check"><input id="ed-verify" type="checkbox"> Verify the host's TLS certificate</label>
+      <label class="check"><input id="ed-disabled" type="checkbox"> Disabled — pause monitoring &amp; alerts (host out of service)</label>
       <div class="row">
         <button class="ghost" onclick="testEdit()">Test connection</button>
         <span id="ed-test" class="muted small"></span>
@@ -112,6 +114,29 @@
       <div class="row end">
         <button class="ghost" onclick="closeEdit()">Cancel</button>
         <button onclick="saveEdit()">Save changes</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Add/Edit service-check dialog -->
+  <div id="checkModal" class="modal" style="display:none">
+    <div class="modal-card">
+      <div class="row"><h2 id="ck-title" style="margin:0;flex:1">Add Check</h2><button class="x" onclick="closeCheck()">×</button></div>
+      <label>Service
+        <!-- options come from the /api/checks catalog; picking one repopulates
+             the port box with that service's default -->
+        <select id="ck-service" onchange="ckService()"></select>
+      </label>
+      <label>Target (IP address or hostname) <input id="ck-target" placeholder="192.168.1.10"></label>
+      <label>Port <input id="ck-port" type="number" min="1" max="65535"></label>
+      <label>Pin to host (optional — folds into that host's health)
+        <select id="ck-node"></select>
+      </label>
+      <label>Name (optional) <input id="ck-name" placeholder="defaults to service @ target"></label>
+      <div id="ck-err" class="err"></div>
+      <div class="row end">
+        <button class="ghost" onclick="closeCheck()">Cancel</button>
+        <button onclick="saveCheck()">Save</button>
       </div>
     </div>
   </div>
@@ -339,7 +364,8 @@ function uiAlert(title, body){
 
 // ── Esc closes the topmost open modal ──
 const MODAL_ORDER = ['dlgModal','detailModal','auditModal','guestsModal','repinModal',
-                     'certModal','svcModal','usersModal','notifyModal','editModal','addModal'];
+                     'certModal','svcModal','usersModal','notifyModal','editModal','addModal',
+                     'checkModal'];
 document.addEventListener('keydown', e=>{
   if(e.key !== 'Escape') return;
   for(const id of MODAL_ORDER){
@@ -348,7 +374,7 @@ document.addEventListener('keydown', e=>{
       ({dlgModal: ()=>dlgResolve(null), detailModal: closeDetail, auditModal: closeAudit,
         guestsModal: closeGuests, repinModal: closeRepin, certModal: closeCert,
         svcModal: closeSvc, usersModal: closeUsers, notifyModal: closeNotify,
-        editModal: closeEdit, addModal: closeAdd})[id]();
+        editModal: closeEdit, addModal: closeAdd, checkModal: closeCheck})[id]();
       return;
     }
   }
@@ -424,6 +450,7 @@ async function loadFleet(fresh){
   const u = document.getElementById('updated');
   u.textContent = 'updated ' + new Date().toLocaleTimeString() + (data.cached ? ' (cached '+data.cache_age+'s)' : '');
   loadSparks();   // background — re-renders when it lands
+  if(tab==='checks') loadChecks().then(()=>{ if(tab==='checks') render(); });
   renderRollup(); render();
   // Keep an open virt Guests modal current: its power states come from the
   // fleet envelope, so re-render it whenever fresh fleet data lands.
@@ -476,6 +503,8 @@ function renderRollup(){
            'show only unreachable hosts')
     + pill('Degraded', r.degraded||0, r.degraded?'warn':'', "setTab('alerts')")
     + pill('Alerts', r.alerts, r.alerts?'warn':'', "setTab('alerts')");
+  if (r.disabled) html += pill('Paused', r.disabled, '', "goOverview('')",
+                               'hosts with monitoring disabled');
   if (r.vms) html += pill('VMs', r.vms + (r.containers ? ' ('+r.containers+' CT)' : ''), '', "goOverview('')");
   if (r.storage_size) html += pill('Storage', hbytes(r.storage_used)+' / '+hbytes(r.storage_size), '', "setTab('storage')");
   document.getElementById('rollup').innerHTML = html;
@@ -493,10 +522,12 @@ function setTab(t){
   document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active', b.dataset.tab===t));
   render();
   if(t==='storage') loadHistSummary().then(()=>{ if(tab==='storage') render(); });
+  if(t==='checks') loadChecks().then(()=>{ if(tab==='checks') render(); });
 }
 function render(){
   if(!fleet){ document.getElementById('view').innerHTML='<div class="muted">Loading fleet…</div>'; return; }
   const v = document.getElementById('view');
+  if(tab==='checks'){ v.innerHTML = checksView(); return; }   // checks don't need enrolled hosts
   if(!fleet.nodes.length){ v.innerHTML='<div class="muted">No nodes enrolled yet.</div>'; return; }
   if(tab==='overview') v.innerHTML = overviewView();
   else if(tab==='alerts') v.innerHTML = alertsView();
@@ -559,7 +590,7 @@ function matchesText(n){
   return [n.name, urlHost(n.base_url), n.version, n.host_type, (n.tags||[]).join(' ')]
     .join(' ').toLowerCase().indexOf(q) >= 0;
 }
-function matchesStatus(n){ return statusFilter === 'bad' ? !n.ok : true; }
+function matchesStatus(n){ return statusFilter === 'bad' ? (!n.ok && !n.disabled) : true; }
 function toggleTag(t){ tagFilter.has(t) ? tagFilter.delete(t) : tagFilter.add(t); render(); }
 function clearTags(){ tagFilter.clear(); statusFilter=''; render(); }
 function tagBar(){
@@ -572,7 +603,7 @@ function tagBar(){
   return '<div class="tagbar">'+filt+(tags.length?'<span class="muted small">Tags:</span>'+chips:'')+status+clear+'</div>';
 }
 // Problems first: unreachable, then warning, then healthy (name-stable within).
-function nodeRank(n){ return !n.ok ? 0 : ((n.health && n.health.length) ? 1 : 2); }
+function nodeRank(n){ return n.disabled ? 3 : !n.ok ? 0 : ((n.health && n.health.length) ? 1 : 2); }
 function overviewView(){
   const groups={};
   fleet.nodes.filter(n=>matchesTags(n)&&matchesText(n)&&matchesStatus(n))
@@ -618,8 +649,9 @@ function nodeRow(n){
   // legacy client-side signals remain as a fallback for older payloads.
   const issues = (n.health || []).map(h=>h.detail || h);
   const warn = issues.length || alerts || n.stale || nasBad || sparkBad || dnsmaqBad;
-  const dot = n.ok ? (warn?'warn':'ok') : (awaiting?'warn':'bad');
-  const dotTitle = n.ok ? (issues.length ? issues.join(' · ') : (warn?'attention needed':'healthy'))
+  const dot = n.disabled ? 'off' : n.ok ? (warn?'warn':'ok') : (awaiting?'warn':'bad');
+  const dotTitle = n.disabled ? 'monitoring paused'
+                 : n.ok ? (issues.length ? issues.join(' · ') : (warn?'attention needed':'healthy'))
                         : (awaiting ? 'awaiting first poll' : (n.error||'unreachable'));
   const rm = me && me.role==='admin';
   // version-skew warning: flagged server-side when a nexus node trails the
@@ -630,7 +662,9 @@ function nodeRow(n){
   const host = esc(urlHost(n.base_url)) + ver;
 
   let mid;
-  if(!n.ok){
+  if(n.disabled){
+    mid = '<div class="hr-status muted">Paused — monitoring &amp; alerts disabled</div>';
+  } else if(!n.ok){
     mid = '<div class="hr-status '+(awaiting?'muted':'err')+'">'
         + (awaiting?'Awaiting first poll…':'Unreachable: '+esc(n.error||''))+'</div>';
   } else {
@@ -701,6 +735,11 @@ function nodeRow(n){
         if(mt.predicted_tokens_seconds!=null) chips.push(chip('tok/s', Math.round(mt.predicted_tokens_seconds*10)/10));
       }
     }
+    if(n.svc_checks && n.svc_checks.length){
+      const ckBad = n.svc_checks.filter(c=>c.ok===false).length;
+      chips.push(chip('Checks', (n.svc_checks.length-ckBad)+'/'+n.svc_checks.length, ckBad?'bad':'',
+        n.svc_checks.map(c=>c.name+' '+(c.ok===false?'✗':(c.ok?'✓':'…'))).join(', ')));
+    }
     if(alerts) chips.push(chip('alerts', alerts, 'bad'));
     if(n.stale) chips.push(chip('stale', 'poll failed', 'bad'));
     // Mini-meters + chips share one wrapping strip so extra tiles pack onto the
@@ -717,7 +756,8 @@ function nodeRow(n){
   const nexusGuests = !virt && n.ok
     && (!!(n.instances && n.instances.total) || !!(dker && dker.containers));
   const hasGuests = !!(n.ok && n.virt && (n.virt.vm_list||[]).length) || nexusGuests;
-  const actions = (n.ok && openable ? '<a class="btn-open" href="'+openUrl+'" target="_blank" rel="noopener">'+openLbl+'</a>':'')
+  const actions = (rm && n.disabled ? '<button class="btn-open" title="Resume monitoring for this host" onclick="resumeNode(\''+esc(n.id)+'\')">Resume</button>' : '')
+    + (n.ok && openable ? '<a class="btn-open" href="'+openUrl+'" target="_blank" rel="noopener">'+openLbl+'</a>':'')
     + (hasGuests ? '<button class="btn-open" title="View / control guests" onclick="openGuests(\''+esc(n.id)+'\')"><svg class="ico ico-sm"><use href="#i-mon"/></svg> Guests</button>' : '')
     + (rm && certChanged ? '<button class="btn-open" style="border-color:var(--bad);color:var(--bad)" title="Certificate changed — review and re-pin" onclick="openRepin(\''+esc(n.id)+'\',\''+esc(n.name)+'\')"><svg class="ico ico-sm"><use href="#i-lock"/></svg> Review cert</button>' : '')
     + (rm ? '<button class="x edit" title="Edit" onclick="openEdit(\''+esc(n.id)+'\')">✎</button>'
@@ -735,6 +775,10 @@ function svcState(sv){
   return 'off';                               // intentionally off
 }
 
+async function resumeNode(id){
+  try{ await API.put('nodes/'+id, {disabled:false}); refresh(); }
+  catch(e){ await uiAlert('Error', e.message); }
+}
 async function removeNode(id,name){
   if(!(await uiConfirm('Remove host', 'Remove "'+name+'" from the controller? The host itself is untouched.',
                        {okLabel:'Remove', danger:true}))) return;
@@ -773,6 +817,103 @@ function alertsView(){
     + '<p class="muted small">"For" is how long the condition has been active (tracked since the last controller restart).</p>';
 }
 function tr(cells,th){ const t=th?'th':'td'; return '<tr>'+cells.map(c=>'<'+t+'>'+c+'</'+t+'>').join('')+'</tr>'; }
+
+// ── Checks view: service checks (well-known service + port + target,
+//    optionally pinned to a fleet host) probed by the controller ──
+let checksData = null, checkId = null;
+async function loadChecks(){
+  try{ checksData = await API.get('checks'); }
+  catch(e){ if(e.message!=='unauth') checksData = {checks: [], services: [], error: e.message}; }
+}
+function svcById(id){ return ((checksData&&checksData.services)||[]).find(s=>s.id===id); }
+function checksView(){
+  if(!checksData) return '<div class="muted">Loading checks…</div>';
+  const admin = me && me.role==='admin';
+  const oper = me && me.role!=='viewer';
+  let html = '';
+  if(admin) html += '<div class="row" style="margin-bottom:12px"><button onclick="openCheck()">+ Add check</button></div>';
+  const list = checksData.checks || [];
+  if(!list.length)
+    return html + '<div class="muted">No service checks defined yet.'
+      + (admin ? ' Use “+ Add check” to probe any service (HTTP, SSH, DNS, SMB, …) on any address.' : '')+'</div>';
+  const rows = list.map(c=>{
+    const r = c.result || {};
+    const paused = !!r.paused;
+    const dot = paused ? 'off' : r.ok===true ? 'ok' : r.ok===false ? 'bad' : '';
+    const state = paused ? '<span class="muted">paused</span>'
+      : r.ok===true ? '<span class="ok-txt">up</span>'
+      : r.ok===false ? '<span class="bad">down</span>' : '<span class="muted">pending</span>';
+    const svc = svcById(c.service);
+    const acts = '<span class="ck-acts">'
+      + (oper ? '<button class="x" title="Run now" onclick="runCheck(\''+esc(c.id)+'\')">↻</button>' : '')
+      + (admin ? '<button class="x edit" title="Edit" onclick="openCheck(\''+esc(c.id)+'\')">✎</button>'
+               + '<button class="x" title="Delete" onclick="delCheck(\''+esc(c.id)+'\',\''+esc(c.name)+'\')">×</button>' : '')
+      + '</span>';
+    return tr(['<span class="dot '+dot+'"></span> '+state,
+      '<b>'+esc(c.name)+'</b>', esc(svc ? svc.label : c.service),
+      esc(c.target+':'+c.port),
+      c.node_name ? esc(c.node_name) : '<span class="muted">—</span>',
+      r.latency_ms!=null ? r.latency_ms+' ms' : '',
+      esc(r.detail||''),
+      '<span class="muted" title="'+esc(r.ts||'')+'">'+(r.ts ? fmtAgo(r.ts) : '')+'</span>',
+      acts]);
+  });
+  html += '<table class="tbl"><thead>'
+    + tr(['Status','Name','Service','Target','Pinned host','Latency','Detail','Checked',''],'th')
+    + '</thead><tbody>'+rows.join('')+'</tbody></table>'
+    + '<p class="muted small">Checks run from the controller every '+(checksData.interval||60)
+    + 's. A check pinned to a host folds into that host\'s health dot and alerts (and pauses with it); '
+    + 'unpinned checks alert on their own.</p>';
+  return html;
+}
+function openCheck(id){
+  if(!checksData){ loadChecks().then(()=>openCheck(id)); return; }
+  checkId = id || null;
+  const c = id ? (checksData.checks||[]).find(x=>x.id===id) : null;
+  document.getElementById('ck-title').textContent = c ? 'Edit Check' : 'Add Check';
+  const sel = document.getElementById('ck-service');
+  sel.innerHTML = (checksData.services||[]).map(s=>'<option value="'+esc(s.id)+'">'+esc(s.label)+'</option>').join('');
+  sel.value = c ? c.service : 'http';
+  const ns = document.getElementById('ck-node');
+  ns.innerHTML = '<option value="">— none (standalone) —</option>'
+    + ((fleet&&fleet.nodes)||[]).map(n=>'<option value="'+esc(n.id)+'">'+esc(n.name)+'</option>').join('');
+  ns.value = c ? (c.node_id||'') : '';
+  document.getElementById('ck-target').value = c ? c.target : '';
+  const d = svcById(sel.value);
+  document.getElementById('ck-port').value = c ? c.port : ((d && d.port) || '');
+  document.getElementById('ck-name').value = c ? c.name : '';
+  document.getElementById('ck-err').textContent = '';
+  show('checkModal', true);
+}
+function closeCheck(){ show('checkModal', false); checkId = null; }
+function ckService(){
+  // picking a service repopulates the port box with its well-known default
+  const s = svcById(document.getElementById('ck-service').value);
+  document.getElementById('ck-port').value = (s && s.port) || '';
+}
+async function saveCheck(){
+  const body = {
+    service: document.getElementById('ck-service').value,
+    target: document.getElementById('ck-target').value.trim(),
+    port: parseInt(document.getElementById('ck-port').value, 10) || 0,
+    node_id: document.getElementById('ck-node').value || null,
+    name: document.getElementById('ck-name').value.trim(),
+  };
+  try{
+    if(checkId) await API.put('checks/'+checkId, body);
+    else await API.post('checks', body);
+    closeCheck(); await loadChecks(); render();
+  }catch(e){ document.getElementById('ck-err').textContent = e.message; }
+}
+async function runCheck(id){
+  try{ await API.post('checks/'+id+'/run', {}); await loadChecks(); render(); }
+  catch(e){ await uiAlert('Error', e.message); }
+}
+async function delCheck(id, name){
+  if(!(await uiConfirm('Delete check', 'Delete the check "'+name+'"?', {okLabel:'Delete', danger:true}))) return;
+  try{ await API.del('checks/'+id); await loadChecks(); render(); }
+  catch(e){ await uiAlert('Error', e.message); }
+}
 
 // ── Storage view ──
 function storageView(){
@@ -1011,6 +1152,7 @@ function openEdit(id){
   document.getElementById('ed-user').value = n.username || '';
   document.getElementById('ed-pass').value = '';
   document.getElementById('ed-verify').checked = !!n.verify_ssl;
+  document.getElementById('ed-disabled').checked = !!n.disabled;
   document.getElementById('ed-test').textContent = ''; document.getElementById('ed-err').textContent = '';
   show('editModal', true);
 }
@@ -1048,7 +1190,8 @@ async function testEdit(){
 async function saveEdit(){
   const f = editForm(); const n = nodeById(editId); const d = htDesc(editType);
   if(f.type===''){ document.getElementById('ed-err').textContent = 'Enter a name for the custom category.'; return; }
-  const body = {name: f.name, tags: f.tags, type: f.type};
+  const body = {name: f.name, tags: f.tags, type: f.type,
+                disabled: document.getElementById('ed-disabled').checked};
   if(n && f.base_url && f.base_url !== n.base_url) body.base_url = f.base_url;  // re-probes server-side
   if(d.auth==='token'){ if(f.token) body.token = f.token; }
   else {

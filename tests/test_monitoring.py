@@ -100,3 +100,14 @@ def test_health_entries_healthy_is_empty():
 def test_health_entries_covers_unreachable_hosts():
     entries = monitoring.health_entries({'ok': False, 'error': 'Connection refused'})
     assert entries and entries[0]['key'] == 'unreachable'
+
+
+def test_host_conditions_disabled_is_silent():
+    # A paused (monitoring-disabled) host reports NOTHING — even unreachable
+    # or degraded states are suppressed until it's re-enabled.
+    assert monitoring.host_conditions(
+        {'ok': False, 'disabled': True, 'error': 'monitoring disabled'}) == {}
+    env = {'ok': True, 'disabled': True, 'summary': {'alerts': ['a']},
+           'nas': {'pools_degraded': 1}}
+    assert monitoring.host_conditions(env) == {}
+    assert monitoring.health_entries(env) == []

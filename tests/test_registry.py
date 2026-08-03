@@ -499,3 +499,40 @@ def test_clean_type_rejects_unusable():
     assert app.clean_type(42) is None
     assert app.clean_type('x' * 25) is None
     assert app.clean_type('x' * 24) == 'x' * 24
+
+
+# ── disabled (paused-monitoring) hosts ───────────────────────────────
+def test_compute_rollup_disabled_not_unreachable():
+    nodes = [_node(), {'ok': False, 'disabled': True, 'error': 'monitoring disabled'}]
+    r = app.compute_rollup(nodes)
+    assert r['total'] == 2 and r['healthy'] == 1
+    assert r['unreachable'] == 0 and r['disabled'] == 1
+
+
+def test_disabled_envelope_shape():
+    node = {'id': 'x1', 'name': 'node1', 'base_url': 'https://h:8443',
+            'host_type': 'nexus', 'disabled': True}
+    env = app._disabled_envelope(node)
+    assert env['disabled'] is True and env['ok'] is False
+    assert env['error'] == 'monitoring disabled'
+
+
+def test_monitor_cycle_pause_is_silent_not_recovery():
+    """Disabling a host that has an active condition must drop the tracked
+    state without emitting a phantom 'recovered' event."""
+    with app._mon_lock:
+        saved = {k: app._mon[k] for k in app._mon}
+        app._mon.update(present_streak={}, active=set(), last_fire={}, seeded=False)
+    try:
+        down = {'id': 'h1', 'name': 'n1', 'ok': False, 'error': 'no route to host'}
+        app._monitor_cycle([down])   # seed cycle adopts the condition silently
+        assert ('h1', 'unreachable') in app._mon['active']
+        before = len(app._notify_events)
+        paused = {'id': 'h1', 'name': 'n1', 'ok': False, 'disabled': True,
+                  'error': 'monitoring disabled'}
+        app._monitor_cycle([paused])
+        assert app._mon['active'] == set()
+        assert len(app._notify_events) == before   # no event recorded/dispatched
+    finally:
+        with app._mon_lock:
+            app._mon.update(saved)

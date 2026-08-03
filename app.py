@@ -38,6 +38,7 @@ import requests
 import adapters
 import monitoring
 import history
+import checks
 from adapters import (   # host-type seam — see adapters/__init__.py
     NodeError, NodeClient, classify_node, parse_human_bytes, _serves_ai,
     probe_node, build_virt_envelope, build_nas_envelope, build_spark_envelope,
@@ -54,7 +55,7 @@ urllib3.disable_warnings(InsecureRequestWarning)
 app = Flask(__name__, static_url_path='')
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = '0.7.5'
+APP_VERSION = '0.8.0'
 
 
 def env_bool(name, default):
@@ -77,6 +78,7 @@ except OSError:
 
 AUTH_FILE = os.environ.get('CONTROLLER_AUTH_FILE', os.path.join(DATA_DIR, 'controller-auth.json'))
 NODES_FILE = os.environ.get('CONTROLLER_NODES_FILE', os.path.join(DATA_DIR, 'nodes.json'))
+CHECKS_FILE = os.environ.get('CONTROLLER_CHECKS_FILE', os.path.join(DATA_DIR, 'checks.json'))
 AUDIT_FILE = os.environ.get('CONTROLLER_AUDIT_FILE', os.path.join(DATA_DIR, 'audit.log'))
 HISTORY_FILE = os.environ.get('CONTROLLER_HISTORY_FILE', os.path.join(DATA_DIR, 'history.db'))
 HISTORY_DAYS = int(os.environ.get('CONTROLLER_HISTORY_DAYS', '30'))
@@ -290,6 +292,7 @@ RBAC_EXEMPT = {'api_logout', 'change_password'}
 # Endpoints that require the top (admin) role regardless of method — enrolling
 # or removing a node, and managing controller users.
 ADMIN_ONLY = {'nodes_add', 'node_delete', 'node_update', 'node_cert', 'node_repin',
+              'checks_add', 'checks_update', 'checks_delete',
               'tls_regenerate', 'tls_upload_cert',
               'notifications_save', 'notifications_test', 'notifications_events',
               'users_list', 'users_add', 'users_update', 'users_delete',
@@ -834,6 +837,11 @@ def node_update(node_id):
             n['name'] = (data['name'] or '').strip() or n['name']
         if 'tags' in data and isinstance(data['tags'], list):
             n['tags'] = [str(t) for t in data['tags']]
+        if 'disabled' in data:
+            # Maintenance pause: the fan-out stops contacting the host and every
+            # check (dot, alerts, notifier, history sampling) is suspended until
+            # it's re-enabled. The registry record itself is untouched.
+            n['disabled'] = bool(data['disabled'])
         if 'type' in data:
             # 'auto' un-pins (effective type reverts to type_auto); any other
             # cleaned label pins the manual override — a custom label becomes
@@ -1023,10 +1031,13 @@ def _services_down(summary):
 
 def compute_rollup(results):
     """Pure fleet rollup from per-node envelopes (nexus + virt) — unit-tested."""
-    healthy = unreachable = alerts = degraded = svc_down = 0
+    healthy = unreachable = alerts = degraded = svc_down = disabled = 0
     used = size = 0
     vms = containers = 0
     for r in results:
+        if r.get('disabled'):
+            disabled += 1        # paused on purpose — neither healthy nor down
+            continue
         if not r.get('ok'):
             unreachable += 1
             continue
@@ -1047,9 +1058,11 @@ def compute_rollup(results):
         i = r.get('instances') or {}     # nexus nodes running LXD (v2 Containers)
         vms += (i.get('vms') or 0) + (i.get('containers') or 0)
         containers += i.get('containers') or 0
-        if n_alerts or down or zfs_bad or nas.get('pools_degraded') or r.get('stale'):
+        ck_bad = any(c.get('ok') is False for c in r.get('svc_checks') or [])
+        if n_alerts or down or zfs_bad or nas.get('pools_degraded') or r.get('stale') or ck_bad:
             degraded += 1
     return {'total': len(results), 'healthy': healthy, 'unreachable': unreachable,
+            'disabled': disabled,
             'alerts': alerts, 'degraded': degraded, 'services_down': svc_down,
             'storage_used': used, 'storage_size': size,
             'vms': vms, 'containers': containers}
@@ -1082,12 +1095,22 @@ _health_since = {}
 _health_lock = threading.Lock()
 
 
+def _disabled_envelope(node):
+    """Envelope for a host whose monitoring is paused: never contacted, never
+    alerted on — the row renders grey ('paused'), not red."""
+    out = adapters.base_envelope(node)
+    out['disabled'] = True
+    out['error'] = 'monitoring disabled'
+    return out
+
+
 def _build_fleet():
     nodes = load_nodes().get('nodes', [])
-    results = []
-    if nodes:
+    active = [n for n in nodes if not n.get('disabled')]
+    results = [_disabled_envelope(n) for n in nodes if n.get('disabled')]
+    if active:
         with ThreadPoolExecutor(max_workers=FANOUT_WORKERS) as pool:
-            futures = [pool.submit(_fetch_one, n) for n in nodes]
+            futures = [pool.submit(_fetch_one, n) for n in active]
             for fut in as_completed(futures):
                 results.append(fut.result())
     # Refresh last_seen + type_auto for reachable nodes (best-effort).
@@ -1114,6 +1137,7 @@ def _build_fleet():
     if dirty:
         save_nodes(reg)
     flag_version_skew(results)
+    _attach_svc_checks(results)   # pinned service checks → env, before health folds
     # Fold each host's warning+ conditions (failed services, degraded pools,
     # stale polls, alerts, unreachable — same set the notifier fires on) into
     # the envelope, with a first-seen timestamp per (host, condition) so the
@@ -1161,6 +1185,206 @@ def fleet_summary():
                             'cached': True, 'cache_age': round(age, 1)})
     data = _refresh_fleet()
     return jsonify({**scoped_fleet(data, _scope()), 'cached': False, 'cache_age': 0})
+
+
+# ─── Service checks: probe well-known services on the monitor cadence ──
+# Definitions live in checks.json; the latest results are in-memory (like the
+# fleet cache). A check may be pinned to a fleet host: its failure then folds
+# into that host's health dot / Alerts row / notifier condition set (and it
+# pauses with the host); unpinned checks alert as their own monitor entities.
+
+def load_checks():
+    return load_json(CHECKS_FILE, {'checks': []})
+
+
+def save_checks(data):
+    write_json_atomic(CHECKS_FILE, data)
+
+
+# check_id → {'ok','latency_ms','detail','ts'} (+ 'paused': True when the
+# pinned host is disabled). Shared with the monitor thread — guard it.
+_check_results = {}
+_check_lock = threading.Lock()
+
+
+def _now_iso():
+    return datetime.now().astimezone().isoformat(timespec='seconds')
+
+
+def _run_one_check(c, disabled_ids):
+    if c.get('node_id') in disabled_ids:
+        return c['id'], {'ok': None, 'paused': True, 'latency_ms': None,
+                         'detail': 'pinned host is paused', 'ts': _now_iso()}
+    return c['id'], {**checks.run_check(c), 'ts': _now_iso()}
+
+
+def _run_all_checks():
+    """Run every configured check concurrently (monitor cadence). A check
+    pinned to a disabled host pauses with it."""
+    cfg = load_checks().get('checks', [])
+    if not cfg:
+        with _check_lock:
+            _check_results.clear()
+        return
+    disabled_ids = {n['id'] for n in load_nodes().get('nodes', []) if n.get('disabled')}
+    with ThreadPoolExecutor(max_workers=FANOUT_WORKERS) as pool:
+        results = dict(pool.map(lambda c: _run_one_check(c, disabled_ids), cfg))
+    live = {c['id'] for c in cfg}
+    with _check_lock:
+        for k in [k for k in _check_results if k not in live]:
+            del _check_results[k]
+        _check_results.update(results)
+
+
+def _attach_svc_checks(results):
+    """Fold each pinned check's latest result into its host's fan-out envelope
+    (env['svc_checks']) so the dot, Alerts tab, and notifier see it."""
+    cfg = load_checks().get('checks', [])
+    if not cfg:
+        return
+    with _check_lock:
+        res = dict(_check_results)
+    by_node = {}
+    for c in cfg:
+        if not c.get('node_id'):
+            continue
+        r = res.get(c['id']) or {}
+        by_node.setdefault(c['node_id'], []).append(
+            {'id': c['id'], 'name': c['name'], 'service': c['service'],
+             'ok': r.get('ok'), 'detail': r.get('detail'),
+             'latency_ms': r.get('latency_ms')})
+    for env in results:
+        if env.get('disabled'):
+            continue   # paused host: its checks are paused too, show nothing
+        if env['id'] in by_node:
+            env['svc_checks'] = by_node[env['id']]
+
+
+def _check_monitor_envs():
+    """UNPINNED checks as synthetic monitor entities (id 'check:<id>') so the
+    existing debounce/cooldown/webhook machinery covers them. Pinned checks
+    ride their host's condition set instead — never a double fire."""
+    cfg = [c for c in load_checks().get('checks', []) if not c.get('node_id')]
+    if not cfg:
+        return []
+    with _check_lock:
+        res = dict(_check_results)
+    envs = []
+    for c in cfg:
+        r = res.get(c['id'])
+        if not r or r.get('ok') is None:
+            continue   # not probed yet (or paused) — nothing to diff
+        envs.append({'id': 'check:' + c['id'], 'name': 'check ' + c['name'],
+                     'ok': r['ok'],
+                     'error': None if r['ok'] else (r.get('detail') or 'failing'),
+                     'summary': {}})
+    return envs
+
+
+@app.route('/api/checks')
+def checks_list():
+    cfg = load_checks().get('checks', [])
+    reg = load_nodes().get('nodes', [])
+    scope = _scope()
+    if scope is not None:   # scoped accounts don't see checks pinned out of scope
+        visible = {n['id'] for n in reg if scope_allows(scope, n)}
+        cfg = [c for c in cfg if not c.get('node_id') or c['node_id'] in visible]
+    names = {n['id']: n['name'] for n in reg}
+    with _check_lock:
+        res = dict(_check_results)
+    out = [{**c, 'node_name': names.get(c.get('node_id')),
+            'result': res.get(c['id'])} for c in cfg]
+    return jsonify({'checks': out, 'services': checks.SERVICES,
+                    'interval': MONITOR_INTERVAL})
+
+
+def _store_check_result(check):
+    """Probe now + cache the result (respecting a paused pin); bust the fleet
+    cache so a pinned check's dot change shows on the next render."""
+    disabled_ids = {n['id'] for n in load_nodes().get('nodes', []) if n.get('disabled')}
+    cid, result = _run_one_check(check, disabled_ids)
+    with _check_lock:
+        _check_results[cid] = result
+    with _fleet_lock:
+        _fleet_cache['ts'] = 0.0
+    return result
+
+
+@app.route('/api/checks', methods=['POST'])
+def checks_add():
+    """Define a service check. Admin-only (ADMIN_ONLY). Probes immediately so
+    the row shows a live result rather than 'pending'."""
+    rec, e = checks.clean_check(request.get_json() or {})
+    if e:
+        return err(e)
+    if rec['node_id'] and not any(n.get('id') == rec['node_id']
+                                  for n in load_nodes().get('nodes', [])):
+        return err('unknown host for pin')
+    data = load_checks()
+    rec['id'] = secrets.token_hex(6)
+    rec['added_at'] = _now_iso()
+    data.setdefault('checks', []).append(rec)
+    save_checks(data)
+    result = _store_check_result(rec)
+    g.audit_target = rec['name']
+    return jsonify({'success': True, 'check': {**rec, 'result': result}})
+
+
+@app.route('/api/checks/<check_id>', methods=['PUT'])
+def checks_update(check_id):
+    """Edit a check in place (same fields as create). Admin-only."""
+    rec, e = checks.clean_check(request.get_json() or {})
+    if e:
+        return err(e)
+    if rec['node_id'] and not any(n.get('id') == rec['node_id']
+                                  for n in load_nodes().get('nodes', [])):
+        return err('unknown host for pin')
+    data = load_checks()
+    for i, c in enumerate(data.get('checks', [])):
+        if c.get('id') != check_id:
+            continue
+        rec['id'] = check_id
+        rec['added_at'] = c.get('added_at')
+        data['checks'][i] = rec
+        save_checks(data)
+        result = _store_check_result(rec)
+        g.audit_target = rec['name']
+        return jsonify({'success': True, 'check': {**rec, 'result': result}})
+    return err('check not found', 404)
+
+
+@app.route('/api/checks/<check_id>', methods=['DELETE'])
+def checks_delete(check_id):
+    data = load_checks()
+    before = len(data.get('checks', []))
+    target = next((c['name'] for c in data.get('checks', []) if c.get('id') == check_id), None)
+    data['checks'] = [c for c in data.get('checks', []) if c.get('id') != check_id]
+    if len(data['checks']) == before:
+        return err('check not found', 404)
+    save_checks(data)
+    with _check_lock:
+        _check_results.pop(check_id, None)
+    with _fleet_lock:
+        _fleet_cache['ts'] = 0.0
+    g.audit_target = target
+    return jsonify({'success': True})
+
+
+@app.route('/api/checks/<check_id>/run', methods=['POST'])
+def checks_run(check_id):
+    """Probe one check right now (operator+; viewer is blocked upstream)."""
+    c = next((c for c in load_checks().get('checks', [])
+              if c.get('id') == check_id), None)
+    if not c:
+        return err('check not found', 404)
+    if _scope() is not None and c.get('node_id'):
+        node = next((n for n in load_nodes().get('nodes', [])
+                     if n.get('id') == c['node_id']), None)
+        if node and not scope_allows(_scope(), node):
+            return err('check not found', 404)   # invisible out of scope
+    result = _store_check_result(c)
+    g.audit_target = c['name']
+    return jsonify({'success': True, 'result': result})
 
 
 # ─── Notifications: monitor state transitions, POST to webhooks ────────
@@ -1263,10 +1487,18 @@ def _monitor_cycle(results):
     Debounced: FLAP_CYCLES to fire, immediate recovery, per-key cooldown."""
     snap = monitoring.snapshot_conditions(results)
     present = {(hid, key) for hid, e in snap.items() for key in e['conditions']}
+    paused = {r['id'] for r in results if r.get('disabled')}
     now = time.time()
     fire, recover = [], []
     with _mon_lock:
         streak = _mon['present_streak']
+        # A paused host's conditions vanish (host_conditions returns {}), but
+        # that must read as "stop tracking", not "recovered" — drop its state
+        # silently so disabling never notifies and re-enabling starts fresh.
+        for pk in [pk for pk in _mon['active'] if pk[0] in paused]:
+            _mon['active'].discard(pk)
+        for pk in [pk for pk in streak if pk[0] in paused]:
+            del streak[pk]
         # advance streaks
         for pk in present:
             streak[pk] = streak.get(pk, 0) + 1
@@ -1308,6 +1540,7 @@ def _monitor_cycle(results):
 _COND_LABEL = {'unreachable': 'reachable again', 'cert_changed': 'certificate re-pinned',
                'alerts': 'alerts cleared', 'pool_degraded': 'pools healthy',
                'cluster_unhealthy': 'cluster healthy', 'services_down': 'services back up',
+               'check_failed': 'service checks passing',
                'stale': 'polling again', 'version_lag': 'version in sync'}
 
 
@@ -1328,10 +1561,13 @@ def get_history():
 def _monitor_loop():
     while True:
         try:
+            _run_all_checks()   # before the refresh so envelopes fold fresh results
             data = _refresh_fleet()
-            _monitor_cycle(data['nodes'])
+            _monitor_cycle(data['nodes'] + _check_monitor_envs())
             try:
-                get_history().record(data['nodes'])
+                # Paused hosts record no samples (a maintenance window must not
+                # tank the availability % or feed zeros into the forecasts).
+                get_history().record([r for r in data['nodes'] if not r.get('disabled')])
             except Exception as e:
                 print('history: record failed: %s' % e, flush=True)
         except Exception as e:
@@ -1500,8 +1736,10 @@ def fleet_action():
     if not RE_SERVICE.match(service):
         return err('invalid service name')
     # A tag-scoped account can only ever reach its own hosts, whatever the
-    # selector below says (explicit ids included).
-    nodes = [n for n in load_nodes().get('nodes', []) if scope_allows(_scope(), n)]
+    # selector below says (explicit ids included). Paused hosts are never
+    # fanned out to (explicit ids included — they're out of service).
+    nodes = [n for n in load_nodes().get('nodes', [])
+             if scope_allows(_scope(), n) and not n.get('disabled')]
     scope = 'all nodes'
     # Explicit node_ids win; else an optional tag set narrows the fan-out to
     # hosts bearing ANY of the given tags ("restart smbd on everything tagged

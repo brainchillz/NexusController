@@ -13,6 +13,8 @@ def host_conditions(env):
     {key: {'severity', 'detail'}}. Only conditions worth waking someone for;
     transient enroll states (awaiting first poll) are deliberately excluded."""
     conds = {}
+    if env.get('disabled'):
+        return conds   # monitoring paused (host out of service on purpose)
     err = (env.get('error') or '')
     if not env.get('ok'):
         if 'await' in err.lower():
@@ -48,6 +50,13 @@ def host_conditions(env):
     if down:
         conds['services_down'] = {'severity': 'warning',
                                   'detail': f'{down} enabled service(s) not running'}
+    failed = [c for c in env.get('svc_checks') or [] if c.get('ok') is False]
+    if failed:   # pinned service checks (ok None = not probed yet — not a failure)
+        names = ', '.join(c.get('name') or '?' for c in failed)
+        conds['check_failed'] = {'severity': 'warning',
+                                 'detail': (f'service check failing: {names}'
+                                            if len(failed) == 1 else
+                                            f'{len(failed)} service checks failing: {names}')}
     if env.get('stale'):
         conds['stale'] = {'severity': 'warning', 'detail': 'background poll is stale'}
     if env.get('version_lag'):
