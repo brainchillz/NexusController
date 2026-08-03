@@ -44,7 +44,6 @@
       <div class="spacer"></div>
       <span id="updated" class="muted small"></span>
       <span id="whoami" class="muted"></span>
-      <button class="ghost" onclick="openAdd()" id="addBtn">+ Add Host</button>
       <button class="ghost" onclick="refresh()">Refresh</button>
       <button class="ghost" onclick="doLogout()">Sign out</button>
     </header>
@@ -58,6 +57,7 @@
            the element ids their JS has always used. -->
       <div id="settingsPane" style="display:none">
         <div class="setnav">
+          <button class="setsec" data-sec="hosts" onclick="setSection('hosts')"><svg class="ico ico-sm"><use href="#i-mon"/></svg> Hosts</button>
           <button class="setsec" data-sec="users" onclick="setSection('users')"><svg class="ico ico-sm"><use href="#i-users"/></svg> Users</button>
           <button class="setsec" data-sec="notify" onclick="setSection('notify')"><svg class="ico ico-sm"><use href="#i-bell"/></svg> Notifications</button>
           <button class="setsec" data-sec="cert" onclick="setSection('cert')"><svg class="ico ico-sm"><use href="#i-lock"/></svg> Certificate</button>
@@ -65,7 +65,16 @@
           <button class="setsec" data-sec="tuning" onclick="setSection('tuning')">Tuning</button>
         </div>
 
-        <div id="set-users" class="set-sec">
+        <div id="set-hosts" class="set-sec">
+          <h2>Enrolled Hosts</h2>
+          <p class="muted small">The connection registry — how the controller reaches each host.
+            Status and metrics live on the Overview; pausing/resuming monitoring is in each
+            host's Edit dialog.</p>
+          <div class="row" style="margin-bottom:10px"><button onclick="openAdd()">+ Add Host</button></div>
+          <div id="hosts-body" class="muted">Loading…</div>
+        </div>
+
+        <div id="set-users" class="set-sec" style="display:none">
           <h2>Controller Users</h2>
           <p class="muted small"><b>admin</b> manages nodes + full control · <b>operator</b> controls
             (no enroll/remove) · <b>viewer</b> is read-only. Scope tags confine an
@@ -407,7 +416,7 @@ async function boot(){
   document.getElementById('whoami').textContent = me.user + ' · ' + me.role
     + (me.scope_tags && me.scope_tags.length ? ' · <svg class="ico ico-sm"><use href="#i-tag"/></svg> ' + me.scope_tags.join(', ') : '');
   const adminUI = me.role === 'admin' ? '' : 'none';
-  ['addBtn','settingsTab'].forEach(i=>document.getElementById(i).style.display = adminUI);
+  document.getElementById('settingsTab').style.display = adminUI;
   setTab(tab);
   await refresh();
   startPoll();
@@ -772,9 +781,9 @@ function nodeRow(n){
   const actions = (rm && n.disabled ? '<button class="btn-open" title="Resume monitoring for this host" onclick="resumeNode(\''+esc(n.id)+'\')">Resume</button>' : '')
     + (n.ok && openable ? '<a class="btn-open" href="'+openUrl+'" target="_blank" rel="noopener">'+openLbl+'</a>':'')
     + (hasGuests ? '<button class="btn-open" title="View / control guests" onclick="openGuests(\''+esc(n.id)+'\')"><svg class="ico ico-sm"><use href="#i-mon"/></svg> Guests</button>' : '')
-    + (rm && certChanged ? '<button class="btn-open" style="border-color:var(--bad);color:var(--bad)" title="Certificate changed — review and re-pin" onclick="openRepin(\''+esc(n.id)+'\',\''+esc(n.name)+'\')"><svg class="ico ico-sm"><use href="#i-lock"/></svg> Review cert</button>' : '')
-    + (rm ? '<button class="x edit" title="Edit" onclick="openEdit(\''+esc(n.id)+'\')">✎</button>'
-          + '<button class="x" title="Remove" onclick="removeNode(\''+esc(n.id)+'\',\''+esc(n.name)+'\')">×</button>' : '');
+    + (rm && certChanged ? '<button class="btn-open" style="border-color:var(--bad);color:var(--bad)" title="Certificate changed — review and re-pin" onclick="openRepin(\''+esc(n.id)+'\',\''+esc(n.name)+'\')"><svg class="ico ico-sm"><use href="#i-lock"/></svg> Review cert</button>' : '');
+  // Edit/Remove live in Settings → Hosts now — the overview rows are pure
+  // monitoring (plus contextual repair actions: Resume, Review cert).
 
   return '<div class="hrow">'
     + '<span class="dot '+dot+'" title="'+esc(dotTitle)+'"></span>'
@@ -795,7 +804,8 @@ async function resumeNode(id){
 async function removeNode(id,name){
   if(!(await uiConfirm('Remove host', 'Remove "'+name+'" from the controller? The host itself is untouched.',
                        {okLabel:'Remove', danger:true}))) return;
-  try{ await API.del('nodes/'+id); refresh(); }catch(e){ await uiAlert('Error', e.message); }
+  try{ await API.del('nodes/'+id); refresh(); if(tab==='settings') loadHostsSection(); }
+  catch(e){ await uiAlert('Error', e.message); }
 }
 
 // ── Alerts view: structured health conditions, severity + since ──
@@ -1142,14 +1152,17 @@ async function testNode(){
 async function saveNode(){
   const f = nodeForm();
   if(f.type===''){ document.getElementById('nd-err').textContent = 'Enter a name for the custom category.'; return; }
-  try{ await API.post('nodes', f); closeAdd(); refresh(); }
+  try{ await API.post('nodes', f); closeAdd(); refresh();
+       if(tab==='settings') loadHostsSection(); }
   catch(e){ document.getElementById('nd-err').textContent = e.message; }
 }
 
 // ── Edit host (name / base URL / tags / type / credentials) ──
 let editId = null, editType = 'nexus';
 function openEdit(id){
-  const n = nodeById(id); if(!n) return;
+  // Prefer the registry record (has username/verify_ssl/disabled); the fleet
+  // envelope is only a fallback.
+  const n = hostsReg.find(x=>x.id===id) || nodeById(id); if(!n) return;
   editId = id; editType = n.host_type || 'nexus';
   const d = htDesc(editType);
   const set = (sel,on)=>document.querySelectorAll('#editModal '+sel).forEach(e=>e.style.display = on ? '' : 'none');
@@ -1212,14 +1225,16 @@ async function saveEdit(){
     if(f.password) body.password = f.password;
   }
   if(d.verify_tls && n && f.verify_ssl !== !!n.verify_ssl) body.verify_ssl = f.verify_ssl;
-  try{ await API.put('nodes/'+editId, body); closeEdit(); refresh(); }
+  try{ await API.put('nodes/'+editId, body); closeEdit(); refresh();
+       if(tab==='settings') loadHostsSection(); }
   catch(e){ document.getElementById('ed-err').textContent = e.message; }
 }
 
 // ── TLS certificate ──
 // ── Settings page: one pane, five sections; each activation runs its loader ──
-let settingsSection = 'users';
-const SECTION_LOAD = {users: ()=>loadUsersSection(), notify: ()=>loadNotifySection(),
+let settingsSection = 'hosts';
+const SECTION_LOAD = {hosts: ()=>loadHostsSection(),
+                      users: ()=>loadUsersSection(), notify: ()=>loadNotifySection(),
                       cert: ()=>loadCertSection(), audit: ()=>loadAudit(),
                       tuning: ()=>loadTuning()};
 function setSection(s){
@@ -1231,6 +1246,34 @@ function setSection(s){
 async function loadCertSection(){
   document.getElementById('cert-msg').textContent='';
   await loadCertInfo();
+}
+// Hosts section: the connection registry — name/address/port + edit/remove.
+// Deliberately no status or metrics (that's the Overview's job). Rows come
+// from /api/nodes (full registry records, so Edit sees username/verify_ssl).
+let hostsReg = [];
+async function loadHostsSection(){
+  const b = document.getElementById('hosts-body');
+  try{
+    const d = await API.get('nodes');
+    hostsReg = d.nodes||[];
+    if(!hostsReg.length){ b.innerHTML = '<div class="muted">No hosts enrolled yet — use “+ Add Host”.</div>'; return; }
+    const rows = hostsReg.slice()
+      .sort((a,b)=>String(a.name).localeCompare(String(b.name)))
+      .map(n=>{
+        let host = n.base_url, port = '';
+        try{ const u = new URL(n.base_url); host = u.hostname;
+             port = u.port || (u.protocol==='https:' ? '443' : '80'); }catch(e){}
+        const kind = (HT[n.host_type||'nexus']||{}).label || n.host_type || 'nexus';
+        return tr(['<b>'+esc(n.name)+'</b>'+(n.disabled?' <span class="muted small">(paused)</span>':''),
+          esc(host), esc(port), '<span class="muted small">'+esc(kind)+'</span>',
+          '<span class="ck-acts">'
+          + '<button class="x edit" title="Edit" onclick="openEdit(\''+esc(n.id)+'\')">✎</button>'
+          + '<button class="x" title="Remove" onclick="removeNode(\''+esc(n.id)+'\',\''+esc(n.name)+'\')">×</button>'
+          + '</span>']);
+      });
+    b.innerHTML = '<table class="tbl"><thead>'+tr(['Name','Address','Port','Kind',''],'th')
+      + '</thead><tbody>'+rows.join('')+'</tbody></table>';
+  }catch(e){ b.innerHTML = '<div class="bad">'+esc(e.message)+'</div>'; }
 }
 async function loadTuning(){
   const m = document.getElementById('tn-msg'); m.textContent='';
