@@ -153,7 +153,9 @@ main{padding:20px;max-width:1200px;margin:0 auto}
 .srow-h{display:flex;justify-content:space-between;margin-bottom:6px}
 .sgap{height:6px}
 .warn{color:var(--warn)} .bad{color:var(--bad)}
-.btn-open{display:inline-block;font-size:12px;text-decoration:none;color:var(--accent);border:1px solid var(--line);border-radius:6px;padding:5px 10px}
+/* Used on <a> AND <button> — background must be explicit or the global
+   orange button background bleeds through (orange-on-orange text). */
+.btn-open{display:inline-block;font-size:12px;text-decoration:none;color:var(--accent);border:1px solid var(--line);border-radius:6px;padding:5px 10px;background:transparent}
 .btn-open:hover{border-color:var(--accent);background:var(--panel2)}
 
 /* Services: bulk bar, clickable dots, logs */
