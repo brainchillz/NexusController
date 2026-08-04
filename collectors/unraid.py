@@ -14,6 +14,8 @@ Queries (all reads):
     every pool member ("caches"); entries carrying ``fsSize`` are mounted
     pools. Sizes here are **kilobytes**.
   * ``notifications { overview { unread } }``  alert/warning counts
+  * ``vars { shareSmbEnabled shareNfsEnabled useSsh }``  service enable flags
+    (Unraid's API exposes no per-service run state — enabled implies running)
 
 `build_metrics` emits the SAME normalized dict as the TrueNAS/Synology/ZimaOS
 collectors → `build_nas_envelope` + the whole NAS UI are reused. Pools = the
@@ -38,6 +40,7 @@ _QUERY = """{
     caches  { name status fsSize fsUsed fsFree }
   }
   notifications { overview { unread { alert warning total } } }
+  vars { shareSmbEnabled shareNfsEnabled useSsh }
 }"""
 
 # session cache: host -> {'session': requests.Session, 'csrf': str}
@@ -187,6 +190,15 @@ def build_metrics(data):
     if n_warn:
         alerts.append(f'{n_warn} unread warning notification(s) in Unraid')
 
+    services = {}
+    svc_vars = data.get('vars') or {}
+    for flag, key, label in (('shareSmbEnabled', 'smb', 'Samba'),
+                             ('shareNfsEnabled', 'nfs', 'NFS Server'),
+                             ('useSsh', 'ssh', 'SSH')):
+        if svc_vars.get(flag):   # enabled-only; Unraid runs what's enabled
+            services[key] = {'name': label, 'active': 'active',
+                             'enabled': 'enabled'}
+
     cpu_pct = ((metrics.get('cpu') or {}).get('percentTotal'))
     mem = metrics.get('memory') or {}
     mem_pct = mem.get('percentTotal')
@@ -213,4 +225,5 @@ def build_metrics(data):
         'disk_count': len(disks) + len(parities) + len(caches),
         'alert_count': len(alerts),
         'alerts': alerts[:10],
+        'services': services,
     }

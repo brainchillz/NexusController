@@ -96,3 +96,13 @@ def test_unraid_adapter_registered():
     assert a.default_type == 'Storage' and a.polled
     d = a.descriptor()
     assert d['label'].startswith('Unraid') and d['url_placeholder'].startswith('http://')
+
+
+def test_service_vars_map_to_services():
+    d = dict(LIVE)
+    d['vars'] = {'shareSmbEnabled': True, 'shareNfsEnabled': True, 'useSsh': False}
+    m = unraid.build_metrics(d)
+    assert m['services']['smb'] == {'name': 'Samba', 'active': 'active', 'enabled': 'enabled'}
+    assert 'nfs' in m['services']
+    assert 'ssh' not in m['services']      # disabled → omitted
+    assert unraid.build_metrics(LIVE)['services'] == {}   # no vars → none

@@ -123,3 +123,29 @@ def test_public_node_strips_truenas_key():
     n = {'id': '1', 'name': 'nas', 'host_type': 'truenas', 'token_enc': 'ciphertext'}
     pub = app._public_node(n)
     assert 'token_enc' not in pub
+
+# service.query rows as the middleware returns them.
+SERVICES = [
+    {'service': 'cifs', 'enable': True, 'state': 'RUNNING'},
+    {'service': 'nfs', 'enable': True, 'state': 'STOPPED'},
+    {'service': 'ftp', 'enable': False, 'state': 'STOPPED'},
+    {'service': 'smartd', 'enable': True, 'state': 'RUNNING'},   # not file/access
+]
+
+
+def test_map_services_states_and_filtering():
+    svcs = truenas.map_services(SERVICES)
+    assert svcs['smb'] == {'name': 'Samba', 'active': 'active', 'enabled': 'enabled'}
+    # enabled-but-stopped surfaces as down (matrix red / services_down condition)
+    assert svcs['nfs'] == {'name': 'NFS Server', 'active': 'inactive', 'enabled': 'enabled'}
+    assert 'ftp' not in svcs      # fully off → omitted (no grey column bloat)
+    assert 'smartd' not in svcs   # not in the file/access whitelist
+
+
+def test_envelope_carries_services_summary():
+    m = truenas.build_metrics(INFO, POOLS, DISKS, [], services=SERVICES)
+    env = app.build_nas_envelope(NAS_NODE, m)
+    assert env['summary']['services']['smb']['active'] == 'active'
+    # and the base envelope's summary stays None when nothing is reported
+    env = app.build_nas_envelope(NAS_NODE, truenas.build_metrics(INFO, POOLS, DISKS, []))
+    assert env['summary'] is None

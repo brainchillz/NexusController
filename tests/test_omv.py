@@ -84,3 +84,26 @@ def test_omv_adapter_registered():
     assert a.default_type == 'Storage' and a.polled
     d = a.descriptor()
     assert d['label'] == 'OpenMediaVault' and d['url_placeholder'].startswith('http://')
+
+
+SERVICES = [
+    {'name': 'samba', 'title': 'SMB/CIFS', 'enabled': True, 'running': True},
+    {'name': 'nfs', 'title': 'NFS', 'enabled': True, 'running': False},
+    {'name': 'rsyncd', 'title': 'RSync server', 'enabled': False, 'running': False},
+    {'name': 'writecache', 'title': 'WriteCache', 'enabled': True, 'running': True},
+]
+
+
+def test_map_services_known_and_passthrough():
+    svcs = omv.map_services(SERVICES)
+    assert svcs['smb'] == {'name': 'Samba', 'active': 'active', 'enabled': 'enabled'}
+    assert svcs['nfs']['active'] == 'inactive'   # enabled-but-stopped → down
+    assert 'rsync' not in svcs                   # fully off → omitted
+    # unknown plugin services pass through under their own name/title
+    assert svcs['writecache']['name'] == 'WriteCache'
+
+
+def test_metrics_carry_services():
+    m = omv.build_metrics(INFO, FILESYSTEMS, RAIDS, SMART, SERVICES)
+    assert 'smb' in m['services']
+    assert omv.build_metrics(INFO, FILESYSTEMS, RAIDS, SMART)['services'] == {}

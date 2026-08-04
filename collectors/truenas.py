@@ -1,7 +1,7 @@
 """TrueNAS collector — SCALE/CORE over the JSON-RPC 2.0 WebSocket API (API key).
 
 Read-only by design: only ever calls read methods (system.info, pool.query,
-disk.query, alert.list) plus one reporting read (CPU/memory). Auth is the API key
+disk.query, alert.list, service.query) plus one reporting read (CPU/memory). Auth is the API key
 via ``auth.login_with_api_key`` over ``wss://<host>/api/current`` — the key's user
 needs the *Read Only Admin* role (every method errors otherwise). Talks to
 app.py's TrueNasAdapter.
@@ -69,6 +69,10 @@ def collect_metrics(host, api_key, port=443, verify_ssl=False, timeout=CONNECT_T
             alerts = call('alert.list')
         except Exception:
             alerts = []
+        try:
+            services = call('service.query')
+        except Exception:
+            services = []
         cpu_graph = mem_graph = None
         try:
             graphs = call('reporting.get_data',
@@ -84,7 +88,7 @@ def collect_metrics(host, api_key, port=443, verify_ssl=False, timeout=CONNECT_T
         except Exception:
             pass
 
-    return build_metrics(info, pools, disks, alerts, cpu_graph, mem_graph)
+    return build_metrics(info, pools, disks, alerts, cpu_graph, mem_graph, services)
 
 
 def _recent_avg(graph, column, n=60):
@@ -109,8 +113,41 @@ def _recent_avg(graph, column, n=60):
 # e.g. "an update is available" — does not).
 _SEVERE = {'WARNING', 'ERROR', 'CRITICAL', 'ALERT', 'EMERGENCY'}
 
+# TrueNAS service names → the canonical service keys/names the nexus nodes
+# report, so the Services matrix merges them into the same columns.
+_SERVICE_KEYS = {
+    'cifs': ('smb', 'Samba'),
+    'nfs': ('nfs', 'NFS Server'),
+    'iscsitarget': ('iscsi', 'iSCSI Target'),
+    'ftp': ('ftp', 'FTP'),
+    'rsync': ('rsync', 'Rsync'),
+    'ssh': ('ssh', 'SSH'),
+}
 
-def build_metrics(info, pools, disks, alerts, cpu_graph=None, mem_graph=None):
+
+def map_services(services):
+    """service.query rows ({service, enable, state}) → the nexus-style
+    summary.services dict. Only enabled-or-running file/access services are
+    emitted (a NAS's fixed catalog is mostly off — grey columns are noise);
+    an enabled-but-STOPPED service surfaces as down in the matrix."""
+    out = {}
+    for s in services or []:
+        mapped = _SERVICE_KEYS.get(s.get('service'))
+        if not mapped:
+            continue
+        key, name = mapped
+        enabled = bool(s.get('enable'))
+        running = (s.get('state') or '').upper() == 'RUNNING'
+        if not (enabled or running):
+            continue
+        out[key] = {'name': name,
+                    'active': 'active' if running else 'inactive',
+                    'enabled': 'enabled' if enabled else 'disabled'}
+    return out
+
+
+def build_metrics(info, pools, disks, alerts, cpu_graph=None, mem_graph=None,
+                  services=None):
     """Pure transform: TrueNAS JSON-RPC payloads → the normalized metric dict.
     (Shapes are identical to the old REST payloads, so this is unchanged.)"""
     info = info or {}
@@ -163,4 +200,5 @@ def build_metrics(info, pools, disks, alerts, cpu_graph=None, mem_graph=None):
         'disk_count': len(disks),
         'alert_count': len(active),
         'alerts': [(a.get('formatted') or a.get('text') or '').strip() for a in active][:10],
+        'services': map_services(services),
     }

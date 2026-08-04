@@ -19,6 +19,12 @@ def build_nas_envelope(node, metrics):
                         'memory': {'pct': metrics.get('memory_usage_percent')}}
     out['used_bytes'] = int((metrics.get('storage_used_gb') or 0) * 1024 ** 3)
     out['size_bytes'] = int((metrics.get('storage_total_gb') or 0) * 1024 ** 3)
+    # File/access services (Samba, NFS, iSCSI, …) in the nexus summary.services
+    # shape → the Services matrix picks them up with no per-platform SPA code
+    # (sparkdash/dnsmaq precedent). Collectors that don't report services just
+    # don't get a summary block.
+    if metrics.get('services'):
+        out['summary'] = {'services': metrics['services']}
     out['nas'] = {
         'kind': node.get('host_type'),
         'hostname': metrics.get('hostname'),

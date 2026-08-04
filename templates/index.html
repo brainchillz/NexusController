@@ -528,15 +528,16 @@ function fmtForecast(fc){
 
 function renderRollup(){
   const r = fleet.rollup;
-  let html = pill('Nodes', r.total, '', "goOverview('')")
-    + pill('Healthy', r.healthy, 'ok', "goOverview('')")
+  let html = pill('Nodes', r.total, '', "goOverview('')", 'show all hosts')
+    + pill('Healthy', r.healthy, 'ok', "goOverview('ok')", 'show only reachable hosts')
     + pill('Unreachable', r.unreachable, r.unreachable?'bad':'', "goOverview('bad')",
            'show only unreachable hosts')
     + pill('Degraded', r.degraded||0, r.degraded?'warn':'', "setTab('alerts')")
     + pill('Alerts', r.alerts, r.alerts?'warn':'', "setTab('alerts')");
-  if (r.disabled) html += pill('Paused', r.disabled, '', "goOverview('')",
-                               'hosts with monitoring disabled');
-  if (r.vms) html += pill('VMs', r.vms + (r.containers ? ' ('+r.containers+' CT)' : ''), '', "goOverview('')");
+  if (r.disabled) html += pill('Paused', r.disabled, '', "goOverview('paused')",
+                               'show only paused hosts (monitoring disabled)');
+  if (r.vms) html += pill('VMs', r.vms + (r.containers ? ' ('+r.containers+' CT)' : ''), '',
+                          "goOverview('guests')", 'show only hosts running VMs / containers');
   if (r.storage_size) html += pill('Storage', hbytes(r.storage_used)+' / '+hbytes(r.storage_size), '', "setTab('storage')");
   document.getElementById('rollup').innerHTML = html;
 }
@@ -629,7 +630,19 @@ function matchesText(n){
   return [n.name, urlHost(n.base_url), n.version, n.host_type, (n.tags||[]).join(' ')]
     .join(' ').toLowerCase().indexOf(q) >= 0;
 }
-function matchesStatus(n){ return statusFilter === 'bad' ? (!n.ok && !n.disabled) : true; }
+// Rollup-pill status filters: key → [chip label, predicate]. Predicates match
+// what the pill counts (compute_rollup): Healthy = every reachable non-paused
+// host (degraded ones included), VMs = reachable hosts contributing guests.
+const STATUS_FILTERS = {
+  bad:    ['unreachable', n => !n.ok && !n.disabled],
+  ok:     ['healthy',     n => n.ok && !n.disabled],
+  paused: ['paused',      n => !!n.disabled],
+  guests: ['with VMs/CTs', n => {
+    const v = n.virt||{}, i = n.instances||{};
+    return ((v.vms||0)+(v.containers||0)+(i.total!=null?i.total:(i.vms||0)+(i.containers||0))) > 0;
+  }],
+};
+function matchesStatus(n){ const f = STATUS_FILTERS[statusFilter]; return f ? f[1](n) : true; }
 function toggleTag(t){ tagFilter.has(t) ? tagFilter.delete(t) : tagFilter.add(t); render(); }
 function clearTags(){ tagFilter.clear(); statusFilter=''; render(); }
 function tagBar(){
@@ -637,7 +650,8 @@ function tagBar(){
   const filt = '<input id="hostq" class="hostq" placeholder="filter hosts…" value="'+esc(hostFilter)
     + '" oninput="hostFilter=this.value;render()" onfocus="hostFilterFocus=true" onblur="hostFilterFocus=false">';
   const chips = tags.map(t=>'<span class="tagf'+(tagFilter.has(t)?' on':'')+'" onclick="toggleTag('+esc(JSON.stringify(t))+')">'+esc(t)+'</span>').join('');
-  const status = statusFilter ? '<span class="tagf on" onclick="statusFilter=\'\';render()" title="clear status filter">unreachable ✕</span>' : '';
+  const sf = STATUS_FILTERS[statusFilter];
+  const status = sf ? '<span class="tagf on" onclick="statusFilter=\'\';render()" title="clear status filter">'+esc(sf[0])+' ✕</span>' : '';
   const clear = (tagFilter.size || statusFilter) ? '<span class="tagf clear" onclick="clearTags()">clear ✕</span>' : '';
   return '<div class="tagbar">'+filt+(tags.length?'<span class="muted small">Tags:</span>'+chips:'')+status+clear+'</div>';
 }
@@ -1092,7 +1106,10 @@ function servicesView(){
     return bulk + '<div class="ok-txt big">✓ No service problems anywhere.</div>';
 
   let head = tr(['Node'].concat(keys.map(k=>esc(cols[k]))), 'th');
-  let rows = reach.map(n=>{
+  // Only hosts reporting at least one displayed service get a row — a host
+  // with nothing monitored here (hypervisors, agents) is pure dash noise.
+  const listed = reach.filter(n=>{ const svcs=(n.summary||{}).services||{}; return keys.some(k=>svcs[k]); });
+  let rows = listed.map(n=>{
     const svcs = (n.summary||{}).services||{};
     const cells = ['<b>'+esc(n.name)+'</b>'].concat(keys.map(k=>{
       const sv = svcs[k];

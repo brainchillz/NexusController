@@ -10,6 +10,7 @@ Calls (all reads):
   * ``MdMgmt.getList``                  mdadm arrays (state → pool health);
                                         tolerated missing (plugin/OMV version)
   * ``Smart.getList``                   disks + SMART overallstatus
+  * ``Services.getStatus``              file/access services (best-effort)
 
 `build_metrics` emits the SAME normalized dict as the TrueNAS/Synology/ZimaOS/
 Unraid collectors → `build_nas_envelope` + the whole NAS UI are reused.
@@ -95,7 +96,11 @@ def _collect(s, base):
         smart = _paged(s, base, 'Smart', 'getList')
     except OmvError:
         smart = []
-    return build_metrics(info, filesystems, raids, smart)
+    try:
+        services = _paged(s, base, 'Services', 'getStatus')
+    except OmvError:
+        services = []
+    return build_metrics(info, filesystems, raids, smart, services)
 
 
 def collect_metrics(host, username, password, port=80, scheme='http',
@@ -127,7 +132,39 @@ def _num(v):
         return 0.0
 
 
-def build_metrics(info, filesystems, raids, smart):
+# OMV service names → canonical (key, display name) matching the nexus nodes'
+# summary.services keys (columns merge in the Services matrix). Anything not
+# listed (plugin services, e.g. writecache) passes through under its own name.
+_SERVICE_KEYS = {
+    'samba': ('smb', 'Samba'),
+    'nfs': ('nfs', 'NFS Server'),
+    'rsyncd': ('rsync', 'Rsync'),
+    'ftp': ('ftp', 'FTP'),
+    'ssh': ('ssh', 'SSH'),
+}
+
+
+def map_services(services):
+    """Services.getStatus rows ({name, title, enabled, running}) → the
+    nexus-style summary.services dict. Enabled-or-running only (see
+    collectors/truenas.map_services); enabled-but-stopped shows as down."""
+    out = {}
+    for s in services or []:
+        name = s.get('name') or ''
+        if not name:
+            continue
+        enabled = bool(s.get('enabled'))
+        running = bool(s.get('running'))
+        if not (enabled or running):
+            continue
+        key, label = _SERVICE_KEYS.get(name, (name.lower(), s.get('title') or name))
+        out[key] = {'name': label,
+                    'active': 'active' if running else 'inactive',
+                    'enabled': 'enabled' if enabled else 'disabled'}
+    return out
+
+
+def build_metrics(info, filesystems, raids, smart, services=None):
     """Pure transform: OMV RPC payloads → the normalized NAS metric dict
     (same shape as collectors/truenas.build_metrics)."""
     info = info or {}
@@ -212,4 +249,5 @@ def build_metrics(info, filesystems, raids, smart):
         'disk_count': len(smart),
         'alert_count': len(alerts),
         'alerts': alerts[:10],
+        'services': map_services(services),
     }

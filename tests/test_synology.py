@@ -73,3 +73,28 @@ def test_synology_adapter_registered():
     assert a.default_type == 'Storage' and a.polled
     d = a.descriptor()
     assert d['label'].startswith('Synology') and d['verify_tls']
+
+
+SERVICES = {'service': [
+    {'service_id': 'pkg-synosamba-smbd', 'enable_status': 'enabled'},
+    {'service_id': 'nfs-server', 'enable_status': 'disabled'},
+    {'service_id': 'pkg-iscsi', 'enable_status': 'static'},
+    {'service_id': 'ftp-ssl', 'enable_status': 'enabled'},
+    {'service_id': 'chronyd', 'enable_status': 'enabled'},   # not file/access
+]}
+
+
+def test_map_services_enabled_only():
+    svcs = synology.map_services(SERVICES)
+    # DSM has no run state — enabled implies running
+    assert svcs['smb'] == {'name': 'Samba', 'active': 'active', 'enabled': 'enabled'}
+    assert 'nfs' not in svcs      # disabled → omitted
+    assert 'iscsi' not in svcs    # 'static' (system-managed) → skipped
+    assert svcs['ftp']['name'] == 'FTP'   # ftp-ssl folds into ftp
+    assert 'chronyd' not in svcs
+
+
+def test_metrics_and_envelope_carry_services():
+    m = synology.build_metrics(INFO, UTIL, STORAGE, SERVICES)
+    assert 'smb' in m['services']
+    assert synology.build_metrics(INFO, UTIL, STORAGE)['services'] == {}

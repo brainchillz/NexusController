@@ -55,7 +55,7 @@ urllib3.disable_warnings(InsecureRequestWarning)
 app = Flask(__name__, static_url_path='')
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = '0.10.2'
+APP_VERSION = '0.11.2'
 
 
 def env_bool(name, default):
@@ -115,7 +115,11 @@ app.config.update(
 def write_json_atomic(path, data, mode=0o600):
     """Temp file + fsync + os.replace so a crash/full disk can't truncate a
     config (a corrupt controller-auth.json would lock everyone out)."""
-    tmp = f'{path}.tmp.{os.getpid()}'
+    # pid alone is NOT unique here — one worker, many threads: the monitor loop
+    # and a request-driven _build_fleet can save_nodes() concurrently, and a
+    # shared tmp name lets their writes interleave (seen live: chmod on a tmp
+    # the other thread had already os.replace()d away).
+    tmp = f'{path}.tmp.{os.getpid()}.{threading.get_ident()}'
     with open(tmp, 'w') as f:
         json.dump(data, f, indent=2)
         f.flush()

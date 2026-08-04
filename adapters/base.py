@@ -89,12 +89,13 @@ def friendly_error(err):
 
 def envelope_error(node, exc):
     """Fan-out/poll error → the condensed message for the envelope; the full
-    exception text goes to the log (that's the only place it should appear)."""
-    msg = friendly_error(exc)
-    if msg != str(exc or '').strip():
-        log.warning('%s (%s): %s', node.get('name') or node.get('id'),
-                    node.get('base_url', ''), exc)
-    return msg
+    exception text ALWAYS goes to the log. (It used to log only when
+    friendly_error condensed something — short pass-through errors like DSM's
+    'API error code 119' were invisible in docker logs, which made the
+    intermittent-Synology hunt needlessly blind.)"""
+    log.warning('%s (%s): %s', node.get('name') or node.get('id'),
+                node.get('base_url', ''), exc)
+    return friendly_error(exc)
 
 
 def _split_host_port(base_url):
