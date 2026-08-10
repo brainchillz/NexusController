@@ -28,6 +28,15 @@ top of them, not a replacement.
   view, fleet-wide service actions, **drill-in to the node's full SPA through
   the controller** (websocket consoles included), and LXD instance / Docker
   container counts with lifecycle control (see *Guest control*).
+- **Fleet patch posture** — nexus nodes running the dashboard's updates module
+  report their distro and pending updates with every poll: each card carries an
+  **OS chip** plus an amber **Updates** / red **Security** chip, the top bar
+  sums them fleet-wide (*Updates N* / *Security updates N*, click to filter),
+  and the chip opens an **Updates modal** driven through the audited
+  reverse-proxy — package list, apply-all with the node's live progress bar and
+  log, and a Reboot-now button once the node reports a reboot is required.
+  Pending **security updates fire the webhook notifier** (info severity — the
+  status dot and public board deliberately stay calm).
 - **Virtualization hosts too** — enroll **Proxmox VE, VMware vCenter, or
   standalone ESXi** hosts (username/password) right alongside Nexus nodes. Their
   row shows host count, running/total **VMs & containers**, CPU/RAM, and
@@ -459,7 +468,10 @@ AI/llama status, node-type classification, **version-skew warnings**, a
 **self-describing host-adapter package** (Proxmox / vCenter / ESXi
 virtualization; TrueNAS / Synology / ZimaOS / Unraid / OpenMediaVault NAS;
 SparkDash DGX clusters; Linux + Windows agents), **guest lifecycle control**
-(Proxmox/VMware VMs, and LXD instances + Docker containers on nodes), **push
+(Proxmox/VMware VMs, and LXD instances + Docker containers on nodes),
+**fleet update visibility + remote patching** (OS/updates chips, summed
+top-bar pills, proxy-driven apply with live progress, reboot-when-required,
+security-update webhooks), **push
 notifications** (webhooks, debounced state transitions), **user management**
 with **tag-scoped RBAC**, **history + capacity forecasting** (sparklines,
 days-to-full), **certificate review / re-pin**, tag filtering, TLS certificate
