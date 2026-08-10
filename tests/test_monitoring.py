@@ -154,3 +154,18 @@ def test_board_state_memory_exemptions():
 def test_board_state_warmup_is_amber_not_red():
     s, issues = monitoring.board_state({'ok': False, 'error': 'awaiting first poll'})
     assert s == 'amber' and issues == ['awaiting first poll']
+
+
+def test_security_updates_condition_is_info_only():
+    # Security updates fire the notifier (a condition exists) but must not
+    # touch the status dot or the public board — info severity, like
+    # version_lag. Plain pending updates fire nothing at all.
+    env = {'ok': True, 'summary': {'updates': {'available': 9, 'security': 3}}}
+    conds = monitoring.host_conditions(env)
+    assert conds['security_updates']['severity'] == 'info'
+    assert '3 security' in conds['security_updates']['detail']
+    assert monitoring.health_entries(env) == []          # dot stays green
+    env['health'] = monitoring.health_entries(env)
+    assert monitoring.board_state(env)[0] == 'green'     # board stays green
+    plain = {'ok': True, 'summary': {'updates': {'available': 9, 'security': 0}}}
+    assert 'security_updates' not in monitoring.host_conditions(plain)

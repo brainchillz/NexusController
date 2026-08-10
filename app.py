@@ -55,7 +55,7 @@ urllib3.disable_warnings(InsecureRequestWarning)
 app = Flask(__name__, static_url_path='')
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = '0.11.3'
+APP_VERSION = '0.12.0'
 
 
 def env_bool(name, default):
@@ -1039,6 +1039,7 @@ def compute_rollup(results):
     healthy = unreachable = alerts = degraded = svc_down = disabled = 0
     used = size = 0
     vms = containers = 0
+    upd_hosts = sec_hosts = upd_total = sec_total = 0
     for r in results:
         if r.get('disabled'):
             disabled += 1        # paused on purpose — neither healthy nor down
@@ -1063,6 +1064,13 @@ def compute_rollup(results):
         i = r.get('instances') or {}     # nexus nodes running LXD (v2 Containers)
         vms += (i.get('vms') or 0) + (i.get('containers') or 0)
         containers += i.get('containers') or 0
+        u = s.get('updates') or {}   # nexus updates-module summary block
+        if u.get('available'):
+            upd_hosts += 1
+            upd_total += u.get('available') or 0
+            if u.get('security'):
+                sec_hosts += 1
+                sec_total += u.get('security') or 0
         ck_bad = any(c.get('ok') is False for c in r.get('svc_checks') or [])
         if n_alerts or down or zfs_bad or nas.get('pools_degraded') or r.get('stale') or ck_bad:
             degraded += 1
@@ -1070,7 +1078,9 @@ def compute_rollup(results):
             'disabled': disabled,
             'alerts': alerts, 'degraded': degraded, 'services_down': svc_down,
             'storage_used': used, 'storage_size': size,
-            'vms': vms, 'containers': containers}
+            'vms': vms, 'containers': containers,
+            'updates_hosts': upd_hosts, 'security_hosts': sec_hosts,
+            'updates_pending': upd_total, 'security_pending': sec_total}
 
 
 def _version_tuple(v):
@@ -1658,7 +1668,8 @@ _COND_LABEL = {'unreachable': 'reachable again', 'cert_changed': 'certificate re
                'alerts': 'alerts cleared', 'pool_degraded': 'pools healthy',
                'cluster_unhealthy': 'cluster healthy', 'services_down': 'services back up',
                'check_failed': 'service checks passing',
-               'stale': 'polling again', 'version_lag': 'version in sync'}
+               'stale': 'polling again', 'version_lag': 'version in sync',
+               'security_updates': 'security updates cleared'}
 
 
 # ─── History store (lazy: importing app must not create a stray DB) ───

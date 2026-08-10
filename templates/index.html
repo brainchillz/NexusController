@@ -303,6 +303,15 @@
     </div>
   </div>
 
+  <div id="updatesModal" class="modal" style="display:none">
+    <div class="modal-card wide">
+      <div class="row"><h2 style="margin:0;flex:1">Updates · <span id="up-node"></span></h2>
+        <button class="x" onclick="closeUpdates()">×</button></div>
+      <div id="up-msg" class="small" style="min-height:18px"></div>
+      <div id="up-body" style="max-height:60vh;overflow:auto"></div>
+    </div>
+  </div>
+
   <!-- Host detail dialog -->
   <div id="detailModal" class="modal" style="display:none">
     <div class="modal-card wide" style="width:760px">
@@ -394,7 +403,7 @@ function uiAlert(title, body){
 }
 
 // ── Esc closes the topmost open modal ──
-const MODAL_ORDER = ['dlgModal','detailModal','guestsModal','repinModal',
+const MODAL_ORDER = ['dlgModal','detailModal','updatesModal','guestsModal','repinModal',
                      'svcModal','editModal','addModal','checkModal'];
 document.addEventListener('keydown', e=>{
   if(e.key !== 'Escape') return;
@@ -402,7 +411,7 @@ document.addEventListener('keydown', e=>{
     const el = document.getElementById(id);
     if(el && el.style.display !== 'none'){
       ({dlgModal: ()=>dlgResolve(null), detailModal: closeDetail,
-        guestsModal: closeGuests, repinModal: closeRepin,
+        guestsModal: closeGuests, updatesModal: closeUpdates, repinModal: closeRepin,
         svcModal: closeSvc,
         editModal: closeEdit, addModal: closeAdd, checkModal: closeCheck})[id]();
       return;
@@ -534,6 +543,10 @@ function renderRollup(){
            'show only unreachable hosts')
     + pill('Degraded', r.degraded||0, r.degraded?'warn':'', "setTab('alerts')")
     + pill('Alerts', r.alerts, r.alerts?'warn':'', "setTab('alerts')");
+  if (r.updates_pending) html += pill('Updates', r.updates_pending, 'warn', "goOverview('updates')",
+    r.updates_pending+' package update(s) pending across '+r.updates_hosts+' host(s) — click to show them');
+  if (r.security_pending) html += pill('Security updates', r.security_pending, 'bad', "goOverview('security')",
+    r.security_pending+' SECURITY update(s) pending across '+r.security_hosts+' host(s) — click to show them');
   if (r.disabled) html += pill('Paused', r.disabled, '', "goOverview('paused')",
                                'show only paused hosts (monitoring disabled)');
   if (r.vms) html += pill('VMs', r.vms + (r.containers ? ' ('+r.containers+' CT)' : ''), '',
@@ -641,6 +654,8 @@ const STATUS_FILTERS = {
     const v = n.virt||{}, i = n.instances||{};
     return ((v.vms||0)+(v.containers||0)+(i.total!=null?i.total:(i.vms||0)+(i.containers||0))) > 0;
   }],
+  updates:  ['pending updates',  n => ((((n.summary||{}).updates)||{}).available||0) > 0],
+  security: ['security updates', n => ((((n.summary||{}).updates)||{}).security||0) > 0],
 };
 function matchesStatus(n){ const f = STATUS_FILTERS[statusFilter]; return f ? f[1](n) : true; }
 function toggleTag(t){ tagFilter.has(t) ? tagFilter.delete(t) : tagFilter.add(t); render(); }
@@ -677,6 +692,8 @@ function overviewView(){
   return html;
 }
 function urlHost(u){ try{ return new URL(u).hostname; }catch(e){ return (u||'').replace(/^[a-z]+:\/\//,'').split(/[:\/]/)[0]; } }
+function updChip(id,k,v,cls,title){ return '<span class="ck click '+cls+'" title="'+esc(title)
+  + '" onclick="openUpdates(\''+esc(id)+'\')">'+esc(k)+' <b>'+esc(v)+'</b></span>'; }
 function chip(k,v,cls,title){ return '<span class="ck '+(cls||'')+'"'+(title?' title="'+esc(title)+'"':'')+'>'+esc(k)+' <b>'+esc(v)+'</b></span>'; }
 function miniMeter(label,pct){ pct=Math.max(0,Math.min(100,Math.round(pct)));
   const cls = pct>=90?'bad':pct>=75?'warn':'ok';
@@ -771,7 +788,12 @@ function nodeRow(n){
       if(x.dhcp_enabled) chips.push(chip('DHCP', (x.active_leases!=null?x.active_leases:0)+' lease'+(x.active_leases===1?'':'s')));
       if(x.dnsmasq_version) chips.push(chip('dnsmasq','v'+x.dnsmasq_version));
     } else {
-      const zfs=s.zfs||{}, disks=s.disks||{};
+      const zfs=s.zfs||{}, disks=s.disks||{}, sys=s.system||{}, upd=s.updates||{};
+      if(sys.os) chips.push(chip('OS', sys.os.length>24?sys.os.slice(0,23)+'\u2026':sys.os, '', sys.os));
+      if(upd.security>0) chips.push(updChip(n.id,'Security',upd.security+'/'+(upd.available||0),'bad',
+        upd.security+' SECURITY update(s) among '+(upd.available||0)+' pending \u2014 click to review / apply'));
+      else if(upd.available>0) chips.push(updChip(n.id,'Updates',upd.available,'warnc',
+        upd.available+' package update(s) pending \u2014 click to review / apply'));
       if(zfs.pools) chips.push(chip('ZFS', zfs.pools+' pool'+(zfs.pools>1?'s':'')+(zfs.online===false?' ⚠':''), zfs.online===false?'bad':''));
       if(has(n,'disks') && disks.total!=null) chips.push(chip('Disks', disks.free+'/'+disks.total, disks.smart_ok===false?'bad':''));
       if(has(n,'smb') && s.smb) chips.push(chip('SMB', s.smb.shares));
@@ -1501,6 +1523,117 @@ function openGuests(id){
   show('guestsModal', true);
 }
 function closeGuests(){ show('guestsModal', false); guestsNode = null; }
+
+// ── Updates modal: the node's package updates through the reverse-proxy
+//    (guests-modal pattern — zero controller routes; the node's own RBAC
+//    gates writes, the proxy audits them). Applying streams progress: the
+//    node reports an `apply` block we poll every 2.5s while it runs. ──
+let updatesNode = null, updTimer = null;
+function openUpdates(id){
+  updatesNode = id;
+  const n = nodeById(id);
+  document.getElementById('up-node').textContent = n ? n.name : '';
+  document.getElementById('up-msg').textContent = '';
+  document.getElementById('up-body').innerHTML = '<div class="muted">Loading…</div>';
+  show('updatesModal', true);
+  renderUpdates();
+}
+function closeUpdates(){
+  show('updatesModal', false); updatesNode = null;
+  if(updTimer){ clearTimeout(updTimer); updTimer = null; }
+}
+function updAgo(ts){
+  if(!ts) return 'never';
+  const m = Math.max(0, Math.round((Date.now()/1000 - ts)/60));
+  return m < 1 ? 'just now' : m < 60 ? m+' min ago' : Math.floor(m/60)+'h '+(m%60)+'m ago';
+}
+async function renderUpdates(){
+  if(!updatesNode) return;
+  const n = nodeById(updatesNode);
+  if(!n){ closeUpdates(); return; }
+  const body = document.getElementById('up-body');
+  let u;
+  try{ u = await API.get('nodes/'+n.id+'/proxy/updates'); }
+  catch(e){ body.innerHTML = '<div class="bad small">'+esc(e.message)+'</div>'; return; }
+  if(!updatesNode) return;   // closed while loading
+  const ap = u.apply||{}, wr = canWrite(n);
+
+  if(ap.running){
+    const pct = ap.total ? Math.min(100, Math.round(ap.done/ap.total*100)) : 0;
+    body.innerHTML =
+      '<div class="small"><b>Applying updates…</b> '
+      + (ap.total ? 'step '+ap.done+' of '+ap.total+' — '+pct+'%' : 'waiting for package manager output')
+      + '</div>'
+      + (ap.total ? '<span class="mm-bar" style="display:block;height:6px;margin:8px 0"><i class="ok" style="width:'+pct+'%"></i></span>' : '')
+      + '<pre class="upd-log">'+esc((ap.log||[]).slice(-100).join('\n'))+'</pre>';
+    const lg = body.querySelector('.upd-log'); if(lg) lg.scrollTop = lg.scrollHeight;
+    updTimer = setTimeout(renderUpdates, 2500);
+    return;
+  }
+
+  let head = '';
+  if(ap.finished && ap.rc === 0) head += '<div class="ok-txt small">✓ Updates applied '+updAgo(ap.finished)+'</div>';
+  else if(ap.finished && ap.rc != null && ap.rc !== 0)
+    head += '<div class="bad small">Apply failed (exit '+esc(String(ap.rc))+', '+updAgo(ap.finished)+') — see the node\'s Updates page for the log.</div>';
+  if(ap.reboot_required)
+    head += '<div class="small" style="color:var(--warn);margin:4px 0"><b>Reboot required</b> to finish applying updates. '
+      + (wr ? '<button class="btn-open" onclick="updReboot()">Reboot now</button>' : '')+'</div>';
+  const avN = u.available||0, secN = u.security||0;
+  head += avN
+    ? '<div class="small" style="margin:4px 0"><b>'+avN+'</b> update'+(avN>1?'s':'')+' pending'
+      + (secN ? ' — <span class="bad"><b>'+secN+'</b> security</span>' : '')
+      + ' · '+esc(u.manager||'')+' · checked '+updAgo(u.checked)+'</div>'
+    : (u.error
+        ? '<div class="bad small">Update check failed: '+esc(u.error)+'</div>'
+        : '<div class="ok-txt small">✓ Up to date · checked '+updAgo(u.checked)+'</div>');
+
+  let btns = '';
+  if(wr){
+    btns += '<button class="btn-open" onclick="updCheck()">Check now</button> ';
+    if(avN && u.apply_available) btns += '<button class="btn-open" onclick="updApply('+avN+','+secN+')">Apply all updates</button>';
+    else if(avN) btns += '<span class="muted small">apply helper not installed on the node (installer --helpers-only)</span>';
+  }
+
+  const rows = (u.packages||[]).map(p =>
+    '<tr><td><b>'+esc(p.name)+'</b></td>'
+    + '<td class="muted small">'+esc(p.current||'—')+'</td>'
+    + '<td class="small">'+esc(p.candidate||'')+'</td>'
+    + '<td class="muted small">'+esc(p.origin||'')+'</td>'
+    + '<td>'+(p.security?'<span class="bad small">security</span> ':'')
+    + (p.reboot_likely?'<span class="small" style="color:var(--warn)">reboot-likely</span>':'')+'</td></tr>');
+  const tbl = rows.length
+    ? '<table class="tbl"><thead><tr><th>Package</th><th>Installed</th><th>Available</th><th>Source</th><th></th></tr></thead>'
+      + '<tbody>'+rows.join('')+'</tbody></table>' : '';
+
+  body.innerHTML = head + (btns?'<div style="margin:6px 0">'+btns+'</div>':'') + tbl;
+}
+async function updCheck(){
+  const msg = document.getElementById('up-msg');
+  try{
+    await API.post('nodes/'+updatesNode+'/proxy/updates/check');
+    msg.textContent = 'Re-checking…';
+    updTimer = setTimeout(async ()=>{ msg.textContent=''; renderUpdates(); }, 4000);
+  }catch(e){ msg.innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
+}
+async function updApply(avail, sec){
+  const n = nodeById(updatesNode); if(!n) return;
+  if(!(await uiConfirm('Apply all updates', 'Upgrade '+avail+' package'+(avail>1?'s':'')
+      + (sec?' (including '+sec+' security)':'')+' on "'+n.name+'"? The package manager may restart services; '
+      + 'a reboot may be required afterwards — you\'ll be told here.', {okLabel:'Apply', danger:true}))) return;
+  try{ await API.post('nodes/'+updatesNode+'/proxy/updates/apply'); renderUpdates(); }
+  catch(e){ document.getElementById('up-msg').innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
+}
+async function updReboot(){
+  const n = nodeById(updatesNode); if(!n) return;
+  if(!(await uiConfirm('Reboot host', 'Reboot "'+n.name+'" now to finish applying updates? '
+      + 'Active I/O and running guests are interrupted; the row goes red until the node returns.',
+      {okLabel:'Reboot', danger:true}))) return;
+  try{
+    await API.post('nodes/'+updatesNode+'/proxy/system/reboot');
+    document.getElementById('up-msg').innerHTML =
+      '<span class="ok-txt">Reboot sent ✓</span> <span class="muted">— the row shows red until the node is back (1–3 min).</span>';
+  }catch(e){ document.getElementById('up-msg').innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
+}
 function renderGuests(){
   const n = nodeById(guestsNode);
   if(!n || !n.virt){ closeGuests(); return; }
@@ -1875,6 +2008,7 @@ async function openDetail(id){
     + kv('Host type', esc(n.host_type||'nexus'))
     + kv('URL', '<a href="'+esc(n.base_url)+'" target="_blank" rel="noopener">'+esc(n.base_url)+'</a>')
     + kv('Version', esc(n.version||'—'))
+    + kv('OS', esc((((n.summary||{}).system)||{}).os||''))
     + kv('Token role', esc(n.token_role||reg.role||'—'))
     + kv('Tags', (n.tags||[]).length ? esc(n.tags.join(', ')) : '')
     + kv('Capabilities', (reg.capabilities||[]).length ? '<span class="small">'+esc(reg.capabilities.join(', '))+'</span>' : '')

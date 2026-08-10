@@ -62,6 +62,15 @@ def host_conditions(env):
     if env.get('version_lag'):
         conds['version_lag'] = {'severity': 'info',
                                 'detail': f"behind fleet (newest v{env['version_lag']})"}
+    # Pending SECURITY updates (nexus updates-module summary block): worth a
+    # webhook, deliberately NOT a warning — info severity keeps the status dot
+    # and the public board untouched (version_lag precedent). Plain pending
+    # updates fire nothing.
+    upd = summary.get('updates') or {}
+    if upd.get('security'):
+        conds['security_updates'] = {
+            'severity': 'info',
+            'detail': f"{upd['security']} security update(s) pending"}
     return conds
 
 

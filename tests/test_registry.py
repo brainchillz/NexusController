@@ -117,6 +117,22 @@ def test_compute_rollup_unreachable_and_degraded():
     assert r['degraded'] == 1  # the offline-pool node
 
 
+def test_compute_rollup_update_counts():
+    # nexus updates-module summary block: hosts with pending updates counted,
+    # security-update hosts counted separately (a security host counts in both)
+    plain, sec, none = _node(), _node(), _node()
+    plain['summary']['updates'] = {'available': 4, 'security': 0}
+    sec['summary']['updates'] = {'available': 9, 'security': 3}
+    r = app.compute_rollup([plain, sec, none])
+    assert r['updates_hosts'] == 2
+    assert r['security_hosts'] == 1
+    # summed counts drive the top pills ("Security updates 132")
+    assert r['updates_pending'] == 13
+    assert r['security_pending'] == 3
+    # hosts without the module / block contribute nothing
+    assert app.compute_rollup([none])['updates_hosts'] == 0
+
+
 def test_services_down_ignores_disabled():
     svcs = {'a': {'enabled': 'enabled', 'active': 'active'},
             'b': {'enabled': 'enabled', 'active': 'inactive'},   # down
