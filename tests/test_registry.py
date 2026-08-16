@@ -161,6 +161,49 @@ def test_render_drillin_handles_missing_head():
     assert '/api/nodes/n1/proxy/' in out
 
 
+# ── plugin asset retargeting (3.0.0+ out-of-tree plugins) ────────────
+# The node's SPA injects plugin JS as <script src=...> at RUNTIME, so the URL
+# never appears in the HTML and render_drillin_html cannot reach it. Without
+# this rewrite the script 404s on the controller and the plugin's page reads
+# "page not found" through drill-in while working fine direct.
+def test_retarget_asset_urls_rewrites_plugin_assets():
+    man = {'modules': [
+        {'id': 'drive-bays', 'assets': {'js': ['/plugin-assets/drive-bays/plugin.js?v=1.0'],
+                                        'css': ['/plugin-assets/drive-bays/p.css']}},
+        {'id': 'zfs'},                                   # builtin: no assets key
+        {'id': 'other', 'assets': {'js': ['/static/js/x.js']}},   # not a plugin asset
+    ]}
+    out = app.retarget_asset_urls(man, 'abc123')
+    assert out['modules'][0]['assets']['js'] == \
+        ['/nodes/abc123/plugin-assets/drive-bays/plugin.js?v=1.0']
+    assert out['modules'][0]['assets']['css'] == \
+        ['/nodes/abc123/plugin-assets/drive-bays/p.css']
+    # a builtin without assets, and a non-plugin path, are both left alone
+    assert 'assets' not in out['modules'][1]
+    assert out['modules'][2]['assets']['js'] == ['/static/js/x.js']
+
+
+def test_retarget_asset_urls_tolerates_odd_shapes():
+    # Anything that is not the manifest shape passes through untouched rather
+    # than raising — the proxy must never 500 on an unexpected node response.
+    assert app.retarget_asset_urls([], 'n1') == []
+    assert app.retarget_asset_urls({'modules': None}, 'n1') == {'modules': None}
+    assert app.retarget_asset_urls({'modules': [None]}, 'n1') == {'modules': [None]}
+    assert app.retarget_asset_urls(
+        {'modules': [{'assets': 'nope'}]}, 'n1') == {'modules': [{'assets': 'nope'}]}
+    assert app.retarget_asset_urls(
+        {'modules': [{'assets': {'js': 'nope'}}]}, 'n1') == {'modules': [{'assets': {'js': 'nope'}}]}
+
+
+def test_retarget_asset_urls_is_idempotent_per_call():
+    # Already-retargeted URLs do not start with /plugin-assets/, so a second
+    # pass is a no-op (matters if a response is ever proxied twice).
+    man = {'modules': [{'assets': {'js': ['/plugin-assets/p/a.js']}}]}
+    once = app.retarget_asset_urls(man, 'n1')
+    twice = app.retarget_asset_urls(once, 'n1')
+    assert twice['modules'][0]['assets']['js'] == ['/nodes/n1/plugin-assets/p/a.js']
+
+
 # ── TLS certificate validation/install (cryptography, no openssl) ────
 def _make_cert_key(cn='test'):
     from cryptography import x509

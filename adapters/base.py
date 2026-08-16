@@ -173,11 +173,17 @@ class NodeClient:
             raise NodeError(f'HTTP {r.status_code}')
         return r.json()
 
-    def raw_get(self, path):
+    def raw_get(self, path, auth=False):
         """GET an arbitrary (non-/api) path on the node — drill-in HTML/assets.
-        Unauthenticated but still pinned."""
+        Pinned. Unauthenticated by default: the node serves / and /static/
+        without a session. Pass auth=True for paths the node DOES gate —
+        /plugin-assets/ is one (a plugin's JS injects post-login, so the node
+        requires a session or bearer there)."""
+        headers = {}
+        if auth and self.token:
+            headers['Authorization'] = f'Bearer {self.token}'
         return pinned_request('GET', self.base_url + path, self.cert_fp,
-                              timeout=NODE_TIMEOUT)
+                              headers=headers, timeout=NODE_TIMEOUT)
 
 
 def base_envelope(node):

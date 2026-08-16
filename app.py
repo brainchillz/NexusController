@@ -1990,6 +1990,55 @@ def node_static(node_id, subpath):
                     content_type=r.headers.get('Content-Type', 'application/octet-stream'))
 
 
+@app.route('/nodes/<node_id>/plugin-assets/<path:subpath>')
+def node_plugin_asset(node_id, subpath):
+    """Proxy an out-of-tree plugin's static assets (3.0.0+ plugin system).
+
+    Separate from node_static because the node AUTH-GATES /plugin-assets/
+    (a plugin's JS injects post-login) while /static/ is public — so this one
+    must carry the enrolled bearer token. Without this route a Python-tier
+    plugin's page exists in the node's nav but its JS 404s through drill-in,
+    so window['page_<id>'] is never defined and the page reads "not found"."""
+    node = _find_node(node_id)
+    if not node:
+        return err('node not found', 404)
+    qs = request.query_string.decode()
+    path = '/plugin-assets/' + subpath + ('?' + qs if qs else '')
+    try:
+        r = NodeClient(node).raw_get(path, auth=True)
+    except NodeError as e:
+        return err(str(e), 502)
+    return Response(r.content, status=r.status_code,
+                    content_type=r.headers.get('Content-Type', 'application/octet-stream'))
+
+
+def retarget_asset_urls(payload, node_id):
+    """Rewrite plugin asset URLs in a node's /api/modules/nav manifest so they
+    resolve through this controller instead of the controller's own root.
+
+    The node emits absolute same-origin paths ('/plugin-assets/x/p.js'), and
+    the SPA injects them as <script src=...> at runtime — they never appear in
+    the HTML, so render_drillin_html cannot rewrite them. This is the same
+    retargeting, applied at the one endpoint that carries them. Mutates and
+    returns payload; a non-manifest shape passes through untouched. Pure →
+    unit-tested."""
+    if not isinstance(payload, dict):
+        return payload
+    base = '/nodes/%s' % node_id
+    for mod in payload.get('modules') or []:
+        assets = (mod or {}).get('assets')
+        if not isinstance(assets, dict):
+            continue
+        for kind in ('js', 'css'):
+            urls = assets.get(kind)
+            if not isinstance(urls, list):
+                continue
+            assets[kind] = [base + u if isinstance(u, str)
+                            and u.startswith('/plugin-assets/') else u
+                            for u in urls]
+    return payload
+
+
 @app.route('/api/nodes/<node_id>/proxy/<path:subpath>',
            methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH'])
 def node_proxy(node_id, subpath):
@@ -2014,6 +2063,16 @@ def node_proxy(node_id, subpath):
     except NodeError as e:
         return err('proxy to node failed: %s' % e, 502)
     out = [(k, v) for k, v in resp.headers.items() if k.lower() not in _HOP_HEADERS]
+    # The UI manifest is the ONLY response carrying plugin asset URLs, and they
+    # must be retargeted at this controller (see retarget_asset_urls). Any
+    # failure here degrades to passing the body through unchanged.
+    if (request.method == 'GET' and subpath.split('?')[0] == 'modules/nav'
+            and resp.status_code == 200):
+        try:
+            body = retarget_asset_urls(resp.json(), node_id)
+            return jsonify(body), resp.status_code
+        except Exception:                                  # noqa: BLE001
+            pass
     return Response(resp.content, status=resp.status_code, headers=out)
 
 
