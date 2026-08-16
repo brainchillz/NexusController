@@ -226,3 +226,53 @@ main{padding:20px;max-width:1200px;margin:0 auto}
   stroke: currentColor; stroke-width: 2; stroke-linecap: round;
   stroke-linejoin: round; fill: none; }
 .ico-sm { width: 13px; height: 13px; vertical-align: -2px; }
+
+/* ─── Single sign-on (only shown when this controller is enrolled) ───── */
+.sso-sep { display:flex; align-items:center; gap:10px; opacity:.6;
+  font-size:11px; text-transform:uppercase; letter-spacing:.08em; margin-bottom:10px; }
+.sso-sep::before, .sso-sep::after { content:''; flex:1; border-top:1px solid var(--line); }
+#sso-btn { width:100%; background:transparent; color:var(--text);
+  border:1px solid var(--line); }
+#sso-btn:hover { border-color:var(--accent); color:var(--accent); }
+
+/* ─── Network row (unifi host type) ───────────────────────────────────
+   A network has no CPU/memory/storage, so it gets stat boxes instead of the
+   usual resource bars. Same row chrome as .hrow so the block sits flush with
+   the host groups below it. */
+/* One full-width bar, above and separate from the host groups / board boxes.
+   The extra bottom margin is the separation — it should not read as the first
+   item of the list beneath it. */
+.netbar{background:var(--panel);border:1px solid var(--line-strong);border-radius:2px;
+  padding:9px 12px;margin:0 0 18px;display:flex;flex-direction:column;gap:8px}
+.netbar-h{display:flex;align-items:center;gap:8px;font-weight:600;font-size:13px}
+.netbar-h a{color:var(--text);text-decoration:none}
+.netbar-h a:hover{color:var(--accent)}
+.netbar .small{font-weight:400}
+.nboxes{display:flex;gap:1px;width:100%;flex-wrap:wrap;background:var(--line);
+  border:1px solid var(--line);border-radius:2px;overflow:hidden}
+.nbox{flex:1 1 120px;min-width:120px;background:var(--panel);padding:6px 10px;
+  display:flex;flex-direction:column;gap:1px;justify-content:center}
+/* Throughput carries two stacked rates, so it needs more width than a box
+   holding a two-digit client count — otherwise the arrows crowd the figures
+   while the short boxes sit half empty. */
+.nbox-thru{flex:1.6 1 165px;min-width:165px}
+.nbox-r{display:flex;align-items:baseline;gap:7px;font-family:var(--mono);
+  font-size:13px;font-variant-numeric:tabular-nums;line-height:1.35}
+.nbox-r .ar{color:var(--muted);font-size:11px;width:9px;flex:none;text-align:center}
+.nbox-r .nv{white-space:nowrap}
+.nbox-l{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted)}
+.nbox-v{font-family:var(--mono);font-size:14px;font-variant-numeric:tabular-nums;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.nbox-s{font-size:10.5px;color:var(--muted);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.nbox .u{font-size:10.5px;color:var(--muted)}
+.nbox.ok .nbox-r .nv{color:var(--ok)}
+.nbox.warn .nbox-r .nv{color:var(--warn)}
+.nbox.bad .nbox-r .nv{color:var(--bad)}
+/* Semantic state on the value only — the box itself stays neutral so a row of
+   them does not read as a wall of colour. */
+.nbox.ok   .nbox-v{color:var(--ok)}
+.nbox.warn .nbox-v{color:var(--warn)}
+.nbox.bad  .nbox-v{color:var(--bad)}
+/* The issues box is the one you hover, so hint that it holds more. */
+.nbox[title]{cursor:help}

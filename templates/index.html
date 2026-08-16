@@ -26,6 +26,10 @@
       <input id="lg-pass" type="password" placeholder="Password" autocomplete="current-password">
       <button type="submit">Sign in</button>
       <div id="lg-err" class="err"></div>
+      <div id="sso-block" style="display:none;margin-top:14px">
+        <div class="sso-sep"><span>or</span></div>
+        <button type="button" id="sso-btn" onclick="ssoSignIn()">Sign in with Nexus SSO</button>
+      </div>
       <div class="small" style="margin-top:12px;text-align:center">
         <span class="hlink muted" onclick="show('login',false);showPublic()">← status board</span>
       </div>
@@ -433,9 +437,33 @@ async function loadHostTypes(){
   }catch(e){ /* modal falls back to nexus-only defaults */ }
 }
 
+// Set from /api/me when this controller is enrolled with an issuer; null
+// otherwise. Additive — the password form is always present, so an issuer
+// outage never locks the controller out of its own UI.
+let ssoConfig = null;
+function ssoSignIn(){
+  const next = location.pathname + location.search + location.hash;
+  location.href = ssoConfig.issuer + '/sso/authorize?aud='
+    + encodeURIComponent(ssoConfig.audience) + '&next=' + encodeURIComponent(next);
+}
+async function ssoProbe(){
+  // /api/me is public and answers 401 with the hint when enrolled.
+  try {
+    const r = await fetch('/api/me');
+    const j = await r.json().catch(()=>({}));
+    ssoConfig = j.sso || null;
+  } catch(e){ ssoConfig = null; }
+  const blk = document.getElementById('sso-block');
+  if (blk) blk.style.display = ssoConfig ? '' : 'none';
+  if (ssoConfig && new URLSearchParams(location.search).has('sso_error')) {
+    document.getElementById('lg-err').textContent =
+      'Single sign-on did not complete. Sign in below.';
+  }
+}
+
 async function boot(){
   try { me = await API.get('me'); }
-  catch(e){ showPublic(); return; }   // unauthenticated → public status board
+  catch(e){ ssoProbe(); showPublic(); return; }   // unauthenticated → public status board
   showApp();
   loadHostTypes();
   document.getElementById('whoami').textContent = me.user + ' · ' + me.role
@@ -595,8 +623,8 @@ function caps(n){ return n.capabilities || []; }
 function has(n,c){ return caps(n).indexOf(c) >= 0; }
 
 // ── Overview: hosts grouped by category into compact horizontal rows ──
-const CAT_ORDER = ['Storage','Virtualization','AI','General'];
-const BUILTIN_TYPES = ['Storage','AI','Mixed','Virtualization','Unknown'];
+const CAT_ORDER = ['Network','Storage','Virtualization','AI','General'];
+const BUILTIN_TYPES = ['Network','Storage','AI','Mixed','Virtualization','Unknown'];
 function category(n){
   if(n.disabled) return 'Paused';   // paused hosts gather in one bottom group
   const t = n.type;
@@ -674,9 +702,15 @@ function tagBar(){
 function nodeRank(n){ return n.disabled ? 3 : !n.ok ? 0 : ((n.health && n.health.length) ? 1 : 2); }
 function overviewView(){
   const groups={};
-  fleet.nodes.filter(n=>matchesTags(n)&&matchesText(n)&&matchesStatus(n))
+  const visible = fleet.nodes.filter(n=>matchesTags(n)&&matchesText(n)&&matchesStatus(n));
+  // The network is not one host among many — it is the thing every other host
+  // sits behind. It gets a single full-width bar above the groups rather than
+  // a row inside one.
+  const nets = visible.filter(n=>n.host_type==='unifi');
+  visible.filter(n=>n.host_type!=='unifi')
     .forEach(n=>{ const c=category(n); (groups[c]=groups[c]||[]).push(n); });
-  let html=tagBar();
+  let html = nets.map(networkRow).join('');
+  html += tagBar();
   let any=false;
   // Custom categories slot between the built-ins and the General catch-all;
   // the Paused group (disabled hosts) is pinned to the very bottom.
@@ -701,6 +735,81 @@ function miniMeter(label,pct){ pct=Math.max(0,Math.min(100,Math.round(pct)));
     + '<span class="mm-bar"><i class="'+cls+'" style="width:'+pct+'%"></i></span>'
     + '<span class="mm-v">'+pct+'%</span></span>';
 }
+
+// ── Network row (host_type 'unifi') ──
+// A network has no CPU/memory/storage, so the usual bars would all be empty.
+// It gets stat boxes instead: WAN and LAN throughput, clients, internet
+// latency, and issues — the last carrying the actual problems in its tooltip
+// so the number is never a dead end.
+function nbits(bps){
+  bps = Number(bps)||0;
+  if(bps >= 1e9) return (bps/1e9).toFixed(2)+' Gb/s';
+  if(bps >= 1e6) return (bps/1e6).toFixed(1)+' Mb/s';
+  if(bps >= 1e3) return (bps/1e3).toFixed(0)+' kb/s';
+  return bps.toFixed(0)+' b/s';
+}
+// Throughput reads as two stacked rows so the arrows never collide with the
+// figures, and the numbers line up under each other.
+function thruBox(label, rx, tx, cls, title){
+  return '<div class="nbox nbox-thru '+(cls||'')+'"'+(title?' title="'+esc(title)+'"':'')+'>'
+    + '<div class="nbox-l">'+esc(label)+'</div>'
+    + '<div class="nbox-r"><span class="ar">&#8595;</span><span class="nv">'+nbits(rx)+'</span></div>'
+    + '<div class="nbox-r"><span class="ar">&#8593;</span><span class="nv">'+nbits(tx)+'</span></div>'
+    + '</div>';
+}
+function statBox(label, value, sub, cls, title){
+  return '<div class="nbox '+(cls||'')+'"'+(title?' title="'+esc(title)+'"':'')+'>'
+    + '<div class="nbox-l">'+esc(label)+'</div>'
+    + '<div class="nbox-v">'+value+'</div>'
+    + (sub?'<div class="nbox-s">'+esc(sub)+'</div>':'')+'</div>';
+}
+function issueTooltip(net){
+  const list = net.issues||[];
+  if(!list.length) return 'No active unacknowledged issues.';
+  // Worst first (the adapter already sorted); one line each.
+  return list.map(i => '• ['+i.severity+'] '+(i.subject?i.subject+' — ':'')+i.message).join('\n')
+       + (list.length >= 12 ? '\n…more in UnifiDash' : '');
+}
+function networkRow(n){
+  const net = n.network;
+  if(!net) return nodeRow(n);           // unreachable → fall back to the normal row
+  return networkBar(n.name, net, n.ok ? null : 'red', n.base_url);
+}
+
+// One full-width bar: the network, above and separate from the host groups.
+// Shared by the signed-in overview and the public wallboard, so the two can
+// never drift apart. `url` is omitted on the wallboard, where anonymous
+// visitors get no addresses.
+function networkBar(name, net, forceState, url){
+  const crit = net.critical||0, warn = net.warning||0;
+  const issueCls = crit ? 'bad' : warn ? 'warn' : 'ok';
+  const issueVal = crit ? crit : warn ? warn : 0;
+  const issueLbl = crit ? 'Critical issues' : warn ? 'Warnings' : 'Issues';
+  const lat = net.latency_ms;
+  const latCls = lat==null ? '' : lat >= 100 ? 'bad' : lat >= 40 ? 'warn' : 'ok';
+  const wanCls = net.wan_status === 'ok' ? '' : 'warn';
+  const bad = (net.subsystems||[]).filter(x=>x.status && x.status!=='ok');
+  const dot = forceState==='red' || crit ? 'bad' : (warn ? 'warn' : 'ok');
+  const title = url
+    ? '<a href="'+esc(url)+'" target="_blank" rel="noopener">'+esc(name)+'</a>'
+    : esc(name);
+  return '<div class="netbar">'
+    + '<div class="netbar-h"><span class="dot '+dot+'"></span>'+title
+    + (net.isp?'<span class="muted small"> · '+esc(net.isp)+'</span>':'')+'</div>'
+    + '<div class="nboxes">'
+    + thruBox('WAN', net.wan_rx_bps, net.wan_tx_bps, wanCls,
+              'WAN throughput now. Status: '+net.wan_status)
+    + thruBox('LAN', net.lan_rx_bps, net.lan_tx_bps, '', 'LAN throughput now')
+    + statBox('Clients', net.clients,
+              (net.wireless||0)+' wifi · '+(net.wired||0)+' wired', '',
+              'Devices online: '+(net.devices_online||0)+' of '+(net.devices_total||0))
+    + statBox('Internet', lat==null?'—':lat+' <span class="u">ms</span>', 'latency', latCls,
+              'Round-trip latency reported by the gateway')
+    + statBox(issueLbl, issueVal, bad.length?bad.map(x=>x.name).join(', '):'none', issueCls,
+              issueTooltip(net))
+    + '</div></div>';
+}
+
 // One host as a horizontal row: status · name/ip · CPU/Mem/Store bars · type chips · actions.
 // The IP shown is the enrolled base URL's host (the address the controller actually
 // reaches) — not the host's self-reported system.ip, which can be a container IP.
@@ -876,9 +985,14 @@ function statusBoard(d){
   if(!d) return '<div class="muted">Loading status…</div>';
   if(d.warming) return '<div class="muted">Controller is warming up — first poll in progress…</div>';
   const groups = {};
-  (d.hosts||[]).forEach(h=>{ (groups[h.category]=groups[h.category]||[]).push(h); });
+  // The network bar spans the full width above the boxes; every other host
+  // stays a pill in its category.
+  const nets = (d.hosts||[]).filter(h=>h.network);
+  (d.hosts||[]).filter(h=>!h.network)
+    .forEach(h=>{ (groups[h.category]=groups[h.category]||[]).push(h); });
   const extras = Object.keys(groups).filter(c=>CAT_ORDER.indexOf(c)<0 && c!=='Paused').sort();
-  let html = '<div class="board">';
+  let html = nets.map(h=>networkBar(h.name, h.network, h.state)).join('');
+  html += '<div class="board">';
   CAT_ORDER.slice(0,-1).concat(extras,'General','Paused').forEach(c=>{
     const list = groups[c]; if(!list||!list.length) return;
     list.sort((a,b)=> (BOARD_RANK[a.state]-BOARD_RANK[b.state]) || a.name.localeCompare(b.name));

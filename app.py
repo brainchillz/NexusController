@@ -25,9 +25,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from urllib3.exceptions import InsecureRequestWarning
 import urllib3
-from flask import Flask, jsonify, request, session, send_from_directory, g, Response
+from flask import (Flask, jsonify, request, session, send_from_directory, g,
+                   Response, redirect)
 from flask_sock import Sock
 from werkzeug.security import generate_password_hash, check_password_hash
+
+import sso
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography import x509
 from cryptography.x509.oid import NameOID
@@ -291,12 +294,14 @@ def _scope_presets():
 
 
 # ─── AuthN / AuthZ ────────────────────────────────────────────────────
-PUBLIC_ENDPOINTS = {'api_login', 'api_me', 'index', 'static', 'api_status'}
+PUBLIC_ENDPOINTS = {'api_login', 'api_me', 'index', 'static', 'api_status',
+                    'sso_callback'}
 # Writes a non-admin role may still issue (sign out / change own password).
 RBAC_EXEMPT = {'api_logout', 'change_password'}
 # Endpoints that require the top (admin) role regardless of method — enrolling
 # or removing a node, and managing controller users.
-ADMIN_ONLY = {'nodes_add', 'node_delete', 'node_update', 'node_cert', 'node_repin',
+ADMIN_ONLY = {'sso_status', 'sso_enroll', 'sso_disable',
+              'nodes_add', 'node_delete', 'node_update', 'node_cert', 'node_repin',
               'checks_add', 'checks_update', 'checks_delete', 'tuning_save',
               'tls_regenerate', 'tls_upload_cert',
               'notifications_save', 'notifications_test', 'notifications_events',
@@ -509,6 +514,93 @@ def api_login():
                     'must_change': bool(rec.get('must_change'))})
 
 
+# ─── Single sign-on (optional) ─────────────────────────────────────────
+
+@app.route('/api/sso')
+def sso_status():
+    """What this controller's SSO configuration is, and whether the UI may
+    change it."""
+    cfg = sso.config()
+    return jsonify({'success': True, 'configured': bool(cfg),
+                    'locked': sso.locked(),
+                    'source': (cfg or {}).get('source'),
+                    'issuer': (cfg or {}).get('issuer', ''),
+                    'audience': (cfg or {}).get('audience', ''),
+                    'kid': (cfg or {}).get('kid', '')})
+
+
+@app.route('/api/sso/enroll', methods=['POST'])
+def sso_enroll():
+    """Redeem a one-time enrollment code at an issuer and store the result.
+
+    Admin here AND a code minted by an admin at the issuer -- neither side can
+    enroll the other unilaterally. Refused when the host configuration already
+    fixes this, so a UI admin cannot override what the installer decided.
+    """
+    if sso.locked():
+        return err("Single sign-on is fixed by this host's configuration "
+                   'and cannot be changed here', 409)
+    data = request.get_json(silent=True) or {}
+    issuer = str(data.get('issuer') or '').strip().rstrip('/')
+    code = str(data.get('code') or '').strip()
+    if not issuer.startswith(('http://', 'https://')):
+        return err('Issuer must be an http:// or https:// URL')
+    if not code:
+        return err('Enrollment code is required')
+    result, e = sso.redeem(issuer, code)
+    if e:
+        return err(e)
+    sso.save_stored(result['issuer'], result['key'], result.get('kid', ''),
+                    result['audience'])
+    return jsonify({'success': True, 'issuer': result['issuer'],
+                    'audience': result['audience'], 'kid': result.get('kid', '')})
+
+
+@app.route('/api/sso', methods=['DELETE'])
+def sso_disable():
+    """Remove a UI-enrolled configuration. The current password is required --
+    turning off the way you sign in should not be a single click, and it stops
+    a hijacked session quietly detaching this controller from the issuer."""
+    if sso.locked():
+        return err("Single sign-on is fixed by this host's configuration "
+                   'and cannot be changed here', 409)
+    data = request.get_json(silent=True) or {}
+    rec = _users().get(getattr(g, 'identity_name', ''))
+    if not rec or not check_password_hash(rec.get('password', ''),
+                                          data.get('password') or ''):
+        return err('Current password is incorrect', 403)
+    sso.clear_stored()
+    return jsonify({'success': True})
+
+
+@app.route('/sso/callback')
+def sso_callback():
+    """Exchange a signed SSO assertion for an ordinary local session.
+
+    The ONLY place an assertion is accepted -- it is never a general bearer
+    credential, so _resolve_identity is untouched. Registered unconditionally
+    so a UI enrollment applies without a restart; unconfigured it 404s.
+
+    The subject must already have a controller account, and the assertion
+    carries no role or scope: the local record still decides what they can see
+    and do, which matters more here than anywhere else in the suite.
+    """
+    if not sso.enabled():
+        return err('Not found', 404)
+    sub = sso.verify(request.args.get('a'))
+    dest = sso.safe_next(request.args.get('next'))
+    if not sub:
+        return redirect('/?sso_error=1', code=302)
+    if _users().get(sub) is None:
+        return redirect('/?sso_error=unknown_user', code=302)
+    session.clear()          # session fixation: never reuse a pre-login id
+    session['user'] = sub
+    session.permanent = True
+    g.audit_user = sub
+    return redirect(dest, code=302)
+
+
+
 @app.route('/api/logout', methods=['POST'])
 def api_logout():
     session.clear()
@@ -519,14 +611,24 @@ def api_logout():
 def api_me():
     name, role = _resolve_identity()
     if not name:
-        return jsonify({'authenticated': False}), 401
+        # The login screen needs to know whether to offer SSO before anyone is
+        # authenticated, so the hint rides on the 401 too.
+        body = {'authenticated': False}
+        if sso.enabled():
+            body['sso'] = sso.login_hint()
+        return jsonify(body), 401
     rec = _users().get(name)
     scope = user_scope(rec, role, _scope_presets())
-    return jsonify({'authenticated': True, 'user': name, 'role': role,
-                    'scope_tags': sorted(scope) if scope else None,
-                    'scope_preset': rec.get('scope_preset') if isinstance(rec, dict) else None,
-                    'must_change': bool(isinstance(rec, dict) and rec.get('must_change')),
-                    'version': APP_VERSION})
+    body = {'authenticated': True, 'user': name, 'role': role,
+            'scope_tags': sorted(scope) if scope else None,
+            'scope_preset': rec.get('scope_preset') if isinstance(rec, dict) else None,
+            'must_change': bool(isinstance(rec, dict) and rec.get('must_change')),
+            'version': APP_VERSION}
+    # Added ONLY when configured, so an unconfigured controller's response is
+    # unchanged from one built before SSO existed.
+    if sso.enabled():
+        body['sso'] = sso.login_hint()
+    return jsonify(body)
 
 
 @app.route('/api/account/password', methods=['POST'])
@@ -1420,9 +1522,14 @@ def _board_category(env):
 def api_status():
     """PUBLIC up/down wallboard: host names, colored states, and issue text,
     plus the service checks. Deliberately serves the shared fleet cache only
-    (never triggers a fan-out) so anonymous hits are cheap. Exposes NO
-    addresses, credentials, versions, or metric values — names, states, and
-    the terse issue descriptions the operator asked to surface."""
+    (never triggers a fan-out) so anonymous hits are cheap. Exposes no
+    addresses, credentials or versions.
+
+    EXCEPTION, by explicit operator decision: `unifi` hosts also publish their
+    full network block — WAN/LAN throughput, client counts, latency, ISP and
+    the individual issue descriptions (which name switches, ports and APs).
+    Everything else here still withholds metric values; this one host type
+    does not. Drop the `network` key below to take that back."""
     with _fleet_lock:
         data = _fleet_cache['data']
     # Paused (deliberately-offline) hosts are an operator concern: logged-in
@@ -1434,8 +1541,13 @@ def api_status():
         state, issues = monitoring.board_state(r)
         if state == 'grey' and not authed:
             continue
-        hosts.append({'name': r['name'], 'category': _board_category(r),
-                      'state': state, 'issues': issues})
+        entry = {'name': r['name'], 'category': _board_category(r),
+                 'state': state, 'issues': issues}
+        # See the docstring: the network host publishes its metrics here on
+        # purpose, so the wallboard can carry a live throughput bar.
+        if r.get('host_type') == 'unifi' and r.get('network'):
+            entry['network'] = r['network']
+        hosts.append(entry)
     with _check_lock:
         res = dict(_check_results)
     cks = []
