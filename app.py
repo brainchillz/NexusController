@@ -1638,7 +1638,11 @@ def tuning_save():
     g.audit_target = 'tuning ' + json.dumps(rec, sort_keys=True)
     return jsonify({'success': True, **tuning()})
 
-_mon = {'present_streak': {}, 'active': set(), 'last_fire': {}, 'seeded': False}
+# 'detail' holds the text last NOTIFIED for each active (host, condition), not
+# the text last observed: a change seen during the cooldown is not forgotten,
+# it is reported whole the next time the key is allowed to speak.
+_mon = {'present_streak': {}, 'active': set(), 'last_fire': {}, 'detail': {},
+        'seeded': False}
 _mon_lock = threading.Lock()
 
 
@@ -1722,7 +1726,10 @@ def _dispatch(events):
 
 def _monitor_cycle(results):
     """Diff this fan-out against the running state and dispatch transitions.
-    Debounced: FLAP_CYCLES to fire, immediate recovery, per-key cooldown."""
+    Debounced: FLAP_CYCLES to fire, immediate recovery, per-key cooldown.
+    A condition already firing re-fires when its detail changes, under the same
+    cooldown — the detail is the message, so a second alert landing under a key
+    that is already up would otherwise never be reported."""
     snap = monitoring.snapshot_conditions(results)
     present = {(hid, key) for hid, e in snap.items() for key in e['conditions']}
     paused = {r['id'] for r in results if r.get('disabled')}
@@ -1736,6 +1743,7 @@ def _monitor_cycle(results):
         # silently so disabling never notifies and re-enabling starts fresh.
         for pk in [pk for pk in _mon['active'] if pk[0] in paused]:
             _mon['active'].discard(pk)
+            _mon['detail'].pop(pk, None)
         for pk in [pk for pk in streak if pk[0] in paused]:
             del streak[pk]
         # advance streaks
@@ -1749,28 +1757,42 @@ def _monitor_cycle(results):
             _mon['active'] = set(present)
             for pk in present:
                 _mon['last_fire'][pk] = now
+                _mon['detail'][pk] = snap[pk[0]]['conditions'][pk[1]]['detail']
             _mon['seeded'] = True
             return
-        # fire: present, stable, not already active, cooldown elapsed
+        # fire: present, stable, cooldown elapsed, and either new or changed
         for pk in present:
-            if pk in _mon['active'] or streak.get(pk, 0) < flap:
-                continue
-            if now - _mon['last_fire'].get(pk, 0) < NOTIFY_COOLDOWN:
-                continue
             hid, key = pk
             meta = snap[hid]['conditions'][key]
+            active = pk in _mon['active']
+            if active and meta['detail'] == _mon['detail'].get(pk):
+                continue          # same condition saying the same thing
+            if streak.get(pk, 0) < flap:
+                continue
+            if now - _mon['last_fire'].get(pk, 0) < NOTIFY_COOLDOWN:
+                # Deliberately leaves _mon['detail'] alone: the comparison above
+                # stays true against the last text SENT, so whatever it has
+                # become by the time the cooldown lapses still gets reported.
+                continue
             fire.append({'host_id': hid, 'host': snap[hid]['name'], 'key': key,
-                         'kind': 'firing', 'severity': meta['severity'], 'detail': meta['detail']})
+                         'kind': 'changed' if active else 'firing',
+                         'severity': meta['severity'], 'detail': meta['detail']})
             _mon['active'].add(pk)
+            _mon['detail'][pk] = meta['detail']
             _mon['last_fire'][pk] = now
         # recover: was active, now absent
         for pk in list(_mon['active']):
             if pk not in present:
                 hid, key = pk
                 name = (snap.get(hid) or {}).get('name', hid)
+                # Name what cleared. 'alerts cleared' on its own is only useful
+                # to a reader who still remembers which alerts they were.
+                was = _mon['detail'].pop(pk, None)
+                label = _COND_LABEL.get(key, key)
                 recover.append({'host_id': hid, 'host': name, 'key': key,
                                 'kind': 'recovered', 'severity': 'info',
-                                'detail': _COND_LABEL.get(key, key)})
+                                'detail': ('%s (was: %s)' % (label, monitoring.one_line(was))
+                                           if was else label)})
                 _mon['active'].discard(pk)
     _record_events(fire + recover)
     _dispatch(fire + recover)

@@ -28,11 +28,14 @@ SNAP = {
          'active': True, 'ackedAt': None, 'occurrences': 1},
         {'severity': 'info', 'kind': 'noise', 'subject': 'x', 'subjectName': 'X',
          'message': 'informational', 'active': True, 'ackedAt': None},
-        # Must be filtered out: acknowledged, and resolved/inactive.
+        # Must be filtered out: acknowledged, resolved/inactive, and muted.
         {'severity': 'critical', 'kind': 'old', 'subject': 'y', 'subjectName': 'Y',
          'message': 'already looked at', 'active': True, 'ackedAt': 123},
         {'severity': 'critical', 'kind': 'gone', 'subject': 'z', 'subjectName': 'Z',
          'message': 'resolved', 'active': False, 'ackedAt': None},
+        {'severity': 'critical', 'kind': 'very_weak_signal', 'subject': 'w',
+         'subjectName': 'W', 'message': 'muted at the source',
+         'active': True, 'ackedAt': None, 'muted': True},
     ],
 }
 
@@ -63,6 +66,26 @@ def test_only_active_unacknowledged_issues_count():
     assert 'already looked at' not in msgs and 'resolved' not in msgs
 
 
+def test_muted_issues_do_not_light_up_the_box():
+    """Muting is per-kind in UnifiDash and gates its notifier. If a muted kind
+    still became a node condition here, silencing it at the source would only
+    move the noise onto our webhooks."""
+    n = build_unifi_envelope(dict(NODE), SNAP)['network']
+    assert n['critical'] == 1      # not 2: the muted one does not count
+    assert 'muted at the source' not in [i['message'] for i in n['issues']]
+    assert 'W: muted at the source' not in \
+        (build_unifi_envelope(dict(NODE), SNAP).get('summary') or {}).get('alerts', [])
+
+
+def test_muted_absent_means_not_muted():
+    """UnifiDash builds older than the flag omit it entirely."""
+    issues = [{'severity': 'critical', 'kind': 'device_offline', 'subject': 'd',
+               'subjectName': 'Switch', 'message': 'offline',
+               'active': True, 'ackedAt': None}]
+    n = build_unifi_envelope(dict(NODE), dict(SNAP, issues=issues))['network']
+    assert n['critical'] == 1
+
+
 def test_issues_are_worst_first(env):
     """The tooltip shows the top of this list, so ordering is what decides
     whether the important one is visible."""
@@ -73,6 +96,25 @@ def test_issues_are_worst_first(env):
 def test_critical_issues_reach_the_fleet_rollup(env):
     alerts = (env['summary'] or {}).get('alerts') or []
     assert any('WAN down' in a for a in alerts)
+
+
+def test_rollup_names_the_subject_not_its_mac():
+    """`subject` is the detector's key — a MAC for a client. The rollup line is
+    what lands in a webhook, and a MAC there has to be looked up before anyone
+    can act on it."""
+    issues = [{'severity': 'critical', 'kind': 'device_offline',
+               'subject': 'aa:bb:cc:dd:ee:ff', 'subjectName': 'Workbench switch',
+               'message': 'Offline', 'active': True, 'ackedAt': None}]
+    env = build_unifi_envelope(dict(NODE), dict(SNAP, issues=issues))
+    assert env['summary']['alerts'] == ['Workbench switch: Offline']
+
+
+def test_rollup_falls_back_to_the_subject_when_unnamed():
+    issues = [{'severity': 'critical', 'kind': 'device_offline',
+               'subject': 'aa:bb:cc:dd:ee:ff', 'subjectName': None,
+               'message': 'Offline', 'active': True, 'ackedAt': None}]
+    env = build_unifi_envelope(dict(NODE), dict(SNAP, issues=issues))
+    assert env['summary']['alerts'] == ['aa:bb:cc:dd:ee:ff: Offline']
 
 
 def test_warnings_alone_do_not_raise_a_fleet_alert():

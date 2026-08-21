@@ -28,12 +28,18 @@ def host_conditions(env):
         return conds   # a down host: don't also fire its stale sub-conditions
 
     summary = env.get('summary') or {}
-    n_alerts = len(summary.get('alerts') or [])
     nas = env.get('nas') or {}
-    n_alerts += nas.get('alerts') or 0
+    # Same two places the SPA reads alert text from, in the same order.
+    texts = [t for t in (one_line(a) for a in (summary.get('alerts') or []))
+             if t] + [t for t in (one_line(a) for a in (nas.get('alert_list') or []))
+                      if t]
+    # NAS adapters report a count and, usually, the matching list. Trust
+    # whichever is larger: a count without text still has to be alertable.
+    n_alerts = max(len(summary.get('alerts') or []) + (nas.get('alerts') or 0),
+                   len(texts))
     if n_alerts:
         conds['alerts'] = {'severity': 'warning',
-                           'detail': f'{n_alerts} active alert(s)'}
+                           'detail': _alert_detail(n_alerts, texts)}
 
     if nas.get('pools_degraded'):
         conds['pool_degraded'] = {'severity': 'critical',
@@ -72,6 +78,44 @@ def host_conditions(env):
             'severity': 'info',
             'detail': f"{upd['security']} security update(s) pending"}
     return conds
+
+
+# An alert line is one host's text, quoted into a digest that may carry several
+# hosts, so it is clipped rather than allowed to run.
+ALERT_TEXT_MAX = 140
+ALERT_TEXT_SHOWN = 3
+
+
+def one_line(text, limit=ALERT_TEXT_MAX):
+    """Any alert text → one clipped line. Sources vary: UnifiDash sends
+    'Subject: message', the NAS collectors send whatever the appliance wrote,
+    which can be multi-line. A notification line cannot carry that."""
+    text = ' '.join(str(text or '').split())
+    if len(text) > limit:
+        text = text[:limit - 1].rstrip() + '…'
+    return text
+
+
+def _alert_detail(n, texts):
+    """Count + alert texts → the condition detail.
+
+    The detail IS the notification: format_event puts nothing else in the line,
+    and the recovered line replays it. A bare count told the reader something
+    was wrong on a host they already knew was in the digest — true, and not
+    worth the notification. The text is right there in the envelope, so it goes
+    in the line.
+
+    Sources that report only a count (some NAS adapters) still fall back to it;
+    long lists are clipped, because the point is to say what happened, not to
+    mirror the Alerts tab."""
+    if not texts:
+        return f'{n} active alert(s)'
+    if n == 1:
+        return texts[0]
+    shown = texts[:ALERT_TEXT_SHOWN]
+    more = n - len(shown)
+    return '%d active alerts: %s%s' % (n, '; '.join(shown),
+                                       f' (+{more} more)' if more > 0 else '')
 
 
 def _services_down(summary):
@@ -146,8 +190,14 @@ def snapshot_conditions(results):
 
 def diff_snapshots(prev, cur):
     """Two snapshot_conditions() maps → a list of transition events. A condition
-    that appears is a 'firing' event; one that clears is 'recovered'. Hosts that
-    vanish from the registry are ignored (no orphan 'recovered' spam)."""
+    that appears is a 'firing' event; one whose detail changes while it stays up
+    is 'changed'; one that clears is 'recovered'. Hosts that vanish from the
+    registry are ignored (no orphan 'recovered' spam).
+
+    A condition's detail is the whole of its notification, so a second alert
+    arriving under a key that is already firing is news even though the key was
+    already there. This applies no rate limit — the monitor's cooldown is what
+    decides whether a 'changed' event is worth sending."""
     events = []
     for hid, entry in cur.items():
         name = entry['name']
@@ -158,16 +208,23 @@ def diff_snapshots(prev, cur):
                 events.append({'host_id': hid, 'host': name, 'key': key,
                                'kind': 'firing', 'severity': meta['severity'],
                                'detail': meta['detail']})
+            elif pconds[key].get('detail') != meta['detail']:
+                events.append({'host_id': hid, 'host': name, 'key': key,
+                               'kind': 'changed', 'severity': meta['severity'],
+                               'detail': meta['detail']})
         for key, meta in pconds.items():
             if key not in cconds and hid in cur:
                 events.append({'host_id': hid, 'host': name, 'key': key,
                                'kind': 'recovered', 'severity': meta['severity'],
                                'detail': meta['detail']})
-    events.sort(key=lambda e: (e['kind'] != 'firing', SEVERITY.get(e['severity'], 3)))
+    order = {'firing': 0, 'changed': 1, 'recovered': 2}
+    events.sort(key=lambda e: (order.get(e['kind'], 3),
+                               SEVERITY.get(e['severity'], 3)))
     return events
 
 
 _ICON = {'firing': {'critical': '🔴', 'warning': '🟠', 'info': '🟡'},
+         'changed': {'critical': '🔴', 'warning': '🟠', 'info': '🟡'},
          'recovered': {'critical': '🟢', 'warning': '🟢', 'info': '🟢'}}
 
 
@@ -176,6 +233,10 @@ def format_event(ev):
     icon = _ICON.get(ev['kind'], {}).get(ev['severity'], '•')
     if ev['kind'] == 'recovered':
         return f"{icon} *{ev['host']}* recovered: {ev['detail']}"
+    if ev['kind'] == 'changed':
+        # Same condition, different facts. Saying so stops the reader treating
+        # it as a second incident on a host they were already told about.
+        return f"{icon} *{ev['host']}* changed: {ev['detail']}"
     return f"{icon} *{ev['host']}*: {ev['detail']}"
 
 

@@ -28,6 +28,73 @@ def test_host_conditions_nas_degraded_and_alerts():
     assert c['alerts']['detail'].startswith('2')
 
 
+def test_alert_condition_carries_the_alert_text():
+    """The detail IS the notification line. A count says a host has alerts,
+    which the reader knew from the fact they were paged."""
+    env = {'ok': True, 'summary': {'alerts': ['Gateway: WAN down']}}
+    assert monitoring.host_conditions(env)['alerts']['detail'] == 'Gateway: WAN down'
+
+
+def test_alert_condition_lists_several_then_counts_the_rest():
+    env = {'ok': True, 'summary': {'alerts': ['a: one', 'b: two', 'c: three',
+                                              'd: four', 'e: five']}}
+    detail = monitoring.host_conditions(env)['alerts']['detail']
+    assert detail == '5 active alerts: a: one; b: two; c: three (+2 more)'
+
+
+def test_alert_condition_reads_nas_alert_list_too():
+    """TrueNAS reports a count in `alerts` and the text in `alert_list`."""
+    env = {'ok': True, 'summary': {},
+           'nas': {'alerts': 1, 'alert_list': ['Pool scrub found errors.']}}
+    assert monitoring.host_conditions(env)['alerts']['detail'] == \
+        'Pool scrub found errors.'
+
+
+def test_alert_condition_falls_back_to_a_count_without_text():
+    """Some sources report only a number — still alertable, just terser."""
+    env = {'ok': True, 'summary': {}, 'nas': {'alerts': 3}}
+    assert monitoring.host_conditions(env)['alerts']['detail'] == '3 active alert(s)'
+
+
+def test_alert_text_is_single_line_and_clipped():
+    """Appliance alerts arrive with newlines and paragraphs in them; a digest
+    line cannot carry those."""
+    env = {'ok': True, 'summary': {'alerts': ['line one\n  line two ' + 'x' * 300]}}
+    detail = monitoring.host_conditions(env)['alerts']['detail']
+    assert '\n' not in detail and detail.startswith('line one line two ')
+    assert len(detail) <= monitoring.ALERT_TEXT_MAX
+
+
+def test_alert_text_reaches_the_notification_line():
+    """End to end: envelope → condition → transition event → webhook body."""
+    cur = monitoring.snapshot_conditions(
+        [{'id': 'n1', 'name': 'UniFi Network',
+          'ok': True, 'summary': {'alerts': ['Gateway: WAN down']}}])
+    events = monitoring.diff_snapshots({}, cur)
+    _, text = monitoring.format_digest(events)
+    assert text == '🟠 *UniFi Network*: Gateway: WAN down'
+    # …and the recovery line replays what it was, not a bare count.
+    recovered = monitoring.diff_snapshots(cur, monitoring.snapshot_conditions(
+        [{'id': 'n1', 'name': 'UniFi Network', 'ok': True, 'summary': {}}]))
+    assert monitoring.format_event(recovered[0]) == \
+        '🟢 *UniFi Network* recovered: Gateway: WAN down'
+
+
+def test_diff_reports_a_changed_detail_on_a_standing_condition():
+    """The key stays up, but what it says is different — a second alert under a
+    key that is already firing is news, not a duplicate."""
+    def snap(alerts):
+        return monitoring.snapshot_conditions(
+            [{'id': 'n1', 'name': 'UniFi Network', 'ok': True,
+              'summary': {'alerts': alerts}}])
+    prev, cur = snap(['Gateway: WAN down']), snap(['Gateway: WAN down', 'AP2: Offline'])
+    events = monitoring.diff_snapshots(prev, cur)
+    assert [e['kind'] for e in events] == ['changed']
+    assert monitoring.format_event(events[0]) == (
+        '🟠 *UniFi Network* changed: 2 active alerts: Gateway: WAN down; AP2: Offline')
+    assert monitoring.diff_snapshots(cur, cur) == []   # unchanged says nothing
+
+
 def test_host_conditions_spark_unhealthy_and_version_lag():
     assert 'cluster_unhealthy' in monitoring.host_conditions(
         {'ok': True, 'spark': {'healthy': False}})

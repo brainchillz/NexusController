@@ -597,6 +597,91 @@ def test_monitor_cycle_pause_is_silent_not_recovery():
             app._mon.update(saved)
 
 
+def _reset_mon():
+    """Fresh monitor state, and the saved copy to put back afterwards."""
+    saved = {k: (v.copy() if hasattr(v, 'copy') else v) for k, v in app._mon.items()}
+    app._mon.update(present_streak={}, active=set(), last_fire={}, detail={},
+                    seeded=False)
+    return saved
+
+
+def _lapse_cooldown():
+    """Pretend NOTIFY_COOLDOWN has passed since the last fire."""
+    with app._mon_lock:
+        app._mon['last_fire'] = {pk: 0 for pk in app._mon['last_fire']}
+
+
+def _unifi_env(alerts):
+    return {'id': 'u1', 'name': 'UniFi Network', 'ok': True,
+            'summary': {'alerts': list(alerts)}}
+
+
+def test_monitor_cycle_refires_when_the_alert_text_changes():
+    """A second alert under a key that is already firing must be reported. The
+    key is unchanged, so only the detail can carry the news."""
+    with app._mon_lock:
+        saved = _reset_mon()
+    try:
+        one, two = _unifi_env(['Gateway: WAN down']), _unifi_env(
+            ['Gateway: WAN down', 'AP2: Offline'])
+        app._monitor_cycle([one])          # seed: adopt silently
+        app._monitor_cycle([one])          # flap streak, no change
+        _lapse_cooldown()                  # covered on its own below
+        before = len(app._notify_events)
+        app._monitor_cycle([two])
+        new = list(app._notify_events)[before:]
+        assert [e['kind'] for e in new] == ['changed']
+        assert new[0]['detail'] == \
+            '2 active alerts: Gateway: WAN down; AP2: Offline'
+        # …and saying the same thing again is silent.
+        before = len(app._notify_events)
+        app._monitor_cycle([two])
+        assert len(app._notify_events) == before
+    finally:
+        with app._mon_lock:
+            app._mon.update(saved)
+
+
+def test_monitor_cycle_cooldown_holds_a_change_then_reports_the_latest():
+    """Inside the cooldown a change is withheld, not dropped — what goes out
+    afterwards is the current text, not the one that was suppressed."""
+    with app._mon_lock:
+        saved = _reset_mon()
+    try:
+        app._monitor_cycle([_unifi_env(['a: one'])])       # seed
+        app._monitor_cycle([_unifi_env(['a: one'])])
+        before = len(app._notify_events)
+        app._monitor_cycle([_unifi_env(['a: one', 'b: two'])])
+        assert len(app._notify_events) == before           # cooldown: withheld
+        # Cooldown lapses; the list has moved on again.
+        _lapse_cooldown()
+        app._monitor_cycle([_unifi_env(['a: one', 'b: two', 'c: three'])])
+        new = list(app._notify_events)[before:]
+        assert [e['kind'] for e in new] == ['changed']
+        assert new[0]['detail'] == \
+            '3 active alerts: a: one; b: two; c: three'
+    finally:
+        with app._mon_lock:
+            app._mon.update(saved)
+
+
+def test_monitor_cycle_recovery_names_what_cleared():
+    """'alerts cleared' alone only helps a reader who still remembers which."""
+    with app._mon_lock:
+        saved = _reset_mon()
+    try:
+        app._monitor_cycle([_unifi_env(['Gateway: WAN down'])])   # seed
+        before = len(app._notify_events)   # recovery is immediate, no cooldown
+        app._monitor_cycle([{'id': 'u1', 'name': 'UniFi Network', 'ok': True,
+                             'summary': {}}])
+        new = list(app._notify_events)[before:]
+        assert [e['kind'] for e in new] == ['recovered']
+        assert new[0]['detail'] == 'alerts cleared (was: Gateway: WAN down)'
+    finally:
+        with app._mon_lock:
+            app._mon.update(saved)
+
+
 def test_clean_type_rejects_paused_reserved_group():
     # 'Paused' is the reserved overview group for disabled hosts.
     assert app.clean_type('Paused') is None

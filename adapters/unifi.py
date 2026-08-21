@@ -3,6 +3,9 @@
 Pulls one versioned snapshot from a UnifiDash instance's read-only API
 (`/api/overview`) and normalizes it into an envelope carrying a `network`
 block: WAN/LAN throughput, client counts, internet latency and issue counts.
+Issues UnifiDash reports as muted are dropped: muting is its operator saying
+this kind is not worth interrupting anyone over, and that has to hold for the
+alarms raised from this snapshot too.
 
 Unlike every other host type here this describes a *network*, not a machine —
 it has no CPU, memory or storage, so the envelope leaves those at their base
@@ -36,17 +39,32 @@ def build_unifi_envelope(node, snap):
     thr = snap.get('throughput') or {}
     wan = snap.get('wan') or {}
 
-    # Only ACTIVE, UNACKNOWLEDGED issues are worth surfacing on the overview —
-    # an acknowledged issue is one someone has already looked at, and a
-    # resolved one is history. The tooltip shows the worst few in full.
+    # Only ACTIVE, UNACKNOWLEDGED, UNMUTED issues are worth surfacing on the
+    # overview — an acknowledged issue is one someone has already looked at, and
+    # a resolved one is history. The tooltip shows the worst few in full.
+    #
+    # `muted` is UnifiDash's own "do not notify about this kind" setting. It
+    # gates that instance's notifier, so without honouring it here a kind the
+    # operator silenced at the source still turns into a node condition and
+    # goes out through OUR webhooks — muted there, shouting here. Older
+    # UnifiDash builds omit the field; absent means not muted.
     live = [i for i in (snap.get('issues') or [])
-            if i.get('active') and not i.get('ackedAt')]
+            if i.get('active') and not i.get('ackedAt') and not i.get('muted')]
     live.sort(key=lambda i: (SEVERITIES.index(i['severity'])
                              if i.get('severity') in SEVERITIES else len(SEVERITIES),
                              -(i.get('occurrences') or 0)))
 
     def _tally(sev):
         return sum(1 for i in live if i.get('severity') == sev)
+
+    def _line(i):
+        # `subject` is the raw key the detector used — a MAC for a client or an
+        # AP. `subjectName` is what the operator calls it. Naming the MAC in a
+        # notification means looking it up before you can act on it, so prefer
+        # the name and fall back only when there is none.
+        who = (i.get('subjectName') or i.get('subject') or '').strip()
+        msg = (i.get('message') or '').strip()
+        return f'{who}: {msg}' if who and msg else (who or msg)
 
     out['network'] = {
         'wan_rx_bps': thr.get('wanRxBps') or 0,
@@ -67,7 +85,7 @@ def build_unifi_envelope(node, snap):
         # Trimmed for the tooltip: enough to say what is wrong and where.
         'issues': [{'severity': i.get('severity'),
                     'kind': i.get('kind'),
-                    'subject': i.get('subjectName') or i.get('subject') or '',
+                    'subject': (i.get('subjectName') or i.get('subject') or ''),
                     'message': i.get('message') or ''}
                    for i in live[:12]],
         'subsystems': [{'name': s.get('name'), 'status': s.get('status')}
@@ -78,8 +96,7 @@ def build_unifi_envelope(node, snap):
     # stay off the rollup so the overview does not cry wolf.
     if out['network']['critical']:
         out['summary'] = {'alerts': [
-            '%s: %s' % (i['subject'], i['message']) for i in live
-            if i.get('severity') == 'critical'][:5]}
+            _line(i) for i in live if i.get('severity') == 'critical'][:5]}
     out['type_auto'] = 'Network'
     return out
 

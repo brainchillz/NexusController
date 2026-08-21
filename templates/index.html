@@ -1890,7 +1890,8 @@ async function loadNotifyEvents(){
           + '<span class="muted">'+esc(String(e.ts||'').replace('T',' ').slice(5,19))+'</span> '
           + '<b>'+esc(e.host)+'</b> '
           + (e.kind==='recovered' ? '<span class="ok-txt">recovered</span>'
-             : '<span class="'+(e.severity==='critical'?'bad':'warn')+'">firing</span>')
+             : '<span class="'+(e.severity==='critical'?'bad':'warn')+'">'
+               + (e.kind==='changed'?'changed':'firing')+'</span>')
           + ' — '+esc(e.detail)+'</div>').join('')
       : '<span class="muted">No state transitions recorded since the controller started.</span>';
   }catch(e){ el.innerHTML = '<span class="muted">'+esc(e.message)+'</span>'; }
