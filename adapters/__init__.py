@@ -23,13 +23,14 @@ from .sparkdash import SparkDashAdapter, build_spark_envelope
 from .agent import AgentAdapter, build_agent_envelope
 from .dnsmaq import DnsmaqAdapter, build_dnsmaq_envelope
 from .unifi import UnifiAdapter, build_unifi_envelope
+from .ugreen import UgreenAdapter
 
 # Registration order = the order host types appear in the Add-Host dropdown.
 ADAPTERS = {a.kind: a for a in
             (NexusAdapter(), ProxmoxAdapter(), VCenterAdapter(), ESXiAdapter(),
              TrueNasAdapter(), SynologyAdapter(), ZimaOSAdapter(), UnraidAdapter(),
-             OmvAdapter(), SparkDashAdapter(), AgentAdapter(), DnsmaqAdapter(),
-             UnifiAdapter())}
+             OmvAdapter(), UgreenAdapter(), SparkDashAdapter(), AgentAdapter(),
+             DnsmaqAdapter(), UnifiAdapter())}
 
 
 def adapter_for(node):

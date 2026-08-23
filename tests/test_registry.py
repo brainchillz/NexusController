@@ -360,8 +360,8 @@ def test_adapter_descriptors_complete():
     kinds = [d['kind'] for d in ds]
     assert kinds[0] == 'nexus'   # first option in the Add-Host dropdown
     assert set(kinds) == {'nexus', 'proxmox', 'vcenter', 'esxi', 'truenas',
-                          'synology', 'zimaos', 'unraid', 'omv', 'sparkdash',
-                          'agent', 'dnsmaq', 'unifi'}
+                          'synology', 'zimaos', 'unraid', 'omv', 'ugreen',
+                          'sparkdash', 'agent', 'dnsmaq', 'unifi'}
     for d in ds:
         for k in ('kind', 'label', 'auth', 'secret_label', 'url_placeholder',
                   'username_placeholder', 'verify_tls', 'default_type', 'polled'):
