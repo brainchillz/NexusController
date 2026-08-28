@@ -15,6 +15,7 @@
   <symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
   <symbol id="i-key" viewBox="0 0 24 24"><path d="m21 2-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.78 7.78 5.5 5.5 0 0 1 7.78-7.78zm0 0L15.5 7.5m3 3L22 7l-3-3"/></symbol>
   <symbol id="i-tag" viewBox="0 0 24 24"><path d="M20.59 13.41 11 3H4v7l9.59 10.59a2 2 0 0 0 2.82 0l4.18-4.18a2 2 0 0 0 0-2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></symbol>
+  <symbol id="i-power" viewBox="0 0 24 24"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></symbol>
   <symbol id="i-mon" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></symbol>
 </defs></svg>
   <!-- Login -->
@@ -316,6 +317,16 @@
     </div>
   </div>
 
+  <!-- Fleet updates: every host with pending updates, applied in one sweep -->
+  <div id="fupdModal" class="modal" style="display:none">
+    <div class="modal-card wide" style="width:920px">
+      <div class="row"><h2 style="margin:0;flex:1">Fleet updates</h2>
+        <button class="x" onclick="closeFleetUpdates()">×</button></div>
+      <div id="fu-msg" class="small" style="min-height:18px"></div>
+      <div id="fu-body" style="max-height:60vh;overflow:auto"></div>
+    </div>
+  </div>
+
   <!-- Host detail dialog -->
   <div id="detailModal" class="modal" style="display:none">
     <div class="modal-card wide" style="width:760px">
@@ -407,7 +418,7 @@ function uiAlert(title, body){
 }
 
 // ── Esc closes the topmost open modal ──
-const MODAL_ORDER = ['dlgModal','detailModal','updatesModal','guestsModal','repinModal',
+const MODAL_ORDER = ['dlgModal','detailModal','updatesModal','fupdModal','guestsModal','repinModal',
                      'svcModal','editModal','addModal','checkModal'];
 document.addEventListener('keydown', e=>{
   if(e.key !== 'Escape') return;
@@ -415,7 +426,8 @@ document.addEventListener('keydown', e=>{
     const el = document.getElementById(id);
     if(el && el.style.display !== 'none'){
       ({dlgModal: ()=>dlgResolve(null), detailModal: closeDetail,
-        guestsModal: closeGuests, updatesModal: closeUpdates, repinModal: closeRepin,
+        guestsModal: closeGuests, updatesModal: closeUpdates,
+        fupdModal: closeFleetUpdates, repinModal: closeRepin,
         svcModal: closeSvc,
         editModal: closeEdit, addModal: closeAdd, checkModal: closeCheck})[id]();
       return;
@@ -571,10 +583,10 @@ function renderRollup(){
            'show only unreachable hosts')
     + pill('Degraded', r.degraded||0, r.degraded?'warn':'', "setTab('alerts')")
     + pill('Alerts', r.alerts, r.alerts?'warn':'', "setTab('alerts')");
-  if (r.updates_pending) html += pill('Updates', r.updates_pending, 'warn', "goOverview('updates')",
-    r.updates_pending+' package update(s) pending across '+r.updates_hosts+' host(s) — click to show them');
-  if (r.security_pending) html += pill('Security updates', r.security_pending, 'bad', "goOverview('security')",
-    r.security_pending+' SECURITY update(s) pending across '+r.security_hosts+' host(s) — click to show them');
+  if (r.updates_pending) html += pill('Updates', r.updates_pending, 'warn', "openFleetUpdates()",
+    r.updates_pending+' package update(s) pending across '+r.updates_hosts+' host(s) — click to review / apply fleet-wide');
+  if (r.security_pending) html += pill('Security updates', r.security_pending, 'bad', "openFleetUpdates()",
+    r.security_pending+' SECURITY update(s) pending across '+r.security_hosts+' host(s) — click to review / apply fleet-wide');
   if (r.disabled) html += pill('Paused', r.disabled, '', "goOverview('paused')",
                                'show only paused hosts (monitoring disabled)');
   if (r.vms) html += pill('VMs', r.vms + (r.containers ? ' ('+r.containers+' CT)' : ''), '',
@@ -726,6 +738,16 @@ function overviewView(){
   return html;
 }
 function urlHost(u){ try{ return new URL(u).hostname; }catch(e){ return (u||'').replace(/^[a-z]+:\/\//,'').split(/[:\/]/)[0]; } }
+// A host that has applied updates but still needs the reboot to finish them:
+// a power glyph on the row. Clickable (= reboot, confirmed) for accounts that
+// may write to that node; an indicator for everyone else.
+function rebootChip(n){
+  const wr = canWrite(n);
+  return '<span class="ck warnc'+(wr?' click':'')+'"'
+    + (wr ? ' onclick="rowReboot(\''+esc(n.id)+'\')"' : '')
+    + ' title="'+esc('Reboot required to finish applying updates'+(wr?' \u2014 click to reboot':''))+'">'
+    + '<svg class="ico ico-sm"><use href="#i-power"/></svg> Reboot</span>';
+}
 function updChip(id,k,v,cls,title){ return '<span class="ck click '+cls+'" title="'+esc(title)
   + '" onclick="openUpdates(\''+esc(id)+'\')">'+esc(k)+' <b>'+esc(v)+'</b></span>'; }
 function chip(k,v,cls,title){ return '<span class="ck '+(cls||'')+'"'+(title?' title="'+esc(title)+'"':'')+'>'+esc(k)+' <b>'+esc(v)+'</b></span>'; }
@@ -903,6 +925,7 @@ function nodeRow(n){
         upd.security+' SECURITY update(s) among '+(upd.available||0)+' pending \u2014 click to review / apply'));
       else if(upd.available>0) chips.push(updChip(n.id,'Updates',upd.available,'warnc',
         upd.available+' package update(s) pending \u2014 click to review / apply'));
+      if(upd.reboot_required) chips.push(rebootChip(n));
       if(zfs.pools) chips.push(chip('ZFS', zfs.pools+' pool'+(zfs.pools>1?'s':'')+(zfs.online===false?' ⚠':''), zfs.online===false?'bad':''));
       if(has(n,'disks') && disks.total!=null) chips.push(chip('Disks', disks.free+'/'+disks.total, disks.smart_ok===false?'bad':''));
       if(has(n,'smb') && s.smb) chips.push(chip('SMB', s.smb.shares));
@@ -1704,7 +1727,10 @@ async function renderUpdates(){
   let btns = '';
   if(wr){
     btns += '<button class="btn-open" onclick="updCheck()">Check now</button> ';
-    if(avN && u.apply_available) btns += '<button class="btn-open" onclick="updApply('+avN+','+secN+')">Apply all updates</button>';
+    if(avN && u.apply_available){
+      btns += '<button class="btn-open" onclick="updApply('+avN+','+secN+',0)">Apply all updates</button> ';
+      if(secN) btns += '<button class="btn-open" onclick="updApply('+avN+','+secN+',1)">Apply security only</button>';
+    }
     else if(avN) btns += '<span class="muted small">apply helper not installed on the node (installer --helpers-only)</span>';
   }
 
@@ -1729,25 +1755,201 @@ async function updCheck(){
     updTimer = setTimeout(async ()=>{ msg.textContent=''; renderUpdates(); }, 4000);
   }catch(e){ msg.innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
 }
-async function updApply(avail, sec){
+async function updApply(avail, sec, security){
   const n = nodeById(updatesNode); if(!n) return;
-  if(!(await uiConfirm('Apply all updates', 'Upgrade '+avail+' package'+(avail>1?'s':'')
-      + (sec?' (including '+sec+' security)':'')+' on "'+n.name+'"? The package manager may restart services; '
+  const count = security ? sec : avail;
+  if(!(await uiConfirm(security?'Apply security updates':'Apply all updates',
+      'Upgrade '+count+' package'+(count>1?'s':'')
+      + (security ? ' (security only)' : (sec?' (including '+sec+' security)':''))
+      + ' on "'+n.name+'"? The package manager may restart services; '
       + 'a reboot may be required afterwards — you\'ll be told here.', {okLabel:'Apply', danger:true}))) return;
-  try{ await API.post('nodes/'+updatesNode+'/proxy/updates/apply'); renderUpdates(); }
+  try{ await API.post('nodes/'+updatesNode+'/proxy/updates/apply', security?{security:true}:{}); renderUpdates(); }
   catch(e){ document.getElementById('up-msg').innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
+}
+// Shared by the per-host modal, the row glyph and the fleet modal: one confirm,
+// one proxied POST. Returns false when the operator backs out.
+async function rebootHost(n){
+  if(!(await uiConfirm('Reboot host', 'Reboot "'+n.name+'" now to finish applying updates? '
+      + 'Active I/O and running guests are interrupted; the row goes red until the node returns.',
+      {okLabel:'Reboot', danger:true}))) return false;
+  await API.post('nodes/'+n.id+'/proxy/system/reboot');
+  return true;
 }
 async function updReboot(){
   const n = nodeById(updatesNode); if(!n) return;
-  if(!(await uiConfirm('Reboot host', 'Reboot "'+n.name+'" now to finish applying updates? '
-      + 'Active I/O and running guests are interrupted; the row goes red until the node returns.',
-      {okLabel:'Reboot', danger:true}))) return;
   try{
-    await API.post('nodes/'+updatesNode+'/proxy/system/reboot');
+    if(!await rebootHost(n)) return;
     document.getElementById('up-msg').innerHTML =
       '<span class="ok-txt">Reboot sent ✓</span> <span class="muted">— the row shows red until the node is back (1–3 min).</span>';
   }catch(e){ document.getElementById('up-msg').innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
 }
+// The row's ⏻ glyph (no modal open to report into — use a dialog).
+async function rowReboot(id){
+  const n = nodeById(id); if(!n) return;
+  try{
+    if(await rebootHost(n))
+      uiAlert('Reboot sent', '"'+n.name+'" is rebooting — its row shows red until it is back (1–3 min).');
+  }catch(e){ uiAlert('Reboot failed', e.message); }
+}
+// ── Fleet updates: the per-host apply, fanned out across every host reporting
+//    pending updates. Zero controller routes (guests-modal pattern) — each
+//    host is driven through the reverse-proxy, so the node's own RBAC gates
+//    the write and the proxy audits it. Fire-then-poll: POST every eligible
+//    host, then re-GET their /api/updates every 3s while an apply runs. ──
+let fuOpen = false, fuTimer = null, fuState = {}, fuErr = {};
+
+// Hosts running the node updates module with something to say: packages
+// pending, a reboot owed, or an apply we already pulled this session (which
+// keeps a host on the list after its count drops to zero).
+function fuCandidates(){
+  return (fleet && fleet.nodes || []).filter(n => {
+    if(!n.ok || n.disabled) return false;
+    const u = (n.summary||{}).updates;
+    return !!u && ((u.available||0) > 0 || !!u.reboot_required
+                   || !!fuState[n.id] || !!fuErr[n.id]);
+  }).sort((a,b)=> fuRank(a)-fuRank(b) || String(a.name).localeCompare(String(b.name)));
+}
+function fuRank(n){ const u=(n.summary||{}).updates||{}; return u.security ? 0 : (u.available ? 1 : 2); }
+
+function openFleetUpdates(){
+  fuOpen = true; fuState = {}; fuErr = {};
+  document.getElementById('fu-msg').textContent = '';
+  document.getElementById('fu-body').innerHTML = '<div class="muted">Loading…</div>';
+  show('fupdModal', true);
+  fuFetch(fuCandidates());
+}
+function closeFleetUpdates(){
+  fuOpen = false; show('fupdModal', false);
+  if(fuTimer){ clearTimeout(fuTimer); fuTimer = null; }
+}
+async function fuFetch(hosts){
+  await Promise.all(hosts.map(async n => {
+    try{ fuState[n.id] = await API.get('nodes/'+n.id+'/proxy/updates'); delete fuErr[n.id]; }
+    catch(e){ fuErr[n.id] = e.message; }
+  }));
+  if(fuOpen) renderFleetUpdates();
+}
+// Eligible = this login may write to that node, its apply helper is installed,
+// nothing is running there already, and it has that flavour of update pending.
+function fuCan(n, security){
+  const u = fuState[n.id];
+  if(!u || !canWrite(n) || !u.apply_available || (u.apply||{}).running) return false;
+  return ((security ? u.security : u.available) || 0) > 0;
+}
+function fuCount(hosts, security){
+  return hosts.reduce((a,n)=> a + ((security ? fuState[n.id].security : fuState[n.id].available)||0), 0);
+}
+function fuHosts(n){ return n+' host'+(n===1?'':'s'); }
+
+function renderFleetUpdates(){
+  const body = document.getElementById('fu-body');
+  const hosts = fuCandidates();
+  if(!hosts.length){
+    body.innerHTML = '<div class="ok-txt small">✓ Every reachable host is up to date.</div>';
+    return;
+  }
+  const all = hosts.filter(n=>fuCan(n,false)), sec = hosts.filter(n=>fuCan(n,true));
+  let btns = '';
+  if(all.length) btns += '<button class="btn-open" onclick="fuApplyAll(0)">Apply all updates ('
+    + fuCount(all,false)+' pkg · '+fuHosts(all.length)+')</button> ';
+  if(sec.length) btns += '<button class="btn-open" style="border-color:var(--bad);color:var(--bad)"'
+    + ' onclick="fuApplyAll(1)">Apply all security ('+fuCount(sec,true)+' pkg · '+fuHosts(sec.length)+')</button>';
+  if(!btns){
+    // No button is not one situation: everything may already be running, or
+    // this login/host simply cannot apply. Say which.
+    const running = hosts.some(n=>((fuState[n.id]||{}).apply||{}).running);
+    const pending = hosts.some(n=>(((n.summary||{}).updates)||{}).available > 0);
+    btns = running ? '<span class="muted small">Applying — the rows below track each host.</span>'
+      : pending ? '<span class="muted small">Nothing to apply from here — applying needs a non-viewer'
+        + ' login, an admin token on the host, and the node\'s apply helper (installer --helpers-only).</span>'
+      : '';
+  }
+
+  const rows = hosts.map(n=>{
+    const u = fuState[n.id] || {}, ap = u.apply || {}, su = (n.summary||{}).updates || {};
+    const avN = u.available != null ? u.available : (su.available||0);
+    const secN = u.security != null ? u.security : (su.security||0);
+    const reboot = !!(ap.reboot_required || su.reboot_required);
+    let state;
+    if(fuErr[n.id]) state = '<span class="bad small">'+esc(fuErr[n.id])+'</span>';
+    else if(ap.running){
+      const pct = ap.total ? Math.min(100, Math.round(ap.done/ap.total*100)) : 0;
+      state = '<span class="mm-bar" style="display:inline-block;width:90px;vertical-align:middle"><i class="ok" style="width:'+pct+'%"></i></span>'
+        + ' <span class="small">'+(ap.total ? pct+'% · step '+ap.done+'/'+ap.total : 'starting…')+'</span>';
+    }
+    else if(reboot) state = '<span class="small" style="color:var(--warn)">'
+      + '<svg class="ico ico-sm"><use href="#i-power"/></svg> reboot required</span>';
+    else if(ap.finished && ap.rc === 0) state = '<span class="ok-txt small">✓ applied '+updAgo(ap.finished)+'</span>';
+    else if(ap.finished && ap.rc != null) state = '<span class="bad small">apply failed (exit '+esc(String(ap.rc))+')</span>';
+    else if(u.error) state = '<span class="bad small">check failed</span>';
+    else state = '<span class="muted small">'+(avN ? 'pending' : 'up to date')+'</span>';
+
+    let acts = '';
+    if(fuCan(n,false)) acts += '<button class="btn-open" onclick="fuApplyOne(\''+esc(n.id)+'\',0)">Apply</button> ';
+    if(fuCan(n,true)) acts += '<button class="btn-open" onclick="fuApplyOne(\''+esc(n.id)+'\',1)">Security</button> ';
+    if(reboot && canWrite(n) && !ap.running)
+      acts += '<button class="btn-open" onclick="fuReboot(\''+esc(n.id)+'\')">'
+        + '<svg class="ico ico-sm"><use href="#i-power"/></svg> Reboot</button> ';
+    acts += '<button class="btn-open" onclick="fuDetails(\''+esc(n.id)+'\')">Details ▸</button>';
+
+    return '<tr><td style="white-space:nowrap"><b>'+esc(n.name)+'</b></td>'
+      + '<td class="small">'+(avN||'—')+'</td>'
+      + '<td class="small">'+(secN ? '<span class="bad">'+secN+'</span>' : '—')+'</td>'
+      + '<td>'+state+'</td>'
+      + '<td class="ck-acts">'+acts+'</td></tr>';
+  });
+
+  body.innerHTML = '<div style="margin:0 0 8px">'+btns+'</div>'
+    + '<table class="tbl"><thead><tr><th>Host</th><th>Pending</th><th>Security</th>'
+    + '<th>State</th><th></th></tr></thead><tbody>'+rows.join('')+'</tbody></table>'
+    + '<div class="small" style="margin-top:8px"><span class="hlink" onclick="closeFleetUpdates();goOverview(\'updates\')">'
+    + 'Show these hosts in the overview ▸</span></div>';
+
+  // Poll only while something is actually applying.
+  if(fuTimer){ clearTimeout(fuTimer); fuTimer = null; }
+  if(hosts.some(n=>((fuState[n.id]||{}).apply||{}).running))
+    fuTimer = setTimeout(()=>{ if(fuOpen) fuFetch(fuCandidates()); }, 3000);
+}
+
+async function fuApplyOne(id, security){
+  const n = nodeById(id);
+  if(n) await fuApply([n], !!security);
+}
+async function fuApplyAll(security){
+  await fuApply(fuCandidates().filter(n=>fuCan(n, !!security)), !!security);
+}
+async function fuApply(targets, security){
+  if(!targets.length) return;
+  const pkgs = fuCount(targets, security);
+  if(!(await uiConfirm(security ? 'Apply security updates' : 'Apply all updates',
+      'Upgrade '+pkgs+' package'+(pkgs===1?'':'s')+(security?' (security only)':'')+' across '
+      + fuHosts(targets.length)+': '+targets.map(n=>n.name).join(', ')+'. Package managers may restart '
+      + 'services; any host still needing a reboot afterwards gets a ⏻ on its row.',
+      {okLabel:'Apply', danger:true}))) return;
+  const msg = document.getElementById('fu-msg');
+  msg.textContent = 'Starting on '+fuHosts(targets.length)+'…';
+  const fails = [];
+  await Promise.all(targets.map(async n=>{
+    try{ await API.post('nodes/'+n.id+'/proxy/updates/apply', security?{security:true}:{}); }
+    catch(e){ fails.push(n.name+': '+e.message); }
+  }));
+  if(!fuOpen) return;
+  const okN = targets.length - fails.length;
+  msg.innerHTML = (okN ? '<span class="ok-txt">Apply started on '+fuHosts(okN)+' ✓</span> ' : '')
+    + (fails.length ? '<span class="bad">'+esc(fails.join(' · '))+'</span>' : '');
+  fuFetch(targets);
+}
+async function fuReboot(id){
+  const n = nodeById(id); if(!n) return;
+  const msg = document.getElementById('fu-msg');
+  try{
+    if(!await rebootHost(n)) return;
+    msg.innerHTML = '<span class="ok-txt">Reboot sent to '+esc(n.name)+' ✓</span>'
+      + ' <span class="muted">— its row shows red until it is back (1–3 min).</span>';
+  }catch(e){ msg.innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
+}
+function fuDetails(id){ closeFleetUpdates(); openUpdates(id); }
+
 function renderGuests(){
   const n = nodeById(guestsNode);
   if(!n || !n.virt){ closeGuests(); return; }

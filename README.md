@@ -30,13 +30,18 @@ top of them, not a replacement.
   container counts with lifecycle control (see *Guest control*).
 - **Fleet patch posture** — nexus nodes running the dashboard's updates module
   report their distro and pending updates with every poll: each card carries an
-  **OS chip** plus an amber **Updates** / red **Security** chip, the top bar
-  sums them fleet-wide (*Updates N* / *Security updates N*, click to filter),
-  and the chip opens an **Updates modal** driven through the audited
-  reverse-proxy — package list, apply-all with the node's live progress bar and
-  log, and a Reboot-now button once the node reports a reboot is required.
-  Pending **security updates fire the webhook notifier** (info severity — the
-  status dot and public board deliberately stay calm).
+  **OS chip** plus an amber **Updates** / red **Security** chip, and a **⏻ power
+  glyph** once that host needs a reboot to finish an apply (click it to reboot,
+  confirmed). The chip opens a per-host **Updates modal** driven through the
+  audited reverse-proxy — package list, apply-all or security-only with the
+  node's live progress bar and log, and Reboot now. The top-bar *Updates* /
+  *Security updates* pills open a **Fleet updates** view of every host with
+  something pending: **Apply all updates** and **Apply all security** patch the
+  whole fleet in one sweep (one audited proxy call per host, each node's own
+  RBAC still gating the write), with per-host progress, per-host apply/reboot,
+  and the packages counted before you confirm. Pending **security updates fire
+  the webhook notifier** (info severity — the status dot and public board
+  deliberately stay calm).
 - **Virtualization hosts too** — enroll **Proxmox VE, VMware vCenter, or
   standalone ESXi** hosts (username/password) right alongside Nexus nodes. Their
   row shows host count, running/total **VMs & containers**, CPU/RAM, and
