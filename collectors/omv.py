@@ -107,9 +107,11 @@ def collect_metrics(host, username, password, port=80, scheme='http',
                     verify_ssl=False):
     """One poll (cached session; re-login on expiry) → normalized NAS metric
     dict. Raises OmvError."""
+    from collectors import session_key
     base = f'{scheme}://{host}:{port}'
+    key = session_key(base, username, password)
     with _lock:
-        s = _sessions.get(base)
+        s = _sessions.get(key)
     if s is not None:
         try:
             return _collect(s, base)
@@ -121,7 +123,7 @@ def collect_metrics(host, username, password, port=80, scheme='http',
     except PermissionError as e:
         raise OmvError(f'authenticated but the RPC rejected the session: {e}')
     with _lock:
-        _sessions[base] = s
+        _sessions[key] = s
     return metrics
 
 

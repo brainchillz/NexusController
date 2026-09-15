@@ -99,9 +99,11 @@ def collect_metrics(host, username, password, port=80, scheme='http',
                     verify_ssl=False):
     """One poll: (cached session) GraphQL query → normalized NAS metric dict.
     Raises UnraidError."""
+    from collectors import session_key
     base = f'{scheme}://{host}:{port}'
+    key = session_key(base, username, password)
     with _lock:
-        cached = _sessions.get(base)
+        cached = _sessions.get(key)
     if cached:
         try:
             data = _graphql(base, cached['session'], cached['csrf'], _QUERY)
@@ -115,7 +117,7 @@ def collect_metrics(host, username, password, port=80, scheme='http',
         raise UnraidError('authenticated but the GraphQL API rejected the '
                           'session (is the Unraid API enabled?)')
     with _lock:
-        _sessions[base] = {'session': s, 'csrf': csrf}
+        _sessions[key] = {'session': s, 'csrf': csrf}
     return build_metrics(data)
 
 

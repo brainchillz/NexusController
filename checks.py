@@ -66,7 +66,7 @@ SERVICES = [
 ]
 SERVICE_MAP = {s['id']: s for s in SERVICES}
 
-_TARGET = re.compile(r'^[A-Za-z0-9._:-]{1,253}$')   # IP (v4/v6) or hostname
+_TARGET = re.compile(r'^[A-Za-z0-9._:-]{1,253}\Z')   # IP (v4/v6) or hostname; \Z: `$` admits a trailing newline
 
 
 def clean_check(data):
@@ -161,11 +161,20 @@ def _dns_query():
     return q + b'\x00' + struct.pack('>HH', 1, 1)
 
 
+def _udp_socket(target, port, timeout):
+    """A UDP socket of the right family for the target. Hard-coding AF_INET
+    made every DNS/NTP check against an IPv6 address fail with an address-
+    family error while _TARGET happily accepted the address."""
+    fam = socket.getaddrinfo(target, port, type=socket.SOCK_DGRAM)[0][0]
+    s = socket.socket(fam, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    return s
+
+
 def _probe_dns(target, port, timeout):
     # ANY well-formed response — even REFUSED — proves a DNS server answers.
     q = _dns_query()
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.settimeout(timeout)
+    with _udp_socket(target, port, timeout) as s:
         s.sendto(q, (target, port))
         data, _ = s.recvfrom(512)
     if len(data) >= 12 and data[:2] == q[:2] and data[2] & 0x80:
@@ -176,8 +185,7 @@ def _probe_dns(target, port, timeout):
 
 def _probe_ntp(target, port, timeout):
     pkt = b'\x1b' + 47 * b'\0'   # SNTP v3 client request
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.settimeout(timeout)
+    with _udp_socket(target, port, timeout) as s:
         s.sendto(pkt, (target, port))
         data, _ = s.recvfrom(256)
     if len(data) >= 48:

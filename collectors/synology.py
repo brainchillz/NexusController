@@ -114,9 +114,11 @@ def collect_metrics(host, username, password, port=5001, verify_ssl=False,
                     scheme='https'):
     """One poll (cached session; re-login + retry when DSM drops the sid) →
     the normalized metric dict (see build_metrics). Raises SynologyError."""
+    from collectors import session_key
     base = f'{scheme}://{host}:{port}/webapi'
+    key = session_key(base, username, password)
     with _lock:
-        cached = _sessions.get(base)
+        cached = _sessions.get(key)
     if cached:
         try:
             return _collect(cached['s'], base, cached['apis'], cached['sid'])
@@ -151,7 +153,7 @@ def collect_metrics(host, username, password, port=5001, verify_ssl=False,
                                 'administrators group')
         raise SynologyError(f'authenticated but DSM rejected the fresh session: {e}')
     with _lock:
-        _sessions[base] = {'s': s, 'sid': sid, 'apis': apis}
+        _sessions[key] = {'s': s, 'sid': sid, 'apis': apis}
     return metrics
 
 

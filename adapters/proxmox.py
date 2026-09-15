@@ -6,8 +6,8 @@ from .base import NodeError
 
 # Guest ids are minted by the collector as "<kind>-<node>-<vmid>" (a node name
 # may itself contain hyphens; the vmid is always the trailing integer).
-_GUEST_ID = re.compile(r'^(qemu|lxc)-(.+)-(\d+)$')
-_NODE_NAME = re.compile(r'^[A-Za-z0-9._-]+$')
+_GUEST_ID = re.compile(r'^(qemu|lxc)-(.+)-(\d+)\Z')
+_NODE_NAME = re.compile(r'^[A-Za-z0-9._-]+\Z')
 
 
 class ProxmoxAdapter(VirtAdapter):

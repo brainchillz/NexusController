@@ -41,7 +41,12 @@ def probe_node(base_url, token):
         raise NodeError('token rejected (401) — check the token and that it is admin/readonly')
     if r.status_code != 200:
         raise NodeError(f'unexpected response (HTTP {r.status_code})')
-    data = r.json()
+    try:
+        data = r.json()
+    except ValueError:
+        raise NodeError('non-JSON response from /api/me (is this a Nexus Dashboard URL?)')
+    if not isinstance(data, dict):
+        raise NodeError('unexpected /api/me shape (is this a Nexus Dashboard URL?)')
     return {
         'cert_fp': fp,
         'role': data.get('role'),

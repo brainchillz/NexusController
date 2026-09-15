@@ -128,9 +128,11 @@ def collect_metrics(host, username, password, port=9443, verify_ssl=False,
                     scheme='https'):
     """One poll (cached token; re-login + retry when UGOS expires it) → the
     normalized metric dict (see build_metrics). Raises UgreenError."""
+    from collectors import session_key
     base = f'{scheme}://{host}:{port}'
+    key = session_key(base, username, password)
     with _lock:
-        cached = _sessions.get(base)
+        cached = _sessions.get(key)
     if cached:
         try:
             return _collect(cached['s'], base, cached['token'])
@@ -145,7 +147,7 @@ def collect_metrics(host, username, password, port=9443, verify_ssl=False,
     except PermissionError as e:
         raise UgreenError(f'authenticated but UGOS rejected the fresh token: {e}')
     with _lock:
-        _sessions[base] = {'s': s, 'token': token}
+        _sessions[key] = {'s': s, 'token': token}
     return metrics
 
 

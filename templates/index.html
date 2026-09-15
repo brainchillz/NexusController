@@ -368,6 +368,13 @@ const API = {
 };
 
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+// A value going INTO a JS string inside an onclick attribute. esc() alone is
+// wrong there: the browser HTML-decodes the attribute before parsing it as
+// JS, so esc("Dave's NAS") → &#39; → ' again and the handler is a syntax
+// error (or, from a hostile node's service key, injected script). JSON gives
+// a double-quoted JS literal with the quotes and backslashes escaped; esc()
+// then protects it from the HTML parser.
+function jsArg(v){return esc(JSON.stringify(v==null?'':v));}
 function show(id,on){document.getElementById(id).style.display = on ? '' : 'none';}
 
 // ── Generic dialog (replaces native confirm()/prompt()/alert()) ──
@@ -731,7 +738,7 @@ function overviewView(){
     const list=groups[c]; if(!list||!list.length) return;
     any=true;
     list.sort((a,b)=> nodeRank(a)-nodeRank(b) || String(a.name).localeCompare(String(b.name)));
-    html += '<div class="hgroup"><div class="hgroup-h">'+c+' <span class="muted">('+list.length+')</span></div>'
+    html += '<div class="hgroup"><div class="hgroup-h">'+esc(c)+' <span class="muted">('+list.length+')</span></div>'
           + list.map(nodeRow).join('') + '</div>';
   });
   if(!any) html += '<div class="muted">'+((tagFilter.size||hostFilter||statusFilter)?'No hosts match the current filter.':'No hosts enrolled yet.')+'</div>';
@@ -822,10 +829,10 @@ function networkBar(name, net, forceState, url){
     + thruBox('WAN', net.wan_rx_bps, net.wan_tx_bps, wanCls,
               'WAN throughput now. Status: '+net.wan_status)
     + thruBox('LAN', net.lan_rx_bps, net.lan_tx_bps, '', 'LAN throughput now')
-    + statBox('Clients', net.clients,
+    + statBox('Clients', esc(net.clients),
               (net.wireless||0)+' wifi · '+(net.wired||0)+' wired', '',
               'Devices online: '+(net.devices_online||0)+' of '+(net.devices_total||0))
-    + statBox('Internet', lat==null?'—':lat+' <span class="u">ms</span>', 'latency', latCls,
+    + statBox('Internet', lat==null?'—':esc(lat)+' <span class="u">ms</span>', 'latency', latCls,
               'Round-trip latency reported by the gateway')
     + statBox(issueLbl, issueVal, bad.length?bad.map(x=>x.name).join(', '):'none', issueCls,
               issueTooltip(net))
@@ -967,7 +974,7 @@ function nodeRow(n){
   const actions = (rm && n.disabled ? '<button class="btn-open" title="Resume monitoring for this host" onclick="resumeNode(\''+esc(n.id)+'\')">Resume</button>' : '')
     + (n.ok && openable ? '<a class="btn-open" href="'+openUrl+'" target="_blank" rel="noopener">'+openLbl+'</a>':'')
     + (hasGuests ? '<button class="btn-open" title="View / control guests" onclick="openGuests(\''+esc(n.id)+'\')"><svg class="ico ico-sm"><use href="#i-mon"/></svg> Guests</button>' : '')
-    + (rm && certChanged ? '<button class="btn-open" style="border-color:var(--bad);color:var(--bad)" title="Certificate changed — review and re-pin" onclick="openRepin(\''+esc(n.id)+'\',\''+esc(n.name)+'\')"><svg class="ico ico-sm"><use href="#i-lock"/></svg> Review cert</button>' : '');
+    + (rm && certChanged ? '<button class="btn-open" style="border-color:var(--bad);color:var(--bad)" title="Certificate changed — review and re-pin" onclick="openRepin('+jsArg(n.id)+','+jsArg(n.name)+')"><svg class="ico ico-sm"><use href="#i-lock"/></svg> Review cert</button>' : '');
   // Edit/Remove live in Settings → Hosts now — the overview rows are pure
   // monitoring (plus contextual repair actions: Resume, Review cert).
 
@@ -1126,13 +1133,13 @@ function checksView(){
     const acts = '<span class="ck-acts">'
       + (oper ? '<button class="x" title="Run now" onclick="runCheck(\''+esc(c.id)+'\')">↻</button>' : '')
       + (admin ? '<button class="x edit" title="Edit" onclick="openCheck(\''+esc(c.id)+'\')">✎</button>'
-               + '<button class="x" title="Delete" onclick="delCheck(\''+esc(c.id)+'\',\''+esc(c.name)+'\')">×</button>' : '')
+               + '<button class="x" title="Delete" onclick="delCheck('+jsArg(c.id)+','+jsArg(c.name)+')">×</button>' : '')
       + '</span>';
     return tr(['<span class="dot '+dot+'"></span> '+state,
       '<b>'+esc(c.name)+'</b>', esc(svc ? svc.label : c.service),
       esc(c.target+':'+c.port),
       c.node_name ? esc(c.node_name) : '<span class="muted">—</span>',
-      r.latency_ms!=null ? r.latency_ms+' ms' : '',
+      r.latency_ms!=null ? esc(r.latency_ms)+' ms' : '',
       esc(r.detail||''),
       '<span class="muted" title="'+esc(r.ts||'')+'">'+(r.ts ? fmtAgo(r.ts) : '')+'</span>',
       acts]);
@@ -1274,7 +1281,7 @@ function servicesView(){
       const sv = svcs[k];
       if(!sv) return '<span class="muted">—</span>';
       return '<span class="sd click '+svcState(sv)+'" title="'+esc(sv.active)+' / '+esc(sv.enabled)
-        +' — click to manage" onclick="openSvc(\''+esc(n.id)+'\',\''+esc(k)+'\')"></span>';
+        +' — click to manage" onclick="openSvc('+jsArg(n.id)+','+jsArg(k)+')"></span>';
     }));
     return tr(cells);
   });
@@ -1527,7 +1534,7 @@ async function loadHostsSection(){
           esc(host), esc(port), '<span class="muted small">'+esc(kind)+'</span>',
           '<span class="ck-acts">'
           + '<button class="x edit" title="Edit" onclick="openEdit(\''+esc(n.id)+'\')">✎</button>'
-          + '<button class="x" title="Remove" onclick="removeNode(\''+esc(n.id)+'\',\''+esc(n.name)+'\')">×</button>'
+          + '<button class="x" title="Remove" onclick="removeNode('+jsArg(n.id)+','+jsArg(n.name)+')">×</button>'
           + '</span>']);
       });
     b.innerHTML = '<table class="tbl"><thead>'+tr(['Name','Address','Port','Kind',''],'th')
@@ -1715,7 +1722,7 @@ async function renderUpdates(){
   if(ap.reboot_required)
     head += '<div class="small" style="color:var(--warn);margin:4px 0"><b>Reboot required</b> to finish applying updates. '
       + (wr ? '<button class="btn-open" onclick="updReboot()">Reboot now</button>' : '')+'</div>';
-  const avN = u.available||0, secN = u.security||0;
+  const avN = Number(u.available)||0, secN = Number(u.security)||0;   // node-supplied: coerce, never interpolate raw
   head += avN
     ? '<div class="small" style="margin:4px 0"><b>'+avN+'</b> update'+(avN>1?'s':'')+' pending'
       + (secN ? ' — <span class="bad"><b>'+secN+'</b> security</span>' : '')
@@ -1867,8 +1874,8 @@ function renderFleetUpdates(){
 
   const rows = hosts.map(n=>{
     const u = fuState[n.id] || {}, ap = u.apply || {}, su = (n.summary||{}).updates || {};
-    const avN = u.available != null ? u.available : (su.available||0);
-    const secN = u.security != null ? u.security : (su.security||0);
+    const avN = Number(u.available != null ? u.available : su.available)||0;
+    const secN = Number(u.security != null ? u.security : su.security)||0;
     const reboot = !!(ap.reboot_required || su.reboot_required);
     let state;
     if(fuErr[n.id]) state = '<span class="bad small">'+esc(fuErr[n.id])+'</span>';

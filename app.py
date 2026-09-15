@@ -20,7 +20,7 @@ import socket
 import secrets
 import threading
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from urllib3.exceptions import InsecureRequestWarning
@@ -29,6 +29,7 @@ from flask import (Flask, jsonify, request, session, send_from_directory, g,
                    Response, redirect)
 from flask_sock import Sock
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.exceptions import HTTPException
 
 import sso
 from cryptography.fernet import Fernet, InvalidToken
@@ -58,7 +59,7 @@ urllib3.disable_warnings(InsecureRequestWarning)
 app = Flask(__name__, static_url_path='')
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = '0.13.0'
+APP_VERSION = '0.13.1'
 
 
 def env_bool(name, default):
@@ -139,8 +140,50 @@ def load_json(path, default):
         return default
 
 
+# Read-modify-write guards. write_json_atomic keeps a FILE from tearing; it
+# does nothing for two threads that each load -> mutate -> save the same JSON
+# (gunicorn is one worker, many threads, plus the monitor loop). The registry
+# is the live case: _build_fleet refreshes last_seen every cycle while an
+# admin enrolls or deletes a node in a request thread — whichever saved
+# second used to win, silently dropping the other's change. Network I/O
+# (probes, fan-out) is always done BEFORE taking the lock.
+_CFG_LOCK = threading.RLock()
+_REG_LOCK = threading.RLock()
+
+
 def err(msg, code=400):
     return jsonify({'success': False, 'error': msg}), code
+
+
+def _s(v):
+    """Request field -> stripped string. A number or null where a string was
+    expected used to AttributeError on .strip() and 500 the request."""
+    if v is None:
+        return ''
+    return (v if isinstance(v, str) else str(v)).strip()
+
+
+def _qnum(name, default, lo, hi, cast=int):
+    """Clamped numeric query parameter; junk falls back to the default rather
+    than raising ValueError out of the view (an HTML 500 to the SPA)."""
+    try:
+        v = cast(request.args.get(name, default))
+    except (TypeError, ValueError):
+        v = default
+    return min(hi, max(lo, v))
+
+
+@app.errorhandler(Exception)
+def _unhandled(e):
+    """Every unhandled exception answers JSON. The SPA's API helper parses
+    every body; werkzeug's HTML 500 page reached it as "Unexpected token '<'"
+    with the real cause only in the server log. HTTPExceptions (404, 405,
+    400 from a malformed JSON body) keep their own responses."""
+    if isinstance(e, HTTPException):
+        return e
+    app.logger.exception('unhandled exception on %s %s', request.method, request.path)
+    return jsonify({'success': False,
+                    'error': 'Internal error: %s: %s' % (type(e).__name__, str(e)[:300])}), 500
 
 
 # ─── Config / auth bootstrap ──────────────────────────────────────────
@@ -156,12 +199,13 @@ def _fernet():
     """Fernet for encrypting node tokens at rest. The key lives in the (0600)
     auth file; a node token is admin-equivalent on that node, so the registry is
     a high-value secret store."""
-    cfg = load_config()
-    key = cfg.get('fernet_key')
-    if not key:
-        key = Fernet.generate_key().decode()
-        cfg['fernet_key'] = key
-        save_config(cfg)
+    with _CFG_LOCK:
+        cfg = load_config()
+        key = cfg.get('fernet_key')
+        if not key:
+            key = Fernet.generate_key().decode()
+            cfg['fernet_key'] = key
+            save_config(cfg)
     return Fernet(key.encode())
 
 
@@ -177,6 +221,11 @@ def decrypt_secret(ciphertext):
 
 
 def ensure_bootstrap():
+    with _CFG_LOCK:
+        return _ensure_bootstrap_locked()
+
+
+def _ensure_bootstrap_locked():
     cfg = load_config()
     changed = False
     if not cfg.get('secret_key'):
@@ -338,6 +387,12 @@ def require_login():
     if request.method in ('POST', 'PUT', 'DELETE', 'PATCH') and request.endpoint not in RBAC_EXEMPT:
         if role == 'viewer':
             return err('Read-only account: action not permitted', 403)
+    # The websocket bridge is a GET, so the method rule never sees it — yet it
+    # hands the browser a shell on the node (the node's console wants an
+    # ADMIN token, which is exactly what the controller enrolled). Read-only
+    # must mean read-only there too.
+    if request.endpoint == 'node_ws' and role == 'viewer':
+        return err('Read-only account: console access not permitted', 403)
     return None
 
 
@@ -379,7 +434,7 @@ def audit_matches(entry, q):
 def audit_list():
     """Tail of the controller audit trail, newest first (admin). `q` filters by
     substring across all fields; `limit` caps the result (default 200)."""
-    limit = min(1000, max(1, int(request.args.get('limit', 200) or 200)))
+    limit = _qnum('limit', 200, 1, 1000)
     q = (request.args.get('q') or '').strip().lower()
     entries = []
     try:
@@ -464,6 +519,12 @@ def login_throttled(ip, user, now=None):
 def login_failed(ip, user, now=None):
     now = time.time() if now is None else now
     with _login_lock:
+        # Only the keys a login touches were ever pruned, so a username spray
+        # from many addresses grew the table without bound. Sweep it whole
+        # once it gets large.
+        if len(_login_fails) > 5000:
+            for k in list(_login_fails):
+                _prune_fails(k, now)
         _login_fails.setdefault(('ip', ip), []).append(now)
         _login_fails.setdefault(('user', ip, user), []).append(now)
 
@@ -493,23 +554,32 @@ def _client_ip():
 
 @app.route('/api/login', methods=['POST'])
 def api_login():
-    data = request.get_json() or {}
-    user = (data.get('username') or '').strip()
+    data = request.get_json(silent=True) or {}
+    user = _s(data.get('username'))[:64]
     pw = data.get('password') or ''
+    if not isinstance(pw, str):
+        pw = str(pw)
     ip = _client_ip()
+    # Logins are PUBLIC_ENDPOINTS, which the after_request audit skips — so a
+    # brute-force attempt or a throttle trip never reached audit.log. Record
+    # them here, with the username as the target.
     if login_throttled(ip, user):
+        audit_line('POST', request.path, 'login:%s (throttled)' % user, 429)
         return err('Too many failed attempts — try again in a few minutes', 429)
     rec = _users().get(user)
     if not rec:
         check_password_hash(_DUMMY_HASH, pw)   # equalize timing for unknown users
         login_failed(ip, user)
+        audit_line('POST', request.path, 'login:%s (failed)' % user, 401)
         return err('Invalid credentials', 401)
     if not check_password_hash(rec.get('password', ''), pw):
         login_failed(ip, user)
+        audit_line('POST', request.path, 'login:%s (failed)' % user, 401)
         return err('Invalid credentials', 401)
     login_succeeded(ip, user)
     session.permanent = True
     session['user'] = user
+    audit_line('POST', request.path, 'login:%s' % user, 200)
     return jsonify({'success': True, 'user': user, 'role': _user_role(rec),
                     'must_change': bool(rec.get('must_change'))})
 
@@ -637,22 +707,23 @@ def change_password():
     user = session.get('user')
     if not user:
         return err('Only an interactive session can change a password', 401)
-    cfg = load_config()
-    rec = cfg.get('users', {}).get(user)
-    if not rec or not check_password_hash(rec.get('password', ''), data.get('old_password') or ''):
-        return err('Current password is incorrect')
     new = data.get('new_password') or ''
-    if len(new) < MIN_PASSWORD_LEN:
+    if not isinstance(new, str) or len(new) < MIN_PASSWORD_LEN:
         return err(f'New password must be at least {MIN_PASSWORD_LEN} characters')
-    rec['password'] = generate_password_hash(new)
-    rec.pop('must_change', None)
-    cfg['users'][user] = rec
-    save_config(cfg)
+    with _CFG_LOCK:
+        cfg = load_config()
+        rec = cfg.get('users', {}).get(user)
+        if not rec or not check_password_hash(rec.get('password', ''), data.get('old_password') or ''):
+            return err('Current password is incorrect')
+        rec['password'] = generate_password_hash(new)
+        rec.pop('must_change', None)
+        cfg['users'][user] = rec
+        save_config(cfg)
     return jsonify({'success': True})
 
 
 # ─── Controller user management (admin) ───────────────────────────────
-RE_USERNAME = re.compile(r'^[A-Za-z0-9._-]{1,32}$')
+RE_USERNAME = re.compile(r'^[A-Za-z0-9._-]{1,32}\Z')   # \Z: `$` also matches before a trailing newline
 
 
 @app.route('/api/users')
@@ -678,23 +749,24 @@ def users_add():
         return err('username must be 1–32 chars: letters, digits, . _ -')
     if role not in ROLES:
         return err('role must be one of: %s' % ', '.join(ROLES))
-    if len(pw) < MIN_PASSWORD_LEN:
+    if not isinstance(pw, str) or len(pw) < MIN_PASSWORD_LEN:
         return err(f'password must be at least {MIN_PASSWORD_LEN} characters')
-    cfg = load_config()
-    if user in cfg.get('users', {}):
-        return err('user already exists')
     # Optional scope: a named preset ("role") OR literal tags — the preset
     # wins when both arrive. Admins are always fleet-wide — no dead scope.
-    preset = (data.get('scope_preset') or '').strip() if role != 'admin' else ''
-    if preset and preset not in _scope_presets():
-        return err('unknown scope preset: %s' % preset)
+    preset = _s(data.get('scope_preset')) if role != 'admin' else ''
     tags = clean_scope_tags(data.get('tags')) if (role != 'admin' and not preset) else []
-    rec = {'password': generate_password_hash(pw), 'role': role, 'must_change': True,
-           'tags': tags}
-    if preset:
-        rec['scope_preset'] = preset
-    cfg.setdefault('users', {})[user] = rec
-    save_config(cfg)
+    with _CFG_LOCK:
+        cfg = load_config()
+        if user in cfg.get('users', {}):
+            return err('user already exists', 409)
+        if preset and preset not in (cfg.get('scope_presets') or {}):
+            return err('unknown scope preset: %s' % preset)
+        rec = {'password': generate_password_hash(pw), 'role': role, 'must_change': True,
+               'tags': tags}
+        if preset:
+            rec['scope_preset'] = preset
+        cfg.setdefault('users', {})[user] = rec
+        save_config(cfg)
     g.audit_target = 'user:%s (%s%s)' % (user, role,
                                          ' @' + (preset or ','.join(tags)) if (preset or tags) else '')
     return jsonify({'success': True})
@@ -704,6 +776,11 @@ def users_add():
 def users_update(user):
     """Change a user's role and/or reset their password (admin)."""
     data = request.get_json() or {}
+    with _CFG_LOCK:
+        return _users_update_locked(user, data)
+
+
+def _users_update_locked(user, data):
     cfg = load_config()
     rec = cfg.get('users', {}).get(user)
     if not isinstance(rec, dict):
@@ -716,14 +793,14 @@ def users_update(user):
             return err('cannot remove your own admin role')
         rec['role'] = data['role']
     if data.get('password'):
-        if len(data['password']) < MIN_PASSWORD_LEN:
+        if not isinstance(data['password'], str) or len(data['password']) < MIN_PASSWORD_LEN:
             return err(f'password must be at least {MIN_PASSWORD_LEN} characters')
         rec['password'] = generate_password_hash(data['password'])
         rec['must_change'] = True   # operator-set password → force a change on first login
     # Scope: a named preset and literal tags are mutually exclusive — setting
     # one clears the other; scope_preset:'' or tags:[] clears the scope.
     if 'scope_preset' in data or 'tags' in data:
-        preset = (data.get('scope_preset') or '').strip()
+        preset = _s(data.get('scope_preset'))
         if preset and preset not in (cfg.get('scope_presets') or {}):
             return err('unknown scope preset: %s' % preset)
         if rec.get('role') == 'admin':
@@ -743,17 +820,18 @@ def users_update(user):
 @app.route('/api/users/<user>', methods=['DELETE'])
 def users_delete(user):
     """Remove a controller login (admin). Can't delete yourself or the last admin."""
-    cfg = load_config()
-    users = cfg.get('users', {})
-    if user not in users:
-        return err('user not found', 404)
     if user == g.identity_name:
         return err('cannot delete your own account')
-    admins = [u for u, r in users.items() if _user_role(r) == 'admin']
-    if _user_role(users[user]) == 'admin' and len(admins) <= 1:
-        return err('cannot delete the last admin')
-    del users[user]
-    save_config(cfg)
+    with _CFG_LOCK:
+        cfg = load_config()
+        users = cfg.get('users', {})
+        if user not in users:
+            return err('user not found', 404)
+        admins = [u for u, r in users.items() if _user_role(r) == 'admin']
+        if _user_role(users[user]) == 'admin' and len(admins) <= 1:
+            return err('cannot delete the last admin')
+        del users[user]
+        save_config(cfg)
     g.audit_target = 'user:%s (deleted)' % user
     return jsonify({'success': True})
 
@@ -769,15 +847,16 @@ def scope_presets_save():
     """Create or update one named preset (admin). Users referencing it by
     name re-scope immediately — presets resolve at request time."""
     data = request.get_json() or {}
-    name = (data.get('name') or '').strip()
+    name = _s(data.get('name'))
     if not RE_USERNAME.match(name):
         return err('preset name must be 1–32 chars: letters, digits, . _ -')
     tags = clean_scope_tags(data.get('tags'))
     if not tags:
         return err('a preset needs at least one tag')
-    cfg = load_config()
-    cfg.setdefault('scope_presets', {})[name] = tags
-    save_config(cfg)
+    with _CFG_LOCK:
+        cfg = load_config()
+        cfg.setdefault('scope_presets', {})[name] = tags
+        save_config(cfg)
     g.audit_target = 'scope-preset:%s = %s' % (name, ','.join(tags))
     return jsonify({'success': True})
 
@@ -786,16 +865,17 @@ def scope_presets_save():
 def scope_presets_delete(name):
     """Remove a preset (admin) — refused while any login references it, so a
     scoped account can never silently lose (or gain) access."""
-    cfg = load_config()
-    presets = cfg.get('scope_presets') or {}
-    if name not in presets:
-        return err('preset not found', 404)
-    holders = [u for u, r in cfg.get('users', {}).items()
-               if isinstance(r, dict) and r.get('scope_preset') == name]
-    if holders:
-        return err('preset is in use by: %s' % ', '.join(sorted(holders)))
-    del presets[name]
-    save_config(cfg)
+    with _CFG_LOCK:
+        cfg = load_config()
+        presets = cfg.get('scope_presets') or {}
+        if name not in presets:
+            return err('preset not found', 404)
+        holders = [u for u, r in cfg.get('users', {}).items()
+                   if isinstance(r, dict) and r.get('scope_preset') == name]
+        if holders:
+            return err('preset is in use by: %s' % ', '.join(sorted(holders)))
+        del presets[name]
+        save_config(cfg)
     g.audit_target = 'scope-preset:%s (deleted)' % name
     return jsonify({'success': True})
 
@@ -819,13 +899,13 @@ def host_types():
 def nodes_test():
     """Test-connection without enrolling. operator+ (not viewer)."""
     data = request.get_json() or {}
-    base_url = (data.get('base_url') or '').strip()
-    host_type = (data.get('host_type') or 'nexus').strip()
+    base_url = _s(data.get('base_url'))
+    host_type = _s(data.get('host_type')) or 'nexus'
     if not base_url:
         return err('base_url is required')
-    creds = {'token': (data.get('token') or '').strip(),
-             'username': (data.get('username') or '').strip(),
-             'password': data.get('password') or '',
+    creds = {'token': _s(data.get('token')),
+             'username': _s(data.get('username')),
+             'password': _s(data.get('password')) if not isinstance(data.get('password'), str) else data['password'],
              'verify_ssl': bool(data.get('verify_ssl'))}
     try:
         info = _probe_host(host_type, base_url, creds)
@@ -855,11 +935,14 @@ def nodes_test():
 def nodes_add():
     """Enroll a node. Admin-only (ADMIN_ONLY)."""
     data = request.get_json() or {}
-    name = (data.get('name') or '').strip()
-    base_url = (data.get('base_url') or '').strip()
-    host_type = (data.get('host_type') or 'nexus').strip()
-    token = (data.get('token') or '').strip()
-    tags = data.get('tags') or []
+    name = _s(data.get('name'))
+    base_url = _s(data.get('base_url'))
+    host_type = _s(data.get('host_type')) or 'nexus'
+    token = _s(data.get('token'))
+    # A string here used to be iterated character by character ("prod" ->
+    # tags p, r, o, d); clean_scope_tags trims, dedupes and caps like the
+    # user-scope tags these are matched against.
+    tags = clean_scope_tags(data.get('tags'))
     if not name or not base_url:
         return err('name and base_url are required')
     if host_type not in ADAPTERS:
@@ -870,21 +953,20 @@ def nodes_add():
         if not manual_type:
             return err('invalid type')
     creds = {'token': token,
-             'username': (data.get('username') or '').strip(),
-             'password': data.get('password') or '',
+             'username': _s(data.get('username')),
+             'password': data.get('password') if isinstance(data.get('password'), str) else '',
              'verify_ssl': bool(data.get('verify_ssl'))}
     try:
         info = _probe_host(host_type, base_url, creds)
     except NodeError as e:
         return err(f'connection test failed: {e}', 502)
-    reg = load_nodes()
     nid = secrets.token_hex(8)
     node = {
         'id': nid, 'name': name, 'base_url': base_url.rstrip('/'),
         'host_type': host_type,
         'cert_fp': info['cert_fp'], 'role': info.get('role'),
         'version': info.get('version'), 'capabilities': info.get('capabilities', []),
-        'tags': [str(t) for t in tags if isinstance(t, (str, int, float))],
+        'tags': tags,
         'added_at': datetime.now().astimezone().isoformat(timespec='seconds'),
         'last_seen': None,
     }
@@ -923,8 +1005,12 @@ def nodes_add():
     node['type_pinned'] = bool(manual_type)
     if host_type != 'nexus' and info.get('metrics'):
         _virt_seed_cache(node, info['metrics'])  # so the card renders immediately
-    reg.setdefault('nodes', []).append(node)
-    save_nodes(reg)
+    with _REG_LOCK:   # the probe above is network I/O — done before the lock
+        reg = load_nodes()
+        reg.setdefault('nodes', []).append(node)
+        save_nodes(reg)
+    with _fleet_lock:
+        _fleet_cache['ts'] = 0.0
     g.audit_target = name
     return jsonify({'success': True, 'node': _public_node(node)})
 
@@ -934,105 +1020,120 @@ def node_update(node_id):
     """Edit a node in place: name, tags, manual type override, base_url, and/or
     token. Admin-only. Changing the base_url or token triggers a re-probe (so a
     new URL's cert is re-pinned and role/version/capabilities are refreshed) —
-    no need to delete and re-enroll."""
+    no need to delete and re-enroll.
+
+    Two phases: the (slow, network) re-probe runs against a snapshot of the
+    record with no lock held; the registry is then reloaded and mutated under
+    _REG_LOCK so the monitor's concurrent last_seen save cannot drop the edit."""
     data = request.get_json() or {}
-    reg = load_nodes()
-    for n in reg.get('nodes', []):
-        if n.get('id') != node_id:
-            continue
-        if 'name' in data:
-            n['name'] = (data['name'] or '').strip() or n['name']
-        if 'tags' in data and isinstance(data['tags'], list):
-            n['tags'] = [str(t) for t in data['tags']]
-        if 'disabled' in data:
-            # Maintenance pause: the fan-out stops contacting the host and every
-            # check (dot, alerts, notifier, history sampling) is suspended until
-            # it's re-enabled. The registry record itself is untouched.
-            n['disabled'] = bool(data['disabled'])
-        if 'type' in data:
-            # 'auto' un-pins (effective type reverts to type_auto); any other
-            # cleaned label pins the manual override — a custom label becomes
-            # its own overview category.
-            if data['type'] == 'auto':
-                n['type_pinned'] = False
-                n['type'] = n.get('type_auto', 'Unknown')
-            else:
-                label = clean_type(data['type'])
-                if not label:
-                    return err('invalid type')
-                n['type'] = label
-                n['type_pinned'] = True
-
-        # A base_url/credential change → re-probe to validate and refresh the
-        # pinned cert (+ role/version/caps for nexus). Probe with the new secret
-        # if supplied, else the host's existing (decrypted) one.
-        host_type = n.get('host_type', 'nexus')
-        adapter = ADAPTERS.get(host_type) or ADAPTERS['nexus']
-        new_url = (data.get('base_url') or '').strip()
-        url_changed = bool(new_url) and new_url.rstrip('/') != n['base_url']
-        if adapter.auth == 'token':
-            new_token = (data.get('token') or '').strip()
-            verify_changed = host_type != 'nexus' and 'verify_ssl' in data
-            if url_changed or new_token or verify_changed:
-                base_url = (new_url or n['base_url']).rstrip('/')
-                token = new_token or (decrypt_secret(n.get('token_enc', '')) if n.get('token_enc') else '')
-                verify_ssl = bool(data['verify_ssl']) if 'verify_ssl' in data else bool(n.get('verify_ssl'))
-                try:
-                    info = _probe_host(host_type, base_url, {'token': token, 'verify_ssl': verify_ssl})
-                except NodeError as e:
-                    return err('connection test failed: %s' % e, 502)
-                n['base_url'] = base_url
-                n['cert_fp'] = info['cert_fp']
-                n['role'] = info.get('role')
-                n['version'] = info.get('version')
-                n['capabilities'] = info.get('capabilities', [])
-                if new_token:
-                    n['token_enc'] = encrypt_secret(new_token)
-                if host_type != 'nexus':   # truenas: refresh verify flag + reseed the card
-                    n['verify_ssl'] = verify_ssl
-                    if info.get('metrics'):
-                        _virt_seed_cache(n, info['metrics'])
+    cur = next((x for x in load_nodes().get('nodes', []) if x.get('id') == node_id), None)
+    if not cur:
+        return err('node not found', 404)
+    edits = {}
+    if 'name' in data:
+        edits['name'] = _s(data['name']) or cur['name']
+    if 'tags' in data and isinstance(data['tags'], list):
+        edits['tags'] = clean_scope_tags(data['tags'])
+    if 'disabled' in data:
+        # Maintenance pause: the fan-out stops contacting the host and every
+        # check (dot, alerts, notifier, history sampling) is suspended until
+        # it's re-enabled. The registry record itself is untouched.
+        edits['disabled'] = bool(data['disabled'])
+    if 'type' in data:
+        # 'auto' un-pins (effective type reverts to type_auto); any other
+        # cleaned label pins the manual override — a custom label becomes
+        # its own overview category.
+        if data['type'] == 'auto':
+            edits['type_pinned'] = False
+            edits['type'] = cur.get('type_auto', 'Unknown')
         else:
-            new_pw = data.get('password') or ''
-            new_user = (data.get('username') or '').strip()
-            user_changed = bool(new_user) and new_user != n.get('username')
-            if url_changed or new_pw or user_changed or 'verify_ssl' in data:
-                base_url = (new_url or n['base_url']).rstrip('/')
-                username = new_user or n.get('username', '')
-                password = new_pw or (decrypt_secret(n.get('password_enc', '')) or '')
-                verify_ssl = bool(data['verify_ssl']) if 'verify_ssl' in data else bool(n.get('verify_ssl'))
-                try:
-                    info = _probe_host(host_type, base_url,
-                                       {'username': username, 'password': password, 'verify_ssl': verify_ssl})
-                except NodeError as e:
-                    return err('connection test failed: %s' % e, 502)
-                n['base_url'] = base_url
-                n['cert_fp'] = info['cert_fp']
-                n['username'] = username
-                n['verify_ssl'] = verify_ssl
-                if new_pw:
-                    n['password_enc'] = encrypt_secret(new_pw)
-                if info.get('metrics'):
-                    _virt_seed_cache(n, info['metrics'])
+            label = clean_type(data['type'])
+            if not label:
+                return err('invalid type')
+            edits['type'] = label
+            edits['type_pinned'] = True
 
+    # A base_url/credential change → re-probe to validate and refresh the
+    # pinned cert (+ role/version/caps for nexus). Probe with the new secret
+    # if supplied, else the host's existing (decrypted) one.
+    host_type = cur.get('host_type', 'nexus')
+    adapter = ADAPTERS.get(host_type) or ADAPTERS['nexus']
+    new_url = _s(data.get('base_url'))
+    url_changed = bool(new_url) and new_url.rstrip('/') != cur['base_url']
+    seed = None
+    if adapter.auth == 'token':
+        new_token = _s(data.get('token'))
+        verify_changed = host_type != 'nexus' and 'verify_ssl' in data
+        if url_changed or new_token or verify_changed:
+            base_url = (new_url or cur['base_url']).rstrip('/')
+            token = new_token or (decrypt_secret(cur.get('token_enc', '')) if cur.get('token_enc') else '')
+            verify_ssl = bool(data['verify_ssl']) if 'verify_ssl' in data else bool(cur.get('verify_ssl'))
+            try:
+                info = _probe_host(host_type, base_url, {'token': token, 'verify_ssl': verify_ssl})
+            except NodeError as e:
+                return err('connection test failed: %s' % e, 502)
+            edits.update(base_url=base_url, cert_fp=info['cert_fp'], role=info.get('role'),
+                         version=info.get('version'), capabilities=info.get('capabilities', []))
+            if new_token:
+                edits['token_enc'] = encrypt_secret(new_token)
+            if host_type != 'nexus':   # truenas: refresh verify flag + reseed the card
+                edits['verify_ssl'] = verify_ssl
+                seed = info.get('metrics')
+    else:
+        new_pw = data.get('password') if isinstance(data.get('password'), str) else ''
+        new_user = _s(data.get('username'))
+        user_changed = bool(new_user) and new_user != cur.get('username')
+        if url_changed or new_pw or user_changed or 'verify_ssl' in data:
+            base_url = (new_url or cur['base_url']).rstrip('/')
+            username = new_user or cur.get('username', '')
+            password = new_pw or (decrypt_secret(cur.get('password_enc', '')) or '')
+            verify_ssl = bool(data['verify_ssl']) if 'verify_ssl' in data else bool(cur.get('verify_ssl'))
+            try:
+                info = _probe_host(host_type, base_url,
+                                   {'username': username, 'password': password, 'verify_ssl': verify_ssl})
+            except NodeError as e:
+                return err('connection test failed: %s' % e, 502)
+            edits.update(base_url=base_url, cert_fp=info['cert_fp'], username=username,
+                         verify_ssl=verify_ssl)
+            if new_pw:
+                edits['password_enc'] = encrypt_secret(new_pw)
+            seed = info.get('metrics')
+
+    with _REG_LOCK:
+        reg = load_nodes()
+        n = next((x for x in reg.get('nodes', []) if x.get('id') == node_id), None)
+        if not n:
+            return err('node not found', 404)
+        n.update(edits)
         save_nodes(reg)
-        with _fleet_lock:   # reflect edits on the next fleet view
-            _fleet_cache['ts'] = 0.0
-        g.audit_target = n['name']
-        return jsonify({'success': True, 'node': _public_node(n)})
-    return err('node not found', 404)
+    if seed:
+        _virt_seed_cache(n, seed)
+    with _fleet_lock:   # reflect edits on the next fleet view
+        _fleet_cache['ts'] = 0.0
+    g.audit_target = n['name']
+    return jsonify({'success': True, 'node': _public_node(n)})
 
 
 @app.route('/api/nodes/<node_id>', methods=['DELETE'])
 def node_delete(node_id):
     """Remove a node from the registry. Admin-only."""
-    reg = load_nodes()
-    before = len(reg.get('nodes', []))
-    target = next((n['name'] for n in reg.get('nodes', []) if n.get('id') == node_id), None)
-    reg['nodes'] = [n for n in reg.get('nodes', []) if n.get('id') != node_id]
-    if len(reg['nodes']) == before:
-        return err('node not found', 404)
-    save_nodes(reg)
+    with _REG_LOCK:
+        reg = load_nodes()
+        before = len(reg.get('nodes', []))
+        target = next((n['name'] for n in reg.get('nodes', []) if n.get('id') == node_id), None)
+        reg['nodes'] = [n for n in reg.get('nodes', []) if n.get('id') != node_id]
+        if len(reg['nodes']) == before:
+            return err('node not found', 404)
+        save_nodes(reg)
+    # Nothing of the host may outlive the record: its cached poll, its
+    # first-seen timestamps, and the fleet snapshot (which otherwise kept the
+    # row on screen for up to FLEET_CACHE_TTL).
+    adapters.evict_cache(node_id)
+    with _health_lock:
+        for k in [k for k in _health_since if k[0] == node_id]:
+            del _health_since[k]
+    with _fleet_lock:
+        _fleet_cache['ts'] = 0.0
     g.audit_target = target
     return jsonify({'success': True})
 
@@ -1072,9 +1173,8 @@ def node_repin(node_id):
     what the admin saw — so a certificate that flips again between review and
     click is rejected rather than blindly trusted."""
     data = request.get_json() or {}
-    expected = (data.get('expected') or '').strip().lower().replace(':', '')
-    reg = load_nodes()
-    n = next((x for x in reg.get('nodes', []) if x.get('id') == node_id), None)
+    expected = _s(data.get('expected')).lower().replace(':', '')
+    n = next((x for x in load_nodes().get('nodes', []) if x.get('id') == node_id), None)
     if not n:
         return err('node not found', 404)
     if not (n.get('base_url') or '').lower().startswith('https'):
@@ -1092,8 +1192,13 @@ def node_repin(node_id):
     if observed == old:
         return jsonify({'success': True, 'cert_fp': observed, 'previous': old,
                         'unchanged': True, 'node': _public_node(n)})
-    n['cert_fp'] = observed
-    save_nodes(reg)
+    with _REG_LOCK:
+        reg = load_nodes()
+        n = next((x for x in reg.get('nodes', []) if x.get('id') == node_id), None)
+        if not n:
+            return err('node not found', 404)
+        n['cert_fp'] = observed
+        save_nodes(reg)
     with _fleet_lock:   # drop the cached error envelope so the row recovers now
         _fleet_cache['ts'] = 0.0
     adapters.evict_cache(node_id)  # clear any stale polled error envelope
@@ -1124,8 +1229,15 @@ def _virt_seed_cache(node, metrics):
 
 
 def _fetch_one(node):
-    """Fan-out one host through its host-type adapter (nexus is the default)."""
-    return _adapter_for(node).fetch(node)
+    """Fan-out one host through its host-type adapter (nexus is the default).
+    fetch() MUST NOT raise by contract; if one ever does, it becomes that
+    host's error envelope rather than a 500 for the whole fleet view."""
+    try:
+        return _adapter_for(node).fetch(node)
+    except Exception as e:   # noqa: BLE001 — one host must never sink the fleet
+        out = adapters.base_envelope(node)
+        out['error'] = adapters.base.envelope_error(node, e)
+        return out
 
 
 def _services_down(summary):
@@ -1154,8 +1266,8 @@ def compute_rollup(results):
         nas = r.get('nas') or {}         # NAS hosts report alerts/pool health here
         n_alerts = len(s.get('alerts') or []) + (nas.get('alerts') or 0)
         alerts += n_alerts
-        used += r.get('used_bytes', 0)
-        size += r.get('size_bytes', 0)
+        used += r.get('used_bytes') or 0
+        size += r.get('size_bytes') or 0
         down = _services_down(s)
         svc_down += down
         zfs = s.get('zfs') or {}
@@ -1232,6 +1344,16 @@ def _build_fleet():
                 results.append(fut.result())
     # Refresh last_seen + type_auto for reachable nodes (best-effort).
     seen = {r['id']: r for r in results}
+    with _REG_LOCK:
+        _refresh_registry_from_results(seen)
+    flag_version_skew(results)
+    return _build_fleet_finish(results)
+
+
+def _refresh_registry_from_results(seen):
+    """last_seen / type_auto / version / capabilities self-heal from a fan-out.
+    Caller holds _REG_LOCK: the load-mutate-save here races every enroll,
+    edit and delete otherwise."""
     reg = load_nodes()
     dirty = False
     for n in reg.get('nodes', []):
@@ -1253,7 +1375,9 @@ def _build_fleet():
             dirty = True
     if dirty:
         save_nodes(reg)
-    flag_version_skew(results)
+
+
+def _build_fleet_finish(results):
     _attach_svc_checks(results)   # pinned service checks → env, before health folds
     # Fold each host's warning+ conditions (failed services, degraded pools,
     # stale polls, alerts, unreachable — same set the notifier fires on) into
@@ -1271,22 +1395,39 @@ def _build_fleet():
                 e['since'] = _health_since.setdefault(k, now_iso)
             if entries:
                 r['health'] = entries
-        ids = {r['id'] for r in results}
-        for k in [k for k in _health_since if k[0] in ids and k not in live]:
-            del _health_since[k]   # cleared → a re-fire gets a fresh timestamp
+        # Anything not live is gone: cleared (a re-fire gets a fresh
+        # timestamp) or the host itself was removed (the old `k[0] in ids`
+        # guard kept a deleted host's keys forever).
+        for k in [k for k in _health_since if k not in live]:
+            del _health_since[k]
     results.sort(key=lambda r: r['name'].lower())
     return {'nodes': results, 'rollup': compute_rollup(results),
             'generated_at': datetime.now().astimezone().isoformat(timespec='seconds')}
 
 
-def _refresh_fleet():
+_build_lock = threading.Lock()
+
+
+def _refresh_fleet(max_age=None):
     """Build the fleet and store it in the shared cache. Used by the HTTP
-    endpoint and the background monitor so both share one recent snapshot."""
-    data = _build_fleet()
-    with _fleet_lock:
-        _fleet_cache['data'] = data
-        _fleet_cache['ts'] = time.time()
-    return data
+    endpoint and the background monitor so both share one recent snapshot.
+
+    One build at a time: with the cache just expired, every SPA tab's 15s
+    poll plus the monitor used to start its own fan-out to every node at
+    once. Callers queue on _build_lock, and a caller that passes `max_age`
+    takes the snapshot the previous builder just produced instead of building
+    again. Returns (data, built)."""
+    with _build_lock:
+        if max_age is not None:
+            with _fleet_lock:
+                age = time.time() - _fleet_cache['ts']
+                if _fleet_cache['data'] is not None and age < max_age:
+                    return _fleet_cache['data'], False
+        data = _build_fleet()
+        with _fleet_lock:
+            _fleet_cache['data'] = data
+            _fleet_cache['ts'] = time.time()
+    return data, True
 
 
 @app.route('/api/fleet/summary')
@@ -1300,8 +1441,11 @@ def fleet_summary():
         if not fresh and _fleet_cache['data'] is not None and age < FLEET_CACHE_TTL:
             return jsonify({**scoped_fleet(_fleet_cache['data'], _scope()),
                             'cached': True, 'cache_age': round(age, 1)})
-    data = _refresh_fleet()
-    return jsonify({**scoped_fleet(data, _scope()), 'cached': False, 'cache_age': 0})
+    data, built = _refresh_fleet(max_age=None if fresh else FLEET_CACHE_TTL)
+    with _fleet_lock:
+        age = time.time() - _fleet_cache['ts']
+    return jsonify({**scoped_fleet(data, _scope()), 'cached': not built,
+                    'cache_age': 0 if built else round(age, 1)})
 
 
 # ─── Service checks: probe well-known services on the monitor cadence ──
@@ -1632,9 +1776,10 @@ def tuning_save():
     rec, e = clean_tuning(request.get_json() or {})
     if e:
         return err(e)
-    cfg = load_config()
-    cfg['tuning'] = rec
-    save_config(cfg)
+    with _CFG_LOCK:
+        cfg = load_config()
+        cfg['tuning'] = rec
+        save_config(cfg)
     g.audit_target = 'tuning ' + json.dumps(rec, sort_keys=True)
     return jsonify({'success': True, **tuning()})
 
@@ -1732,7 +1877,12 @@ def _monitor_cycle(results):
     that is already up would otherwise never be reported."""
     snap = monitoring.snapshot_conditions(results)
     present = {(hid, key) for hid, e in snap.items() for key in e['conditions']}
+    # Paused hosts AND hosts no longer in the registry: a deleted unreachable
+    # host used to "recover" on the next cycle — one last "reachable again"
+    # webhook for a machine that had just been removed.
     paused = {r['id'] for r in results if r.get('disabled')}
+    known = set(snap)
+    gone = lambda hid: hid in paused or hid not in known
     now = time.time()
     flap = tuning()['flap_cycles']
     fire, recover = [], []
@@ -1741,10 +1891,11 @@ def _monitor_cycle(results):
         # A paused host's conditions vanish (host_conditions returns {}), but
         # that must read as "stop tracking", not "recovered" — drop its state
         # silently so disabling never notifies and re-enabling starts fresh.
-        for pk in [pk for pk in _mon['active'] if pk[0] in paused]:
+        for pk in [pk for pk in _mon['active'] if gone(pk[0])]:
             _mon['active'].discard(pk)
             _mon['detail'].pop(pk, None)
-        for pk in [pk for pk in streak if pk[0] in paused]:
+            _mon['last_fire'].pop(pk, None)
+        for pk in [pk for pk in streak if gone(pk[0])]:
             del streak[pk]
         # advance streaks
         for pk in present:
@@ -1824,7 +1975,7 @@ def _monitor_loop():
     while True:
         try:
             _run_all_checks()   # before the refresh so envelopes fold fresh results
-            data = _refresh_fleet()
+            data, _ = _refresh_fleet()
             _monitor_cycle(data['nodes'] + _check_monitor_envs())
             try:
                 # Paused hosts record no samples (a maintenance window must not
@@ -1842,8 +1993,8 @@ def history_spark():
     """Compact recent CPU series per host for the Overview sparklines. One call
     returns every host: {host_id: [v, …]} downsampled to `buckets` points over
     the last `hours`."""
-    hours = min(168, max(1, float(request.args.get('hours', 6))))
-    buckets = min(60, max(4, int(request.args.get('buckets', 24))))
+    hours = _qnum('hours', 6.0, 1, 168, float)
+    buckets = _qnum('buckets', 24, 4, 60)
     metric = request.args.get('metric', 'cpu')
     hist = get_history()
     out = {}
@@ -1860,7 +2011,7 @@ def history_spark():
 def history_summary():
     """Per-host availability% + storage capacity forecast over `hours` (default
     7 days), plus a fleet storage forecast. Feeds the Storage tab."""
-    hours = min(720, max(1, float(request.args.get('hours', 168))))
+    hours = _qnum('hours', 168.0, 1, 720, float)
     hist = get_history()
     reg = load_nodes().get('nodes', [])
     seen = {}
@@ -1894,8 +2045,8 @@ def history_host(host_id):
     """Full CPU+mem series for one host (detail view)."""
     if not _find_node(host_id):
         return err('node not found', 404)
-    hours = min(720, max(1, float(request.args.get('hours', 24))))
-    buckets = min(200, max(4, int(request.args.get('buckets', 96))))
+    hours = _qnum('hours', 24.0, 1, 720, float)
+    buckets = _qnum('buckets', 96, 4, 200)
     hist = get_history()
     return jsonify({
         'host_id': host_id, 'hours': hours,
@@ -1920,24 +2071,30 @@ def notifications_save():
     stored URL (so the masked display can be re-saved without re-entering the
     token)."""
     data = request.get_json() or {}
-    cfg = load_config()
-    existing = {h.get('id'): h for h in (cfg.get('notifications') or {}).get('webhooks', [])}
-    hooks = []
-    for h in data.get('webhooks', []):
-        hid = h.get('id') or secrets.token_hex(6)
-        url = (h.get('url') or '').strip()
-        if not url and hid in existing:
-            url = existing[hid]['url']   # keep stored token
-        if not url:
-            continue
-        fmt = h.get('format', 'gchat')
-        sev = h.get('min_severity', 'warning')
-        if sev not in monitoring.SEVERITY:
-            sev = 'warning'
-        hooks.append({'id': hid, 'name': (h.get('name') or 'webhook').strip(),
-                      'url': url, 'format': fmt, 'min_severity': sev})
-    cfg['notifications'] = {'enabled': bool(data.get('enabled')), 'webhooks': hooks}
-    save_config(cfg)
+    incoming = data.get('webhooks')
+    if not isinstance(incoming, list):
+        incoming = []
+    with _CFG_LOCK:
+        cfg = load_config()
+        existing = {h.get('id'): h for h in (cfg.get('notifications') or {}).get('webhooks', [])}
+        hooks = []
+        for h in incoming:
+            if not isinstance(h, dict):
+                continue
+            hid = _s(h.get('id')) or secrets.token_hex(6)
+            url = _s(h.get('url'))
+            if not url and hid in existing:
+                url = existing[hid]['url']   # keep stored token
+            if not url.lower().startswith(('http://', 'https://')):
+                continue
+            fmt = _s(h.get('format')) or 'gchat'
+            sev = h.get('min_severity', 'warning')
+            if sev not in monitoring.SEVERITY:
+                sev = 'warning'
+            hooks.append({'id': hid, 'name': _s(h.get('name')) or 'webhook',
+                          'url': url, 'format': fmt, 'min_severity': sev})
+        cfg['notifications'] = {'enabled': bool(data.get('enabled')), 'webhooks': hooks}
+        save_config(cfg)
     g.audit_target = 'notifications (%d webhook(s))' % len(hooks)
     return jsonify({'success': True, **_public_notify_config()})
 
@@ -1959,7 +2116,7 @@ def notifications_test():
 
 
 FLEET_ACTIONS = {'start', 'stop', 'restart', 'enable', 'disable'}
-RE_SERVICE = re.compile(r'^[A-Za-z0-9_.@-]+$')
+RE_SERVICE = re.compile(r'^[A-Za-z0-9_.@-]+\Z')
 
 
 def _proxy_service_action(node, service, action):
@@ -1989,8 +2146,8 @@ def fleet_action():
     (require_login) already blocked viewer; each node still enforces its own
     token role (a readonly-token node will 403)."""
     data = request.get_json() or {}
-    service = (data.get('service') or '').strip()
-    action = (data.get('action') or '').strip()
+    service = _s(data.get('service'))
+    action = _s(data.get('action'))
     node_ids = data.get('node_ids')
     tags = data.get('tags')
     if action not in FLEET_ACTIONS:
@@ -2007,7 +2164,7 @@ def fleet_action():
     # hosts bearing ANY of the given tags ("restart smbd on everything tagged
     # prod"). No selector = every node that has the service.
     if isinstance(node_ids, list) and node_ids:
-        wanted = set(node_ids)
+        wanted = {str(i) for i in node_ids}
         nodes = [n for n in nodes if n['id'] in wanted]
         scope = '%d node(s)' % len(nodes)
     elif isinstance(tags, list) and tags:
@@ -2214,6 +2371,13 @@ def node_proxy(node_id, subpath):
 sock = Sock(app)
 
 
+def _ws_is_tls(node):
+    """A plain-http node (agent behind a proxy, an http:// enrollment) has no
+    certificate: wrapping its socket in TLS just failed the bridge with a
+    handshake error. Match the scheme the node was enrolled with."""
+    return (node.get('base_url') or '').lower().startswith('https://')
+
+
 def _pinned_ws_connect(node, path):
     """Open a websocket to the node with the enrolled bearer token, pinning the
     TLS cert in-handshake: we establish TLS ourselves, verify the fingerprint
@@ -2223,19 +2387,23 @@ def _pinned_ws_connect(node, path):
     import hashlib as _hashlib
     import websocket as wsclient
     host, port = _split_host_port(node['base_url'])
-    ctx = _ssl._create_unverified_context()
     raw = socket.create_connection((host, port), timeout=NODE_TIMEOUT[0])
+    if not _ws_is_tls(node):
+        tls = raw
+    else:
+        ctx = _ssl._create_unverified_context()
+        try:
+            tls = ctx.wrap_socket(raw, server_hostname=host)
+        except OSError:
+            raw.close()
+            raise
     try:
-        tls = ctx.wrap_socket(raw, server_hostname=host)
-    except OSError:
-        raw.close()
-        raise
-    try:
-        fp = _hashlib.sha256(tls.getpeercert(binary_form=True)).hexdigest()
-        if node.get('cert_fp') and fp != node['cert_fp']:
-            raise NodeError('certificate fingerprint changed for %s:%s '
-                            '(pinned %s…, saw %s…)'
-                            % (host, port, node['cert_fp'][:16], fp[:16]))
+        if _ws_is_tls(node):
+            fp = _hashlib.sha256(tls.getpeercert(binary_form=True)).hexdigest()
+            if node.get('cert_fp') and fp != node['cert_fp']:
+                raise NodeError('certificate fingerprint changed for %s:%s '
+                                '(pinned %s…, saw %s…)'
+                                % (host, port, node['cert_fp'][:16], fp[:16]))
         tls.settimeout(15)
         token = decrypt_secret(node.get('token_enc', '')) or ''
         ws = wsclient.create_connection(
@@ -2353,7 +2521,7 @@ def generate_self_signed():
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         cn = socket.gethostname()
         name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)   # naive UTC, as the builder expects
         cert = (x509.CertificateBuilder()
                 .subject_name(name).issuer_name(name)
                 .public_key(key.public_key())
@@ -2470,7 +2638,7 @@ def cli_set_password(argv):
     install.sh), else prompts. Creates the user (role admin) if absent."""
     import getpass
     user = argv[2] if len(argv) > 2 else 'admin'
-    if not re.match(r'^[A-Za-z0-9._-]{1,32}$', user):
+    if not RE_USERNAME.match(user):
         print('Invalid username')
         return 1
     pw = os.environ.get('CONTROLLER_ADMIN_PASSWORD')

@@ -171,7 +171,13 @@ class NodeClient:
         r = self.request('GET', path)
         if r.status_code != 200:
             raise NodeError(f'HTTP {r.status_code}')
-        return r.json()
+        try:
+            return r.json()
+        except ValueError:
+            # A 200 that is not JSON (a captive portal, a proxy's error page,
+            # the wrong URL) used to escape as ValueError — an HTML 500 from
+            # the enroll route instead of a NodeError the caller handles.
+            raise NodeError('non-JSON response from %s (is this the right URL?)' % path)
 
     def raw_get(self, path, auth=False):
         """GET an arbitrary (non-/api) path on the node — drill-in HTML/assets.
