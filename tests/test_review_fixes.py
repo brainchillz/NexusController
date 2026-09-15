@@ -394,3 +394,25 @@ def test_spa_uses_jsarg_for_names_in_onclick_handlers():
     for site in ('openRepin(', 'removeNode(', 'delCheck(', 'openSvc('):
         assert re.search(re.escape(site) + r"'\+jsArg\(", html), site
     assert 'hgroup-h">\'+esc(c)+' in html
+
+
+# ── atomic JSON writes never leave a readable temp file behind ────────
+
+def test_write_json_atomic_creates_temp_0600_and_cleans_up_on_failure(tmp_path, monkeypatch):
+    import stat
+    target = tmp_path / 'reg.json'
+    seen = {}
+    real_replace = os.replace
+
+    def spy(src, dst):
+        seen['mode'] = stat.S_IMODE(os.stat(src).st_mode)
+        raise OSError('disk full')
+    monkeypatch.setattr(os, 'replace', spy)
+    with pytest.raises(OSError):
+        A.write_json_atomic(str(target), {'nodes': []})
+    assert seen['mode'] == 0o600                       # never 0644, even briefly
+    assert not [p for p in os.listdir(tmp_path) if '.tmp.' in p]   # no leftover
+    monkeypatch.setattr(os, 'replace', real_replace)
+    A.write_json_atomic(str(target), {'nodes': [1]})
+    assert json.load(open(target)) == {'nodes': [1]}
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o600

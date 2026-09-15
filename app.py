@@ -124,12 +124,25 @@ def write_json_atomic(path, data, mode=0o600):
     # shared tmp name lets their writes interleave (seen live: chmod on a tmp
     # the other thread had already os.replace()d away).
     tmp = f'{path}.tmp.{os.getpid()}.{threading.get_ident()}'
-    with open(tmp, 'w') as f:
-        json.dump(data, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    # Created WITH the final mode: an open()+chmod pair left the temp file at
+    # the umask default (0644) between the two calls — and for good, when the
+    # process died in between. A world-readable nodes.json.tmp.* holding the
+    # (encrypted) registry was sitting on the live volume. Any failure after
+    # creation removes the temp file rather than leaving it behind.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)   # in case an existing temp file predated the mode
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def load_json(path, default):
