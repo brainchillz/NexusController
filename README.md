@@ -94,11 +94,31 @@ top of them, not a replacement.
   posts **state-transition** events (host down/up, degraded pool, new alerts,
   certificate change, version drift) to a chat **webhook** (Google Chat, Slack,
   Discord, ntfy, or Gotify). Debounced against flapping, with all-clear
-  recovery messages. Configure under **🔔 Notify** (admin).
+  recovery messages. Each webhook can be **routed by host tag** (the storage
+  channel gets `nas` hosts, the lab channel gets `lab`). Configure under
+  Settings → **Notifications** (admin).
+- **Quiet what you already know about** — **Ack** a single condition on a
+  host (until it clears, or snoozed for hours/days, with a note): its dot,
+  wallboard pill, rollup and notifications go quiet while everything else
+  on that host stays monitored, and a recurrence alerts again. For planned
+  work, **Pause** a host for a **maintenance window**; the controller
+  resumes it itself when the window passes.
+- **Scripting & metrics** — mint an **API token** (any login; same role and
+  scope as you) for Home Assistant, cron or `curl`, and scrape
+  **`/metrics`** into Prometheus / Grafana: per-host up/CPU/memory/storage,
+  health conditions, guests, pending updates, and service-check results,
+  served from the controller's own cache so scraping never touches a host.
+- **Backup** — download the whole configuration set (users, tokens,
+  webhooks, the key that encrypts host credentials, the registry, checks,
+  SSO enrollment, TLS cert + key) as **one passphrase-encrypted bundle**;
+  restore it on the command line, or script nightly backups with
+  `app.py backup`.
 - **User management** — create operator / viewer / admin logins, reset
   passwords, all from the UI (**👥 Users**); first login on a new account
   forces a password change. Failed logins are **rate-limited** (per-account
-  and per-IP sliding windows).
+  and per-IP sliding windows). **Sign out everywhere** ends every session a
+  login holds — SSO sessions included — and a password change ends all the
+  others automatically.
 - **Audit viewer** — the controller-side audit trail (every mutation: who,
   from where, what, result) is browsable from the UI (**📜 Audit**, admin)
   with free-text filtering — no shell access needed.
@@ -114,6 +134,9 @@ top of them, not a replacement.
   **🔐 Review cert** action showing the pinned vs. now-serving fingerprint
   side-by-side; re-pinning is guarded so a certificate that changes *again*
   between review and click is refused rather than blindly trusted.
+- **Certificate expiry** — every host's serving certificate (and the
+  controller's own) is checked a few times a day; a `cert_expiring`
+  condition warns at 30 days and turns the dot amber at 14 or once expired.
 - **Control at scale** — start / stop / restart / enable / disable services on a
   node, view its logs, or run a **fleet-wide action** ("restart `smbd`
   everywhere", or only on nodes tagged `prod`) with per-node success/failure
@@ -200,6 +223,8 @@ sudo CONTROLLER_ADMIN_PASSWORD='choose-a-strong-one' ./install.sh
 | `CONTROLLER_TLS` | `1` | `1` = HTTPS, `0` = HTTP (e.g. behind a TLS proxy) |
 | `CONTROLLER_HSTS` | `0` | `1` = send `Strict-Transport-Security` (opt-in: HSTS is per hostname, not per port — enable once a real cert and a dedicated name are in place) |
 | `CONTROLLER_TRUSTED_PROXY` | *(none)* | IP of a reverse proxy whose `X-Forwarded-For` / `X-Forwarded-Host` are honoured (client IP for the login throttle + audit; public host for the cross-site guard) |
+| `CONTROLLER_CERT_CHECK_INTERVAL` | `21600` | seconds between certificate-expiry sweeps of the fleet |
+| `CONTROLLER_BACKUP_PASSPHRASE` | *(prompt)* | passphrase for `app.py backup` / `app.py restore` when run non-interactively (cron) |
 | `CONTROLLER_ADMIN_PASSWORD` | *(random)* | Seed the admin password |
 
 After install, browse to `https://<host>:9443` and log in as `admin`. Get the
@@ -234,6 +259,8 @@ install, and the service must be **restarted to apply**:
   sudo systemctl restart nexus-controller
   ```
   `app.py cert-info` prints the current cert's subject / issuer / expiry.
+  The other subcommands: `set-password`, `backup <out.ncb>`, and
+  `restore <in.ncb> [--force]` (see *Backup / restore* under Files & state).
 
 Or run HTTP-only (`CONTROLLER_TLS=0`) behind a reverse proxy that terminates TLS.
 
@@ -480,9 +507,13 @@ All under the install dir (`/opt/nexus-controller`), mode `0600`, gitignored:
 | File | Contents |
 |------|----------|
 | `controller-auth.json` | secret key, Fernet key, controller users, API tokens, webhooks |
-| `nodes.json` | the node registry (encrypted tokens, cert fingerprints) |
-| `audit.log` | append-only controller audit trail |
-| `certs/` | auto-generated self-signed TLS cert |
+| `nodes.json` | the node registry (encrypted tokens, cert fingerprints, pause windows) |
+| `checks.json` | service-check definitions |
+| `acks.json` | acknowledged conditions (who, until when, note) |
+| `sso.json` | the SSO enrollment made from the Settings page (absent when SSO is set by env or not enrolled) |
+| `history.db` | 30-day metrics ring buffer (SQLite; disposable, not backed up) |
+| `audit.log` | append-only controller audit trail (not backed up) |
+| `certs/` | auto-generated self-signed TLS cert (replace via Settings → Certificate or `install-cert`) |
 
 **Backup / restore:** Settings → *Backup* downloads every config file as one
 passphrase-encrypted bundle (`.ncb`: auth incl. the Fernet key, users, API
