@@ -416,3 +416,27 @@ def test_write_json_atomic_creates_temp_0600_and_cleans_up_on_failure(tmp_path, 
     A.write_json_atomic(str(target), {'nodes': [1]})
     assert json.load(open(target)) == {'nodes': [1]}
     assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
+
+
+# ── stale temp files from a process killed mid-write ──────────────────
+
+def test_sweep_stale_tmp_removes_only_this_files_leftovers(tmp_path):
+    """A container recreate that lands between os.open and os.replace leaves
+    `<file>.tmp.<pid>.<tid>` behind (seen live after the v0.14.0 deploy). The
+    startup sweep takes exactly those — never the file itself, a sibling
+    state file's temps, or anything else in the dir."""
+    reg = tmp_path / 'nodes.json'
+    reg.write_text('{"nodes": []}')
+    (tmp_path / 'nodes.json.tmp.7.134280553162432').write_text('')
+    (tmp_path / 'nodes.json.tmp.7.99').write_text('partial')
+    (tmp_path / 'controller-auth.json.tmp.7.1').write_text('')   # another file's
+    (tmp_path / 'nodes.json.pre-upgrade').write_text('backup')    # operator backup
+    removed = A.sweep_stale_tmp(str(reg))
+    assert sorted(removed) == ['nodes.json.tmp.7.134280553162432', 'nodes.json.tmp.7.99']
+    left = sorted(os.listdir(tmp_path))
+    assert left == ['controller-auth.json.tmp.7.1', 'nodes.json', 'nodes.json.pre-upgrade']
+    assert reg.read_text() == '{"nodes": []}'
+
+
+def test_sweep_stale_tmp_tolerates_a_missing_dir(tmp_path):
+    assert A.sweep_stale_tmp(str(tmp_path / 'nowhere' / 'nodes.json')) == []

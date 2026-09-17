@@ -2188,8 +2188,9 @@ async function loadUsers(){
       + '<td style="text-align:right">'
       + (u.role==='admin'?'':'<button class="x" title="edit scope" onclick="scopeUser('
           + esc(JSON.stringify(u.username)+','+JSON.stringify(u.scope_preset||'')+','+JSON.stringify((u.tags||[]).join(', ')))+')"><svg class="ico ico-sm"><use href="#i-tag"/></svg></button>')
-      + '<button class="x" title="reset password" onclick="resetUser(\''+esc(u.username)+'\')"><svg class="ico ico-sm"><use href="#i-key"/></svg></button>'
-      + (u.username===me.user?'':'<button class="x" title="delete" onclick="delUser(\''+esc(u.username)+'\')">×</button>')
+      + '<button class="x" title="reset password" onclick="resetUser('+jsArg(u.username)+')"><svg class="ico ico-sm"><use href="#i-key"/></svg></button>'
+      + '<button class="x" title="sign out everywhere (all sessions, SSO included)" onclick="revokeUser('+jsArg(u.username)+')"><svg class="ico ico-sm"><use href="#i-power"/></svg></button>'
+      + (u.username===me.user?'':'<button class="x" title="delete" onclick="delUser('+jsArg(u.username)+')">×</button>')
       + '</td></tr>').join('');
   }catch(e){ tb.innerHTML='<tr><td colspan="4" class="bad">'+esc(e.message)+'</td></tr>'; }
 }
@@ -2260,6 +2261,14 @@ async function delUser(u){
   if(!(await uiConfirm('Delete user', 'Delete controller user "'+u+'"?', {okLabel:'Delete', danger:true}))) return;
   try{ await API.del('users/'+encodeURIComponent(u)); loadUsers(); }
   catch(e){ document.getElementById('us-msg').innerHTML='<span class="bad">'+esc(e.message)+'</span>'; }
+}
+async function revokeUser(u){
+  const self = u === me.user;
+  if(!await uiConfirm('Sign out everywhere', 'End every active session for "'+u+'"'
+      + (self ? ' except this one' : '') + ' — browser logins and SSO sessions alike? They can sign in again straight away.')) return;
+  try{ await API.put('users/'+encodeURIComponent(u), {revoke_sessions: true});
+    document.getElementById('us-msg').innerHTML='<span class="ok-txt">All sessions for '+esc(u)+' ended.</span>';
+  }catch(e){ document.getElementById('us-msg').innerHTML='<span class="bad">'+esc(e.message)+'</span>'; }
 }
 async function resetUser(u){
   const pw = await uiPrompt('Reset password', 'New password for "'+u+'" (min 8 chars; they must change it on next login):',

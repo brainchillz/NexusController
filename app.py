@@ -20,6 +20,7 @@ import socket
 import secrets
 import threading
 from collections import deque
+from urllib.parse import urlsplit
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -59,7 +60,7 @@ urllib3.disable_warnings(InsecureRequestWarning)
 app = Flask(__name__, static_url_path='')
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = '0.13.1'
+APP_VERSION = '0.14.1'
 
 
 def env_bool(name, default):
@@ -106,6 +107,14 @@ _DUMMY_HASH = generate_password_hash('nexus-controller-dummy')
 # Controller roles, most→least privilege. admin manages nodes + full control;
 # operator controls existing nodes but can't enroll/remove; viewer is read-only.
 ROLES = ('admin', 'operator', 'viewer')
+# Methods that change state — the cross-site guard and the viewer rule key
+# off this set (the websocket bridge is added by endpoint name).
+WRITE_METHODS = ('POST', 'PUT', 'DELETE', 'PATCH')
+# Strict-Transport-Security is OPT-IN: HSTS is keyed by hostname, not port,
+# so on a host that also serves plain HTTP elsewhere it would break those —
+# and browsers ignore it for self-signed certs and bare IPs anyway. Set it
+# once a real cert and a dedicated name are in place.
+HSTS_ENABLED = env_bool('CONTROLLER_HSTS', False)
 
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
@@ -143,6 +152,31 @@ def write_json_atomic(path, data, mode=0o600):
         except OSError:
             pass
         raise
+
+
+def sweep_stale_tmp(path):
+    """Remove `<path>.tmp.*` siblings a KILLED process left behind. The
+    write_json_atomic cleanup runs on any exception, but not for a process
+    that is simply gone — a container recreate landing mid-write leaves a
+    0-byte temp next to the registry (seen live, one per such deploy).
+    Called from main() ONLY, at startup: no writer exists in this process
+    yet and the previous instance is dead, so anything matching is stale by
+    definition. Returns the names removed (pure enough to unit-test)."""
+    d, base = os.path.split(path)
+    prefix = base + '.tmp.'
+    removed = []
+    try:
+        names = os.listdir(d or '.')
+    except OSError:
+        return removed
+    for n in names:
+        if n.startswith(prefix):
+            try:
+                os.unlink(os.path.join(d or '.', n))
+                removed.append(n)
+            except OSError:
+                pass
+    return removed
 
 
 def load_json(path, default):
@@ -372,6 +406,35 @@ ADMIN_ONLY = {'sso_status', 'sso_enroll', 'sso_disable',
               'scope_presets_list', 'scope_presets_save', 'scope_presets_delete'}
 
 
+def _session_gen(rec):
+    """A user's current session generation. Every session is stamped with it
+    at login; bumping it (password change/reset, explicit revoke) signs that
+    user out everywhere at once. Records and cookies from before this existed
+    both read as 0, so an upgrade invalidates nothing."""
+    if not isinstance(rec, dict):
+        return 0
+    try:
+        return int(rec.get('session_gen') or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _start_session(user, rec):
+    """THE one place a login becomes a session. The password route and the
+    SSO callback both land here, so every session — however it was earned —
+    carries the generation stamp and starts from a cleared (fixation-proof)
+    cookie."""
+    session.clear()
+    session['user'] = user
+    session['gen'] = _session_gen(rec)
+    session.permanent = True
+
+
+def _bump_session_gen(rec):
+    """Invalidate every existing session for this record (caller saves)."""
+    rec['session_gen'] = _session_gen(rec) + 1
+
+
 def _resolve_identity():
     user = session.get('user')
     if user:
@@ -380,12 +443,64 @@ def _resolve_identity():
         # valid — reject it rather than granting the leftover cookie any role.
         if rec is None:
             return None, None
+        # A session from before the user's last password change / revoke.
+        try:
+            gen = int(session.get('gen') or 0)
+        except (TypeError, ValueError):
+            gen = -1
+        if gen != _session_gen(rec):
+            return None, None
         return user, _user_role(rec)
     return None, None
 
 
+def cross_site_request(method, endpoint, own_hosts, origin, fetch_site):
+    """True when a browser-originated request must be refused as cross-site.
+    Pure → unit-tested.
+
+    Defence in depth behind SameSite=Lax: applies only to state-changing
+    methods and the websocket bridge (a GET that hands out a shell). A GET
+    navigation is never judged — the SSO callback arrives exactly that way
+    (cross-site, top-level, no Origin) and must keep landing.
+
+    Origin, when present, is compared by host[:port] only: behind a
+    TLS-terminating proxy the scheme the browser saw is not the one the app
+    sees. `own_hosts` is the set of names this request may legitimately have
+    been addressed to (the Host header, plus X-Forwarded-Host from the
+    trusted proxy). Without an Origin, Sec-Fetch-Site decides; a request that
+    carries neither is not from a browser and passes."""
+    if method not in WRITE_METHODS and endpoint != 'node_ws':
+        return False
+    own = {h.strip().lower() for h in own_hosts if h}
+    if origin is not None:
+        o = origin.strip().lower()
+        if o == 'null':
+            return True
+        return urlsplit(o).netloc not in own
+    if fetch_site is not None:
+        return fetch_site.strip().lower() not in ('same-origin', 'none')
+    return False
+
+
+def _own_hosts():
+    hosts = {request.host}
+    if _TRUSTED_PROXY and request.remote_addr == _TRUSTED_PROXY:
+        fwd = request.headers.get('X-Forwarded-Host', '').split(',')[0].strip()
+        if fwd:
+            hosts.add(fwd)
+    return hosts
+
+
 @app.before_request
 def require_login():
+    # Cross-site writes are refused BEFORE the public-endpoint exemption so a
+    # login-CSRF (logging the victim into the attacker's account) is covered
+    # too. GETs — the SSO callback among them — never reach this rule.
+    if cross_site_request(request.method, request.endpoint, _own_hosts(),
+                          request.headers.get('Origin'),
+                          request.headers.get('Sec-Fetch-Site')):
+        audit_line(request.method, request.path, 'cross-site request refused', 403)
+        return err('Cross-site request refused', 403)
     if request.endpoint in PUBLIC_ENDPOINTS:
         return None
     name, role = _resolve_identity()
@@ -397,7 +512,7 @@ def require_login():
     if request.endpoint in ADMIN_ONLY and role != 'admin':
         return err('Admin role required', 403)
     # viewer is read-only: no state-changing methods.
-    if request.method in ('POST', 'PUT', 'DELETE', 'PATCH') and request.endpoint not in RBAC_EXEMPT:
+    if request.method in WRITE_METHODS and request.endpoint not in RBAC_EXEMPT:
         if role == 'viewer':
             return err('Read-only account: action not permitted', 403)
     # The websocket bridge is a GET, so the method rule never sees it — yet it
@@ -430,8 +545,44 @@ def audit_line(method, path, target, status):
 
 @app.after_request
 def _audit(resp):
-    if request.method in ('POST', 'PUT', 'DELETE', 'PATCH') and request.endpoint not in PUBLIC_ENDPOINTS:
+    if request.method in WRITE_METHODS and request.endpoint not in PUBLIC_ENDPOINTS:
         audit_line(request.method, request.path, getattr(g, 'audit_target', None), resp.status_code)
+    return resp
+
+
+# The SPA is one inline script with onclick handlers, so script-src needs
+# 'unsafe-inline' — the CSP's value here is everything else: no external
+# scripts/styles/connections, no framing (clickjacking), no <base> hijack,
+# no plugins. The drill-in routes serve a NODE's page, not ours, and get only
+# the framing rule (its assets are proxied same-origin; its plugins are not
+# ours to constrain).
+_CSP_SELF = ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
+             "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+             "connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; "
+             "form-action 'self'; object-src 'none'")
+_CSP_DRILLIN = "frame-ancestors 'none'"
+DRILLIN_ENDPOINTS = {'node_drillin', 'node_static', 'node_plugin_asset', 'node_ws'}
+
+
+def security_headers(endpoint, path, tls, hsts):
+    """Headers for one response (pure → unit-tested). See _CSP_SELF."""
+    h = {'X-Content-Type-Options': 'nosniff',
+         'X-Frame-Options': 'DENY',
+         'Referrer-Policy': 'strict-origin-when-cross-origin',
+         'Content-Security-Policy': (_CSP_DRILLIN if endpoint in DRILLIN_ENDPOINTS
+                                     else _CSP_SELF)}
+    if path.startswith('/api/'):
+        h['Cache-Control'] = 'no-store'   # JSON carries session-scoped state
+    if tls and hsts:
+        h['Strict-Transport-Security'] = 'max-age=31536000'
+    return h
+
+
+@app.after_request
+def _secure_headers(resp):
+    for k, v in security_headers(request.endpoint, request.path,
+                                 TLS_ENABLED, HSTS_ENABLED).items():
+        resp.headers.setdefault(k, v)
     return resp
 
 
@@ -590,8 +741,7 @@ def api_login():
         audit_line('POST', request.path, 'login:%s (failed)' % user, 401)
         return err('Invalid credentials', 401)
     login_succeeded(ip, user)
-    session.permanent = True
-    session['user'] = user
+    _start_session(user, rec)
     audit_line('POST', request.path, 'login:%s' % user, 200)
     return jsonify({'success': True, 'user': user, 'role': _user_role(rec),
                     'must_change': bool(rec.get('must_change'))})
@@ -674,11 +824,10 @@ def sso_callback():
     dest = sso.safe_next(request.args.get('next'))
     if not sub:
         return redirect('/?sso_error=1', code=302)
-    if _users().get(sub) is None:
+    rec = _users().get(sub)
+    if rec is None:
         return redirect('/?sso_error=unknown_user', code=302)
-    session.clear()          # session fixation: never reuse a pre-login id
-    session['user'] = sub
-    session.permanent = True
+    _start_session(sub, rec)   # cleared first: never reuse a pre-login id
     g.audit_user = sub
     return redirect(dest, code=302)
 
@@ -730,8 +879,14 @@ def change_password():
             return err('Current password is incorrect')
         rec['password'] = generate_password_hash(new)
         rec.pop('must_change', None)
+        # A changed password ends every OTHER session for this user (a
+        # stolen cookie stops working). This one is re-stamped so the flow
+        # that just changed it — incl. the forced first-login change —
+        # carries on signed in.
+        _bump_session_gen(rec)
         cfg['users'][user] = rec
         save_config(cfg)
+    session['gen'] = _session_gen(rec)
     return jsonify({'success': True})
 
 
@@ -810,6 +965,9 @@ def _users_update_locked(user, data):
             return err(f'password must be at least {MIN_PASSWORD_LEN} characters')
         rec['password'] = generate_password_hash(data['password'])
         rec['must_change'] = True   # operator-set password → force a change on first login
+        _bump_session_gen(rec)      # …and the old password's sessions die with it
+    if data.get('revoke_sessions'):
+        _bump_session_gen(rec)      # "sign out everywhere" — SSO sessions included
     # Scope: a named preset and literal tags are mutually exclusive — setting
     # one clears the other; scope_preset:'' or tags:[] clears the scope.
     if 'scope_preset' in data or 'tags' in data:
@@ -826,7 +984,9 @@ def _users_update_locked(user, data):
             rec['tags'] = clean_scope_tags(data.get('tags')) if rec.get('role') != 'admin' else []
     cfg['users'][user] = rec
     save_config(cfg)
-    g.audit_target = 'user:%s' % user
+    if user == g.identity_name:
+        session['gen'] = _session_gen(rec)   # revoking yourself keeps THIS session
+    g.audit_target = 'user:%s%s' % (user, ' (sessions revoked)' if data.get('revoke_sessions') else '')
     return jsonify({'success': True})
 
 
@@ -2677,6 +2837,9 @@ def cli_set_password(argv):
 def main():
     cfg = ensure_bootstrap()
     app.secret_key = cfg['secret_key']
+    for f in (AUTH_FILE, NODES_FILE, CHECKS_FILE):
+        for n in sweep_stale_tmp(f):
+            print('startup: removed stale temp file %s' % n, flush=True)
     if TLS_ENABLED:
         ensure_tls_cert()
     print(f'Nexus Controller v{APP_VERSION} on {"https" if TLS_ENABLED else "http"}://0.0.0.0:{PORT}', flush=True)
