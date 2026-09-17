@@ -198,6 +198,8 @@ sudo CONTROLLER_ADMIN_PASSWORD='choose-a-strong-one' ./install.sh
 | `CONTROLLER_SERVICE` | `nexus-controller` | systemd unit name |
 | `CONTROLLER_PORT` | `9443` | Listen port |
 | `CONTROLLER_TLS` | `1` | `1` = HTTPS, `0` = HTTP (e.g. behind a TLS proxy) |
+| `CONTROLLER_HSTS` | `0` | `1` = send `Strict-Transport-Security` (opt-in: HSTS is per hostname, not per port — enable once a real cert and a dedicated name are in place) |
+| `CONTROLLER_TRUSTED_PROXY` | *(none)* | IP of a reverse proxy whose `X-Forwarded-For` / `X-Forwarded-Host` are honoured (client IP for the login throttle + audit; public host for the cross-site guard) |
 | `CONTROLLER_ADMIN_PASSWORD` | *(random)* | Seed the admin password |
 
 After install, browse to `https://<host>:9443` and log in as `admin`. Get the
@@ -400,6 +402,19 @@ login references it.
 - **RBAC** enforced centrally (viewer can't write; enroll/remove is admin-only).
 - **Audit log** of every controller-side mutation (operator, node, method, path,
   result) — in addition to the node's own audit.
+- **Cross-site request guard:** every state-changing request and the console
+  websocket bridge must come from the controller's own origin (`Origin`, else
+  `Sec-Fetch-Site`), on top of the `SameSite=Lax` session cookie. Refusals
+  are audited. Non-browser clients (no such headers) are unaffected. GET
+  navigations are never judged, so the SSO callback keeps landing.
+- **Response headers:** a Content-Security-Policy (no external scripts,
+  styles or connections; no framing; no `<base>` hijack), `X-Frame-Options`,
+  `nosniff`, a referrer policy, `Cache-Control: no-store` on the API, and
+  opt-in HSTS. Drill-in pages (a node's own SPA) get only the framing rule.
+- **Session revocation:** sessions carry the user's generation stamp; a
+  password change (other sessions), an admin reset, or **sign out
+  everywhere** (Users table) bumps it, ending every session for that user at
+  once — SSO-minted sessions included, which have no other revocation hook.
 
 ## Files & state
 
@@ -441,7 +456,7 @@ changes do matter: a node's `base_url` is stored in the registry; update it with
 | `*` | `/api/nodes/<id>/proxy/<path>` | reverse-proxy to a node's `/api/<path>` |
 | `GET` | `/nodes/<id>/` | drill-in: the node's SPA, retargeted |
 | `WS` | `/nodes/<id>/ws/<path>` | drill-in websocket bridge (node console) |
-| `GET/POST/PUT/DELETE` | `/api/users…` | controller login management (admin) |
+| `GET/POST/PUT/DELETE` | `/api/users…` | controller login management (admin); `PUT` with `{"revoke_sessions": true}` signs that user out everywhere |
 | `GET/POST` | `/api/notifications` (+`/test`) | webhook notification config (admin) |
 | `GET` | `/api/notifications/events` | recent monitor state transitions (admin) |
 | `GET` | `/api/audit` | audit-trail tail, filterable (admin) |
