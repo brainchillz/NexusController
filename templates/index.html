@@ -66,6 +66,7 @@
       <span id="updated" class="muted small"></span>
       <span id="whoami" class="muted"></span>
       <button class="ghost" onclick="refresh()">Refresh</button>
+      <button class="ghost" onclick="openTokens()" title="API tokens for scripts and integrations">API tokens</button>
       <button class="ghost" onclick="doLogout()">Sign out</button>
     </header>
 
@@ -82,6 +83,7 @@
           <button class="setsec" data-sec="users" onclick="setSection('users')"><svg class="ico ico-sm"><use href="#i-users"/></svg> Users</button>
           <button class="setsec" data-sec="notify" onclick="setSection('notify')"><svg class="ico ico-sm"><use href="#i-bell"/></svg> Notifications</button>
           <button class="setsec" data-sec="cert" onclick="setSection('cert')"><svg class="ico ico-sm"><use href="#i-lock"/></svg> Certificate</button>
+          <button class="setsec" data-sec="backup" onclick="setSection('backup')">Backup</button>
           <button class="setsec" data-sec="audit" onclick="setSection('audit')"><svg class="ico ico-sm"><use href="#i-list"/></svg> Audit</button>
           <button class="setsec" data-sec="tuning" onclick="setSection('tuning')">Tuning</button>
         </div>
@@ -89,8 +91,8 @@
         <div id="set-hosts" class="set-sec">
           <h2>Enrolled Hosts</h2>
           <p class="muted small">The connection registry — how the controller reaches each host.
-            Status and metrics live on the Overview; pausing/resuming monitoring is in each
-            host's Edit dialog.</p>
+            Status and metrics live on the Overview; <b>Pause</b> stands monitoring &amp; alerts
+            down for a host that is out of service on purpose (Resume brings it back).</p>
           <div class="row" style="margin-bottom:10px"><button onclick="openAdd()">+ Add Host</button></div>
           <div id="hosts-body" class="muted">Loading…</div>
         </div>
@@ -151,6 +153,27 @@
           </div>
         </div>
 
+        <div id="set-backup" class="set-sec" style="display:none">
+          <h2>Backup</h2>
+          <p class="muted small">Download the controller's whole configuration as <b>one encrypted
+            bundle</b>: users, API tokens and webhooks (with the key that encrypts host credentials),
+            the host registry, service checks, the SSO enrollment, and the TLS certificate + key.
+            Metrics history and the audit log are not included. Keep the passphrase — the bundle is
+            useless without it.</p>
+          <label>Passphrase (min 12 characters)<input id="bk-pass" type="password" autocomplete="new-password"></label>
+          <label>Confirm passphrase<input id="bk-pass2" type="password" autocomplete="new-password"></label>
+          <div id="bk-msg" class="small" style="min-height:18px"></div>
+          <div class="row end"><button onclick="downloadBackup()">Download backup</button></div>
+          <h3 style="margin-top:18px">Restore</h3>
+          <p class="muted small">Restore runs on the command line <b>while the controller is stopped</b>
+            (it replaces the files a running controller holds in memory), then start it again:</p>
+          <pre class="small" style="white-space:pre-wrap">python app.py restore nexus-controller-backup-….ncb            # fresh install
+python app.py restore nexus-controller-backup-….ncb --force    # overwrite existing state
+# Docker: docker compose run --rm -v "$PWD/backup.ncb:/tmp/b.ncb:ro" controller python app.py restore /tmp/b.ncb</pre>
+          <p class="muted small">The passphrase is prompted for, or read from <code>CONTROLLER_BACKUP_PASSPHRASE</code>
+            (also used by <code>python app.py backup out.ncb</code> for scheduled backups).</p>
+        </div>
+
         <div id="set-audit" class="set-sec" style="display:none">
           <h2>Audit trail</h2>
           <div class="row" style="margin:4px 0 10px">
@@ -180,6 +203,28 @@
         </div>
       </div>
     </main>
+  </div>
+
+  <!-- API tokens: mint / revoke tokens for scripting the controller -->
+  <div id="tokenModal" class="modal" style="display:none">
+    <div class="modal-card wide">
+      <div class="row"><h2 style="margin:0;flex:1">API tokens</h2>
+        <button class="x" onclick="closeTokens()">×</button></div>
+      <p class="muted small">A token lets a script or integration (Home Assistant, cron, a CLI) use the
+        API as <b>you</b> — same role, same scope — with <code>Authorization: Bearer &lt;token&gt;</code>.
+        The secret is shown <b>once</b>, at creation. A token cannot create other tokens; deleting a
+        login revokes its tokens.</p>
+      <div class="row" style="gap:8px;flex-wrap:wrap">
+        <input id="tk-name" placeholder="what it's for (e.g. home-assistant)" style="flex:1;min-width:200px" maxlength="48">
+        <button onclick="createToken()">Create token</button>
+      </div>
+      <div id="tk-new" class="small" style="display:none;margin:10px 0;padding:10px;border:1px solid var(--line-strong)">
+        <div class="muted small">Copy it now — it will not be shown again.</div>
+        <code id="tk-secret" style="user-select:all;word-break:break-all;display:block;margin-top:6px;font-size:13px"></code>
+      </div>
+      <div id="tk-msg" class="small" style="min-height:18px"></div>
+      <div id="tk-body" class="small">Loading…</div>
+    </div>
   </div>
 
   <!-- Add-host dialog -->
@@ -229,7 +274,6 @@
       <label class="ed-userpass">Username <input id="ed-user" placeholder="root@pam"></label>
       <label class="ed-userpass">New password <input id="ed-pass" type="password" placeholder="leave blank to keep current password"></label>
       <label class="ed-verify check"><input id="ed-verify" type="checkbox"> Verify the host's TLS certificate</label>
-      <label class="check"><input id="ed-disabled" type="checkbox"> Disabled — pause monitoring &amp; alerts (host out of service)</label>
       <div class="row">
         <button class="ghost" onclick="testEdit()">Test connection</button>
         <span id="ed-test" class="muted small"></span>
@@ -426,7 +470,7 @@ function uiAlert(title, body){
 
 // ── Esc closes the topmost open modal ──
 const MODAL_ORDER = ['dlgModal','detailModal','updatesModal','fupdModal','guestsModal','repinModal',
-                     'svcModal','editModal','addModal','checkModal'];
+                     'svcModal','editModal','addModal','checkModal','tokenModal'];
 document.addEventListener('keydown', e=>{
   if(e.key !== 'Escape') return;
   for(const id of MODAL_ORDER){
@@ -436,7 +480,8 @@ document.addEventListener('keydown', e=>{
         guestsModal: closeGuests, updatesModal: closeUpdates,
         fupdModal: closeFleetUpdates, repinModal: closeRepin,
         svcModal: closeSvc,
-        editModal: closeEdit, addModal: closeAdd, checkModal: closeCheck})[id]();
+        editModal: closeEdit, addModal: closeAdd, checkModal: closeCheck,
+        tokenModal: closeTokens})[id]();
       return;
     }
   }
@@ -718,7 +763,7 @@ function tagBar(){
   return '<div class="tagbar">'+filt+(tags.length?'<span class="muted small">Tags:</span>'+chips:'')+status+clear+'</div>';
 }
 // Problems first: unreachable, then warning, then healthy (name-stable within).
-function nodeRank(n){ return n.disabled ? 3 : !n.ok ? 0 : ((n.health && n.health.length) ? 1 : 2); }
+function nodeRank(n){ return n.disabled ? 3 : !n.ok ? ((n.health_acked&&n.health_acked.length&&!(n.health&&n.health.length)) ? 1 : 0) : ((n.health && n.health.length) ? 1 : 2); }
 function overviewView(){
   const groups={};
   const visible = fleet.nodes.filter(n=>matchesTags(n)&&matchesText(n)&&matchesStatus(n));
@@ -857,11 +902,17 @@ function nodeRow(n){
   // stale poll, alerts — same set the notifier fires on) drive the dot; the
   // legacy client-side signals remain as a fallback for older payloads.
   const issues = (n.health || []).map(h=>h.detail || h);
-  const warn = issues.length || alerts || n.stale || nasBad || sparkBad || dnsmaqBad;
-  const dot = n.disabled ? 'off' : n.ok ? (warn?'warn':'ok') : (awaiting?'warn':'bad');
+  const acked = n.health_acked || [];
+  // A built fleet carries server-side health (acks already removed); only a
+  // payload without it falls back to the client-side signals.
+  const srvHealth = ('health' in n) || ('health_acked' in n);
+  const warn = srvHealth ? issues.length : (alerts || n.stale || nasBad || sparkBad || dnsmaqBad);
+  const ackedDown = !n.ok && acked.length && !issues.length;   // a known, acknowledged outage
+  const dot = n.disabled ? 'off' : n.ok ? (warn?'warn':'ok') : ((awaiting||ackedDown)?'warn':'bad');
+  const ackNote = acked.length ? ' · '+acked.length+' acknowledged' : '';
   const dotTitle = n.disabled ? 'monitoring paused'
-                 : n.ok ? (issues.length ? issues.join(' · ') : (warn?'attention needed':'healthy'))
-                        : (awaiting ? 'awaiting first poll' : (n.error||'unreachable'));
+                 : n.ok ? ((issues.length ? issues.join(' · ') : (warn?'attention needed':'healthy'))+ackNote)
+                        : (awaiting ? 'awaiting first poll' : ((ackedDown?'acknowledged: ':'')+(n.error||'unreachable')));
   const rm = me && me.role==='admin';
   // version-skew warning: flagged server-side when a nexus node trails the
   // fleet's newest dashboard version.
@@ -872,7 +923,7 @@ function nodeRow(n){
 
   let mid;
   if(n.disabled){
-    mid = '<div class="hr-status muted">Paused — monitoring &amp; alerts disabled</div>';
+    mid = '<div class="hr-status muted">Paused — monitoring &amp; alerts disabled'+(n.disabled_until?' '+esc(untilText(n.disabled_until))+' (resumes automatically)':'')+'</div>';
   } else if(!n.ok){
     mid = '<div class="hr-status '+(awaiting?'muted':'err')+'">'
         + (awaiting?'Awaiting first poll…':'Unreachable: '+esc(n.error||''))+'</div>';
@@ -950,6 +1001,10 @@ function nodeRow(n){
         if(mt.predicted_tokens_seconds!=null) chips.push(chip('tok/s', Math.round(mt.predicted_tokens_seconds*10)/10));
       }
     }
+    if(n.health_acked && n.health_acked.length){
+      chips.push(chip('✓ acked', n.health_acked.length, 'muted',
+        n.health_acked.map(h=>h.detail+' — '+ackWho(h.ack)).join('\n')));
+    }
     if(n.svc_checks && n.svc_checks.length){
       const ckBad = n.svc_checks.filter(c=>c.ok===false).length;
       chips.push(chip('Checks', (n.svc_checks.length-ckBad)+'/'+n.svc_checks.length, ckBad?'bad':'',
@@ -990,10 +1045,36 @@ function svcState(sv){
   return 'off';                               // intentionally off
 }
 
-async function resumeNode(id){
-  try{ await API.put('nodes/'+id, {disabled:false}); refresh(); }
+async function resumeNode(id){ return pauseNode(id, false); }
+// Pause = monitoring + alerts stand down (host out of service on purpose);
+// the host stays enrolled and its drill-in keeps working. Pausing asks how
+// long: until resumed by hand, or a maintenance window after which the
+// monitor resumes the host itself. Lives on the Settings → Hosts row (and
+// Resume on the overview row).
+const PAUSE_CHOICES = [{value:'', label:'until I resume it'}, {value:'1', label:'1 hour'}, {value:'4', label:'4 hours'},
+                       {value:'24', label:'24 hours'}, {value:'168', label:'7 days'}, {value:'custom', label:'until a date/time…'}];
+async function pauseNode(id, on){
+  const body = {disabled: !!on};
+  if(on){
+    const n = hostsReg.find(h=>h.id===id) || nodeById(id) || {name:id};
+    const v = await uiDialog({title:'Pause monitoring', okLabel:'Pause',
+      body: n.name+': monitoring, alerts, checks and history sampling stand down. The host stays enrolled and its drill-in keeps working.',
+      fields:[{label:'For how long', type:'select', options:PAUSE_CHOICES, value:''}]});
+    if(!v) return;
+    if(v[0]==='custom'){
+      const w = await uiPrompt('Resume at', 'Date and time to resume monitoring (your local time):', {label:'Resume at', type:'datetime-local'});
+      if(!w) return;
+      const t = new Date(w); if(isNaN(t)){ await uiAlert('Invalid', 'That is not a date/time.'); return; }
+      body.disabled_until = t.toISOString();
+    } else if(v[0]){
+      body.disabled_until = new Date(Date.now() + Number(v[0])*3600*1000).toISOString();
+    }
+  }
+  try{ await API.put('nodes/'+id, body); refresh();
+       if(tab==='settings') loadHostsSection(); }
   catch(e){ await uiAlert('Error', e.message); }
 }
+function untilText(iso){ return iso ? 'until '+new Date(iso).toLocaleString() : ''; }
 async function removeNode(id,name){
   if(!(await uiConfirm('Remove host', 'Remove "'+name+'" from the controller? The host itself is untouched.',
                        {okLabel:'Remove', danger:true}))) return;
@@ -1075,10 +1156,18 @@ function fmtAgo(iso){
   if(s < 86400) return Math.round(s/3600)+'h';
   return (s/86400).toFixed(1).replace(/\.0$/,'')+'d';
 }
+function ackWho(a){
+  if(!a) return '';
+  const until = a.until ? 'until '+new Date(a.until*1000).toLocaleString() : 'until it clears';
+  return 'acknowledged by '+(a.by||'?')+' '+until+(a.note?' — '+a.note:'');
+}
 function alertsView(){
   // Status board first (same one the public landing shows), then the
-  // structured condition table for whatever needs attention.
+  // structured condition table for whatever needs attention. Acknowledged
+  // conditions stay listed, muted, with who/until — they still exist, they
+  // just no longer page anyone.
   let html = statusBoard(statusData);
+  const canAck = me && me.role!=='viewer';
   const rows = [];
   fleet.nodes.forEach(n=>{
     (n.health||[]).forEach(h=>{
@@ -1089,18 +1178,42 @@ function alertsView(){
         const msgs = (((n.summary||{}).alerts)||[]).concat((n.nas&&n.nas.alert_list)||[]);
         if(msgs.length) detail += '<div class="muted small" style="margin-top:2px">'+msgs.map(esc).join('<br>')+'</div>';
       }
-      rows.push({crit, html: tr(['<b class="hlink" onclick="openDetail(\''+esc(n.id)+'\')">'+esc(n.name)+'</b>',
+      rows.push({rank: crit?0:1, html: tr(['<b class="hlink" onclick="openDetail('+jsArg(n.id)+')">'+esc(n.name)+'</b>',
         '<span class="'+(crit?'bad':'warn')+'">'+esc(h.severity)+'</span>', detail,
-        '<span class="muted" title="'+esc(h.since||'')+'">'+fmtAgo(h.since)+'</span>'])});
+        '<span class="muted" title="'+esc(h.since||'')+'">'+fmtAgo(h.since)+'</span>',
+        canAck ? '<span class="ck-acts"><button class="x pause" title="acknowledge: quiet this condition (the host stays monitored)" onclick="ackCond('+jsArg(n.id)+','+jsArg(n.name)+','+jsArg(h.key)+','+jsArg(h.detail)+')">Ack</button></span>' : ''])});
+    });
+    (n.health_acked||[]).forEach(h=>{
+      rows.push({rank: 2, html: tr(['<b class="hlink muted" onclick="openDetail('+jsArg(n.id)+')">'+esc(n.name)+'</b>',
+        '<span class="muted">✓ acked</span>',
+        '<span class="muted">'+esc(h.detail)+'</span><div class="muted small" style="margin-top:2px">'+esc(ackWho(h.ack))+'</div>',
+        '<span class="muted" title="'+esc(h.since||'')+'">'+fmtAgo(h.since)+'</span>',
+        canAck ? '<span class="ck-acts"><button class="x pause" title="un-acknowledge" onclick="unackCond('+jsArg(n.id)+','+jsArg(h.key)+')">Unack</button></span>' : ''])});
     });
   });
   if(!rows.length) return html + '<div class="ok-txt" style="margin-top:2px">✓ No active conditions across the fleet.</div>';
-  rows.sort((a,b)=> (a.crit?0:1)-(b.crit?0:1));
+  rows.sort((a,b)=> a.rank-b.rank);
   return html
     + '<h3 class="small" style="margin:4px 0 6px">Condition detail</h3>'
-    + '<table class="tbl"><thead>'+tr(['Host','Severity','Condition','For'],'th')+'</thead>'
+    + '<table class="tbl"><thead>'+tr(['Host','Severity','Condition','For',''],'th')+'</thead>'
     + '<tbody>'+rows.map(r=>r.html).join('')+'</tbody></table>'
-    + '<p class="muted small">"For" is how long the condition has been active (tracked since the last controller restart).</p>';
+    + '<p class="muted small">"For" is how long the condition has been active (tracked since the last controller restart). '
+    + 'Ack quiets one condition — dot, wallboard and notifications — while everything else on the host stays monitored; it clears itself when the condition does, so a recurrence alerts again.</p>';
+}
+const ACK_CHOICES = [{value:'', label:'until it clears'}, {value:'4', label:'4 hours'}, {value:'24', label:'24 hours'},
+                     {value:'72', label:'3 days'}, {value:'168', label:'7 days'}];
+async function ackCond(hostId, hostName, key, detail){
+  const v = await uiDialog({title:'Acknowledge condition', okLabel:'Acknowledge',
+    body: hostName+': '+detail,
+    fields:[{label:'Quiet it', type:'select', options:ACK_CHOICES, value:''},
+            {label:'Note (optional)', placeholder:'e.g. disk on order'}]});
+  if(!v) return;
+  try{ await API.post('acks', {host_id:hostId, key, hours: v[0]||null, note: v[1]||''}); await refresh(); }
+  catch(e){ await uiAlert('Error', e.message); }
+}
+async function unackCond(hostId, key){
+  try{ await API.del('acks/'+encodeURIComponent(hostId)+'/'+encodeURIComponent(key)); await refresh(); }
+  catch(e){ await uiAlert('Error', e.message); }
 }
 function tr(cells,th){ const t=th?'th':'td'; return '<tr>'+cells.map(c=>'<'+t+'>'+c+'</'+t+'>').join('')+'</tr>'; }
 
@@ -1444,7 +1557,6 @@ function openEdit(id){
   document.getElementById('ed-user').value = n.username || '';
   document.getElementById('ed-pass').value = '';
   document.getElementById('ed-verify').checked = !!n.verify_ssl;
-  document.getElementById('ed-disabled').checked = !!n.disabled;
   document.getElementById('ed-test').textContent = ''; document.getElementById('ed-err').textContent = '';
   show('editModal', true);
 }
@@ -1482,8 +1594,7 @@ async function testEdit(){
 async function saveEdit(){
   const f = editForm(); const n = nodeById(editId); const d = htDesc(editType);
   if(f.type===''){ document.getElementById('ed-err').textContent = 'Enter a name for the custom category.'; return; }
-  const body = {name: f.name, tags: f.tags, type: f.type,
-                disabled: document.getElementById('ed-disabled').checked};
+  const body = {name: f.name, tags: f.tags, type: f.type};
   if(n && f.base_url && f.base_url !== n.base_url) body.base_url = f.base_url;  // re-probes server-side
   if(d.auth==='token'){ if(f.token) body.token = f.token; }
   else {
@@ -1501,7 +1612,7 @@ async function saveEdit(){
 let settingsSection = 'hosts';
 const SECTION_LOAD = {hosts: ()=>loadHostsSection(),
                       users: ()=>loadUsersSection(), notify: ()=>loadNotifySection(),
-                      cert: ()=>loadCertSection(), audit: ()=>loadAudit(),
+                      cert: ()=>loadCertSection(), audit: ()=>loadAudit(), backup: ()=>{},
                       tuning: ()=>loadTuning()};
 function setSection(s){
   settingsSection = s;
@@ -1530,10 +1641,12 @@ async function loadHostsSection(){
         try{ const u = new URL(n.base_url); host = u.hostname;
              port = u.port || (u.protocol==='https:' ? '443' : '80'); }catch(e){}
         const kind = (HT[n.host_type||'nexus']||{}).label || n.host_type || 'nexus';
-        return tr(['<b>'+esc(n.name)+'</b>'+(n.disabled?' <span class="muted small">(paused)</span>':''),
+        return tr(['<b>'+esc(n.name)+'</b>'+(n.disabled?' <span class="muted small">(paused'+(n.disabled_until?' '+esc(untilText(n.disabled_until)):'')+')</span>':''),
           esc(host), esc(port), '<span class="muted small">'+esc(kind)+'</span>',
           '<span class="ck-acts">'
-          + '<button class="x edit" title="Edit" onclick="openEdit(\''+esc(n.id)+'\')">✎</button>'
+          + '<button class="x edit" title="Edit" onclick="openEdit('+jsArg(n.id)+')">✎</button>'
+          + '<button class="x pause" title="'+(n.disabled?'Resume monitoring &amp; alerts':'Pause monitoring &amp; alerts (host out of service)')
+          + '" onclick="pauseNode('+jsArg(n.id)+','+(n.disabled?'false':'true')+')">'+(n.disabled?'Resume':'Pause')+'</button>'
           + '<button class="x" title="Remove" onclick="removeNode('+jsArg(n.id)+','+jsArg(n.name)+')">×</button>'
           + '</span>']);
       });
@@ -1565,6 +1678,23 @@ async function saveTuning(){
     m.innerHTML = '<span class="ok-txt">Saved — applies on the next monitor cycle.</span>' + m.innerHTML;
   }catch(e){ m.innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
 }
+async function downloadBackup(){
+  const m = document.getElementById('bk-msg');
+  const p1 = document.getElementById('bk-pass').value, p2 = document.getElementById('bk-pass2').value;
+  if(p1.length < 12){ m.innerHTML = '<span class="bad">Passphrase must be at least 12 characters.</span>'; return; }
+  if(p1 !== p2){ m.innerHTML = '<span class="bad">Passphrases do not match.</span>'; return; }
+  m.textContent = 'Building bundle…';
+  try{
+    const r = await fetch('/api/backup', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({passphrase:p1})});
+    if(!r.ok){ const d = await r.json().catch(()=>({})); throw new Error(d.error || ('HTTP '+r.status)); }
+    const name = (r.headers.get('Content-Disposition')||'').match(/filename="([^"]+)"/);
+    const blob = await r.blob(); const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = name ? name[1] : 'nexus-controller-backup.ncb';
+    document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href), 5000);
+    m.innerHTML = '<span class="ok-txt">Downloaded '+esc(a.download)+'.</span>';
+    document.getElementById('bk-pass').value = ''; document.getElementById('bk-pass2').value = '';
+  }catch(e){ m.innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
+}
 async function loadCertInfo(){
   const el = document.getElementById('cert-current');
   try{
@@ -1573,7 +1703,9 @@ async function loadCertInfo(){
     if(c.error){ el.innerHTML = '<span class="bad">'+esc(c.error)+'</span>'; return; }
     el.innerHTML = 'Subject: <b>'+esc(c.subject||'?')+'</b><br>'
       + 'Issuer: '+esc(c.issuer||'?')+'<br>'
-      + 'Expires: '+esc(c.expires||'?')+' · '
+      + 'Expires: '+esc(c.expires||'?')
+      + (typeof c.days_left==='number' ? ' <span class="'+(c.days_left<=14?'bad':(c.days_left<=30?'warn':'muted'))+'">('
+          + (c.days_left<0 ? 'expired '+(-c.days_left)+' day(s) ago' : 'in '+c.days_left+' day(s)')+')</span>' : '')+' · '
       + (c.self_signed ? '<span class="warn">self-signed</span>' : '<span class="ok-txt">CA-signed</span>')
       + '<br>SHA-256: <span class="mono">'+esc(c.fingerprint_sha256||'')+'</span>';
   }catch(e){ el.innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
@@ -2084,7 +2216,7 @@ async function loadNotifySection(){
   try{
     const c = await API.get('notifications');
     document.getElementById('nf-enabled').checked = !!c.enabled;
-    hooks = (c.webhooks||[]).map(h=>({id:h.id, name:h.name, format:h.format, min_severity:h.min_severity, url:'', url_display:h.url_display}));
+    hooks = (c.webhooks||[]).map(h=>({id:h.id, name:h.name, format:h.format, min_severity:h.min_severity, tags:(h.tags||[]).join(', '), url:'', url_display:h.url_display}));
   }catch(e){ hooks=[]; }
   renderHooks();
   loadNotifyEvents();   // background — fills the Recent-events section
@@ -2114,14 +2246,15 @@ function renderHooks(){
     + '<input placeholder="name" value="'+esc(h.name||'')+'" oninput="hooks['+i+'].name=this.value" style="width:120px">'
     + '<select onchange="hooks['+i+'].format=this.value" style="width:auto">'+FORMATS.map(f=>'<option'+(h.format===f?' selected':'')+'>'+f+'</option>').join('')+'</select>'
     + '<select onchange="hooks['+i+'].min_severity=this.value" style="width:auto" title="minimum severity to send">'+SEVS.map(s=>'<option'+(h.min_severity===s?' selected':'')+'>'+s+'</option>').join('')+'</select>'
+    + '<input placeholder="host tags (any of; blank = every host)" title="Only events from hosts carrying any of these tags reach this webhook. Blank = everything, incl. unpinned checks and the controller itself." value="'+esc(h.tags||'')+'" oninput="hooks['+i+'].tags=this.value" style="width:220px">'
     + '<button class="x" title="remove" onclick="hooks.splice('+i+',1);renderHooks()">×</button></div>'
     + '<input placeholder="'+(h.url_display?('webhook URL (stored: '+esc(h.url_display)+' — blank keeps it)'):'webhook URL')+'" oninput="hooks['+i+'].url=this.value" style="margin-top:6px">'
     + '</div>').join('');
 }
-function addHook(){ hooks.push({name:'', format:'gchat', min_severity:'warning', url:'', url_display:''}); renderHooks(); }
+function addHook(){ hooks.push({name:'', format:'gchat', min_severity:'warning', tags:'', url:'', url_display:''}); renderHooks(); }
 async function saveNotify(){
   const body = {enabled: document.getElementById('nf-enabled').checked,
-    webhooks: hooks.map(h=>({id:h.id, name:h.name, format:h.format, min_severity:h.min_severity, url:h.url}))};
+    webhooks: hooks.map(h=>({id:h.id, name:h.name, format:h.format, min_severity:h.min_severity, tags:parseTags(h.tags), url:h.url}))};
   try{ await API.post('notifications', body);
     await loadNotifySection();
     document.getElementById('nf-msg').innerHTML='<span class="ok-txt">Saved.</span>';
@@ -2270,6 +2403,39 @@ async function revokeUser(u){
     document.getElementById('us-msg').innerHTML='<span class="ok-txt">All sessions for '+esc(u)+' ended.</span>';
   }catch(e){ document.getElementById('us-msg').innerHTML='<span class="bad">'+esc(e.message)+'</span>'; }
 }
+// ── API tokens (any role; admins also see everyone's) ──
+function openTokens(){ show('tokenModal', true); show('tk-new', false);
+  document.getElementById('tk-msg').textContent=''; document.getElementById('tk-name').value=''; loadTokens(); }
+function closeTokens(){ show('tokenModal', false); show('tk-new', false); }
+async function loadTokens(){
+  const b = document.getElementById('tk-body');
+  try{
+    const d = await API.get('tokens');
+    const list = d.tokens||[];
+    if(!list.length){ b.innerHTML = '<p class="muted">No tokens yet.</p>'; return; }
+    const head = (d.admin?['Login']:[]).concat(['Name','Token','Created','Last used','']);
+    b.innerHTML = '<table class="tbl"><thead>'+tr(head,'th')+'</thead><tbody>'
+      + list.map(t=>tr((d.admin?[esc(t.user)+(t.user===d.user?' <span class="muted small">(you)</span>':'')]:[]).concat([
+          '<b>'+esc(t.name)+'</b>', '<code>'+esc(t.prefix)+'…</code>',
+          '<span class="muted small">'+esc(fmtAgo(t.created))+'</span>',
+          '<span class="muted small">'+(t.last_used?esc(fmtAgo(new Date(t.last_used*1000).toISOString())):'never')+'</span>',
+          '<span class="ck-acts"><button class="x" title="revoke" onclick="revokeToken('+jsArg(t.id)+','+jsArg(t.name)+')">×</button></span>']))).join('')
+      + '</tbody></table>';
+  }catch(e){ b.innerHTML = '<div class="bad">'+esc(e.message)+'</div>'; }
+}
+async function createToken(){
+  const name = document.getElementById('tk-name').value.trim() || 'token';
+  const m = document.getElementById('tk-msg');
+  try{ const r = await API.post('tokens', {name});
+    document.getElementById('tk-secret').textContent = r.token; show('tk-new', true);
+    m.innerHTML = '<span class="ok-txt">Created "'+esc(name)+'".</span>'; loadTokens();
+  }catch(e){ m.innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
+}
+async function revokeToken(id, name){
+  if(!await uiConfirm('Revoke token', 'Revoke "'+name+'"? Anything using it stops working immediately.')) return;
+  try{ await API.del('tokens/'+encodeURIComponent(id)); show('tk-new', false); loadTokens(); }
+  catch(e){ document.getElementById('tk-msg').innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
+}
 async function resetUser(u){
   const pw = await uiPrompt('Reset password', 'New password for "'+u+'" (min 8 chars; they must change it on next login):',
                             {label:'New password', type:'password'});
@@ -2333,7 +2499,9 @@ async function openDetail(id){
   const kv = (k,v)=> v ? '<div class="dt-k">'+esc(k)+'</div><div class="dt-v">'+v+'</div>' : '';
   const avail = hist && hist.availability!=null ? (Math.round(hist.availability*10)/10)+'% (24h)' : null;
   const health = (n.health||[]).map(h=>'<div><span class="'+(h.severity==='critical'?'bad':'warn')+'">●</span> '
-      + esc(h.detail)+' <span class="muted small">for '+fmtAgo(h.since)+'</span></div>').join('');
+      + esc(h.detail)+' <span class="muted small">for '+fmtAgo(h.since)+'</span></div>').join('')
+    + (n.health_acked||[]).map(h=>'<div class="muted"><span>✓</span> '+esc(h.detail)
+      + ' <span class="small">('+esc(ackWho(h.ack))+')</span></div>').join('');
   b.innerHTML =
     '<div class="dt-grid">'
     + kv('Status', n.ok ? '<span class="ok-txt">reachable</span>' : '<span class="bad">'+esc(n.error||'unreachable')+'</span>')
@@ -2341,6 +2509,7 @@ async function openDetail(id){
     + kv('Host type', esc(n.host_type||'nexus'))
     + kv('URL', '<a href="'+esc(n.base_url)+'" target="_blank" rel="noopener">'+esc(n.base_url)+'</a>')
     + kv('Version', esc(n.version||'—'))
+    + (n.cert_not_after ? kv('TLS certificate', 'expires '+esc(String(n.cert_not_after).slice(0,10))) : '')
     + kv('OS', esc((((n.summary||{}).system)||{}).os||''))
     + kv('Token role', esc(n.token_role||reg.role||'—'))
     + kv('Tags', (n.tags||[]).length ? esc(n.tags.join(', ')) : '')

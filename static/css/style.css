@@ -276,3 +276,7 @@ main{padding:20px;max-width:1200px;margin:0 auto}
 .nbox.bad  .nbox-v{color:var(--bad)}
 /* The issues box is the one you hover, so hint that it holds more. */
 .nbox[title]{cursor:help}
+/* Settings → Hosts: the Pause/Resume toggle is a word, not a glyph — keep it
+   small and quiet, and don't paint it red on hover like Remove. */
+.ck-acts .x.pause{font-size:12px;padding:2px 7px;border:1px solid var(--line);border-radius:4px;margin:0 4px}
+.ck-acts .x.pause:hover{color:var(--accent);border-color:var(--accent)}

@@ -54,7 +54,7 @@ echo "==> installing app files -> $DIR"
 mkdir -p "$DIR"
 # Every top-level module app.py imports — tests/test_review_fixes.py fails when
 # this list (or the Dockerfile's) drifts from app.py again (sso.py did).
-cp "$SRC/app.py" "$SRC/monitoring.py" "$SRC/history.py" "$SRC/checks.py" \
+cp "$SRC/app.py" "$SRC/monitoring.py" "$SRC/history.py" "$SRC/checks.py" "$SRC/metrics.py" "$SRC/backup.py" \
    "$SRC/sso.py" "$SRC/ed25519.py" "$SRC/requirements.txt" "$DIR/"
 rm -rf "$DIR/templates" "$DIR/static" "$DIR/adapters" "$DIR/collectors"
 cp -r "$SRC/templates" "$SRC/static" "$SRC/adapters" "$SRC/collectors" "$DIR/"

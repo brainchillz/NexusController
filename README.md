@@ -381,6 +381,63 @@ the login is then confined to hosts bearing any of those tags — its fleet
 view, rollup, history, and actions cover only those hosts, and every other
 host 404s. Blank scope = whole fleet; admins are always fleet-wide.
 
+**Scripting the controller:** any login can mint **API tokens** (header
+button → *API tokens*): a token acts as that login — same role, same scope
+— sent as `Authorization: Bearer ct_…`. Use one for Home Assistant, a cron
+job, or `curl`. Tokens are shown once and stored hashed; only an interactive
+session can create one (a token can't mint tokens), password changes don't
+revoke them (revoke by name instead), and deleting the login revokes all of
+its tokens. Token-authenticated actions are audited with `via: token:<id>`.
+
+**Pausing a host / maintenance windows:** Settings → Hosts → **Pause**
+stands monitoring, alerts, checks and history sampling down for a host that
+is out of service on purpose (the host stays enrolled; its drill-in keeps
+working). The dialog asks for how long: *until I resume it*, a preset
+(1h/4h/24h/7d) or a date/time — with a window, the controller **resumes the
+host itself** when it passes (audited as `monitor`), so nobody has to
+remember. **Resume** ends a pause early.
+
+**Routing notifications by tag:** each webhook can carry **host tags**
+(Settings → Notifications): a tagged hook receives only events from hosts
+bearing any of those tags (the same any-of rule as scopes and fleet
+actions), so the storage team's channel sees `nas` hosts and the lab
+channel sees `lab`. A hook with no tags receives everything, including
+unpinned service checks and the controller's own certificate, which have no
+host tags. The severity floor applies first; recoveries always pass it.
+
+**Certificate expiry:** the controller reads every HTTPS host's serving
+certificate a few times a day (adapter-independent — the same TLS handshake
+the pin uses) and raises a `cert_expiring` condition: info at 30 days,
+warning (amber dot, notifier) at 14 days or once expired. The host detail
+drawer shows the date. Its own certificate gets the same treatment (Settings
+→ Certificate shows days left; the notifier reports it as *controller*).
+`CONTROLLER_CERT_CHECK_INTERVAL` (seconds, default 6h) sets the cadence.
+
+**Acknowledging a condition:** on the Alerts tab, **Ack** quiets one
+condition on one host — the status dot, the wallboard, the rollup and the
+webhook notifier all stop reporting it — while everything else on that host
+stays monitored (unlike Pause). Choose *until it clears* or a snooze
+(4h/24h/3d/7d) and add a note; the row stays listed, muted, with who acked it
+and until when, and **Unack** reverses it. An ack removes itself once the
+condition clears, so a recurrence alerts again. An acknowledged outage shows
+amber on the wallboard, not red.
+
+**Prometheus / Grafana:** `GET /metrics` exposes the whole fleet as gauges
+(`nexus_host_up`, `nexus_host_cpu_percent`, `nexus_host_storage_bytes`,
+`nexus_host_health_issue{key}`, `nexus_host_guests`, pending updates,
+`nexus_check_up`/latency, fleet rollups). It reads the controller's own
+fleet cache, so scraping is free — it never contacts a host. Scrape it with
+an API token:
+
+```yaml
+scrape_configs:
+  - job_name: nexus-controller
+    scheme: https
+    tls_config: {insecure_skip_verify: true}   # or your CA
+    bearer_token: ct_…
+    static_configs: [{targets: ['controller.example.com:9443']}]
+```
+
 Scopes can be named: save a **scope preset** ("role") — a named tag grouping
 like `media = nas, docker` — and bind users to it from a dropdown instead of
 typing tags. Presets resolve at request time, so editing one instantly
@@ -422,10 +479,21 @@ All under the install dir (`/opt/nexus-controller`), mode `0600`, gitignored:
 
 | File | Contents |
 |------|----------|
-| `controller-auth.json` | secret key, Fernet key, controller users |
+| `controller-auth.json` | secret key, Fernet key, controller users, API tokens, webhooks |
 | `nodes.json` | the node registry (encrypted tokens, cert fingerprints) |
 | `audit.log` | append-only controller audit trail |
 | `certs/` | auto-generated self-signed TLS cert |
+
+**Backup / restore:** Settings → *Backup* downloads every config file as one
+passphrase-encrypted bundle (`.ncb`: auth incl. the Fernet key, users, API
+tokens and webhooks; the host registry; service checks; the SSO enrollment;
+the TLS cert + key — the whole set, because the registry is useless without
+the key that decrypts it). For scheduled backups:
+`CONTROLLER_BACKUP_PASSPHRASE=… python app.py backup out.ncb` (or `POST
+/api/backup` with an admin API token). Restore with the controller
+**stopped**: `python app.py restore out.ncb` (refuses to overwrite existing
+state; `--force` to replace it), then start it. History and the audit log
+are not part of the bundle.
 
 ## Networking
 
@@ -445,7 +513,7 @@ changes do matter: a node's `base_url` is stored in the registry; update it with
 | `GET` | `/api/nodes` | list nodes (tokens stripped) |
 | `POST` | `/api/nodes` | enroll (admin) |
 | `POST` | `/api/nodes/test` | test-connection without enrolling |
-| `PUT` | `/api/nodes/<id>` | update name/tags/type/token (admin) |
+| `PUT` | `/api/nodes/<id>` | update name/tags/type/token (admin); `{"disabled": true, "disabled_until": "<ISO-8601>"}` pauses for a maintenance window |
 | `DELETE` | `/api/nodes/<id>` | un-enroll (admin) |
 | `GET` | `/api/host-types` | adapter descriptors (drive the Add/Edit modal) |
 | `GET` | `/api/fleet/summary` | fan-out rollup (`?fresh=1` bypasses cache) |
@@ -457,12 +525,16 @@ changes do matter: a node's `base_url` is stored in the registry; update it with
 | `GET` | `/nodes/<id>/` | drill-in: the node's SPA, retargeted |
 | `WS` | `/nodes/<id>/ws/<path>` | drill-in websocket bridge (node console) |
 | `GET/POST/PUT/DELETE` | `/api/users…` | controller login management (admin); `PUT` with `{"revoke_sessions": true}` signs that user out everywhere |
+| `GET/POST/DELETE` | `/api/tokens…` | your API tokens (any role; admins see all). `POST {"name"}` mints one — interactive session only, secret shown once |
 | `GET/POST` | `/api/notifications` (+`/test`) | webhook notification config (admin) |
 | `GET` | `/api/notifications/events` | recent monitor state transitions (admin) |
 | `GET` | `/api/audit` | audit-trail tail, filterable (admin) |
 | `GET` | `/api/history/spark` | recent CPU series per host (sparklines) |
 | `GET` | `/api/history/summary` | availability % + storage forecast per host |
 | `GET` | `/api/history/<id>` | full CPU/mem series for one host |
+| `GET/POST/DELETE` | `/api/acks…` | acknowledge / un-acknowledge one condition on one host (operator+); `hours` snoozes, omitted = until it clears |
+| `POST` | `/api/backup` | `{"passphrase"}` → download the whole config set as one encrypted bundle (admin) |
+| `GET` | `/metrics` | Prometheus exposition of the fleet (any login; `bearer_token` = an API token). Serves the cache only |
 | `GET` | `/api/tls/info` | current serving certificate metadata |
 | `POST` | `/api/tls/regenerate` | regenerate the self-signed cert (admin) |
 | `POST` | `/api/tls/cert` | install a supplied cert + key (admin) |

@@ -17,7 +17,10 @@ import re
 import json
 import time
 import socket
+import ssl
+import logging
 import secrets
+import hashlib
 import threading
 from collections import deque
 from urllib.parse import urlsplit
@@ -42,6 +45,8 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 import requests
 import adapters
 import monitoring
+import metrics
+import backup
 import history
 import checks
 from adapters import (   # host-type seam — see adapters/__init__.py
@@ -60,7 +65,8 @@ urllib3.disable_warnings(InsecureRequestWarning)
 app = Flask(__name__, static_url_path='')
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-APP_VERSION = '0.14.1'
+log = logging.getLogger('controller')
+APP_VERSION = '0.22.0'
 
 
 def env_bool(name, default):
@@ -84,6 +90,7 @@ except OSError:
 AUTH_FILE = os.environ.get('CONTROLLER_AUTH_FILE', os.path.join(DATA_DIR, 'controller-auth.json'))
 NODES_FILE = os.environ.get('CONTROLLER_NODES_FILE', os.path.join(DATA_DIR, 'nodes.json'))
 CHECKS_FILE = os.environ.get('CONTROLLER_CHECKS_FILE', os.path.join(DATA_DIR, 'checks.json'))
+ACKS_FILE = os.environ.get('CONTROLLER_ACKS_FILE', os.path.join(DATA_DIR, 'acks.json'))
 AUDIT_FILE = os.environ.get('CONTROLLER_AUDIT_FILE', os.path.join(DATA_DIR, 'audit.log'))
 HISTORY_FILE = os.environ.get('CONTROLLER_HISTORY_FILE', os.path.join(DATA_DIR, 'history.db'))
 HISTORY_DAYS = int(os.environ.get('CONTROLLER_HISTORY_DAYS', '30'))
@@ -393,13 +400,13 @@ def _scope_presets():
 PUBLIC_ENDPOINTS = {'api_login', 'api_me', 'index', 'static', 'api_status',
                     'sso_callback'}
 # Writes a non-admin role may still issue (sign out / change own password).
-RBAC_EXEMPT = {'api_logout', 'change_password'}
+RBAC_EXEMPT = {'api_logout', 'change_password', 'tokens_create', 'tokens_delete'}
 # Endpoints that require the top (admin) role regardless of method — enrolling
 # or removing a node, and managing controller users.
 ADMIN_ONLY = {'sso_status', 'sso_enroll', 'sso_disable',
               'nodes_add', 'node_delete', 'node_update', 'node_cert', 'node_repin',
               'checks_add', 'checks_update', 'checks_delete', 'tuning_save',
-              'tls_regenerate', 'tls_upload_cert',
+              'tls_regenerate', 'tls_upload_cert', 'backup_download',
               'notifications_save', 'notifications_test', 'notifications_events',
               'users_list', 'users_add', 'users_update', 'users_delete',
               'audit_list',
@@ -435,7 +442,69 @@ def _bump_session_gen(rec):
     rec['session_gen'] = _session_gen(rec) + 1
 
 
+# ─── Controller API tokens (scripting: Home Assistant, cron, CLI) ──────
+# A token is a second credential for an EXISTING login: same user record,
+# same role, same tag scope, resolved before the session. Only its SHA-256
+# is stored (auth file, under 'api_tokens', keyed by that hash); the secret
+# is shown once at creation. Minting needs an interactive session — a token
+# can never mint another token — and deleting the user deletes its tokens.
+# This is NOT a bearer path for SSO assertions: those are accepted at
+# /sso/callback only, and the `ct_` prefix is checked before any lookup.
+TOKEN_PREFIX = 'ct_'
+_token_last_used = {}   # token id → unix ts (in-memory: saving on every call
+                        # would rewrite the auth file per request)
+
+
+def parse_bearer(header):
+    """'Bearer ct_…' → the token, else None (pure). Anything that is not a
+    controller token — a node token someone pasted, an SSO assertion — is
+    ignored here rather than refused, so the session path still applies."""
+    if not header or not isinstance(header, str):
+        return None
+    parts = header.strip().split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != 'bearer':
+        return None
+    tok = parts[1].strip()
+    return tok if tok.startswith(TOKEN_PREFIX) and len(tok) >= 20 else None
+
+
+def token_hash(tok):
+    return hashlib.sha256(tok.encode()).hexdigest()
+
+
+def _api_tokens():
+    t = load_config().get('api_tokens')
+    return t if isinstance(t, dict) else {}
+
+
+def _public_token(h, rec):
+    return {'id': rec.get('id'), 'user': rec.get('user'), 'name': rec.get('name'),
+            'prefix': rec.get('prefix'), 'created': rec.get('created'),
+            'last_used': _token_last_used.get(rec.get('id'))}
+
+
+def _resolve_token():
+    """(user, role) for a presented controller token; (None, None) for a
+    presented-but-invalid one (NO session fallback — a bad token is a bad
+    credential); None when no token was presented at all."""
+    tok = parse_bearer(request.headers.get('Authorization'))
+    if tok is None:
+        return None
+    rec = _api_tokens().get(token_hash(tok))
+    if not isinstance(rec, dict):
+        return (None, None)
+    urec = _users().get(rec.get('user'))
+    if urec is None:
+        return (None, None)          # the login is gone → so is its token
+    _token_last_used[rec.get('id')] = time.time()
+    g.identity_token = rec.get('id')
+    return rec['user'], _user_role(urec)
+
+
 def _resolve_identity():
+    via_token = _resolve_token()
+    if via_token is not None:
+        return via_token
     user = session.get('user')
     if user:
         rec = _users().get(user)
@@ -531,12 +600,20 @@ def _is_admin():
 # ─── Audit (controller-side, mirrors the node) ────────────────────────
 def audit_line(method, path, target, status):
     try:
+        # Background threads (the monitor resuming a maintenance window) have
+        # no request context: `g` and `request` raise RuntimeError there.
+        try:
+            user, ip = getattr(g, 'identity_name', '-'), _client_ip()
+            via = getattr(g, 'identity_token', None)
+        except RuntimeError:
+            user, ip, via = 'monitor', '-', None
         entry = {
             'ts': datetime.now().astimezone().isoformat(timespec='seconds'),
-            'user': getattr(g, 'identity_name', '-'),
-            'ip': _client_ip(),
+            'user': user, 'ip': ip,
             'method': method, 'path': path, 'target': target or '-', 'status': status,
         }
+        if via:
+            entry['via'] = 'token:%s' % via
         with open(os.open(AUDIT_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), 'a') as f:
             f.write(json.dumps(entry) + '\n')
     except Exception:
@@ -590,7 +667,7 @@ def audit_matches(entry, q):
     """Case-insensitive substring match across an audit entry's visible fields
     (pure — unit-tested)."""
     hay = ' '.join(str(entry.get(k, '')) for k in
-                   ('ts', 'user', 'ip', 'method', 'path', 'target', 'status')).lower()
+                   ('ts', 'user', 'ip', 'method', 'path', 'target', 'status', 'via')).lower()
     return q in hay
 
 
@@ -614,6 +691,63 @@ def audit_list():
     if q:
         entries = [e for e in entries if audit_matches(e, q)]
     return jsonify({'entries': entries[-limit:][::-1]})
+
+
+# ─── API tokens ────────────────────────────────────────────────────────
+RE_TOKEN_NAME = re.compile(r'^[^\x00-\x1f]{1,48}\Z')
+
+
+@app.route('/api/tokens')
+def tokens_list():
+    """Your tokens (metadata only — the secret is never stored). Admins see
+    every login's tokens, with the owner in `user`."""
+    me = g.identity_name
+    out = [_public_token(h, t) for h, t in _api_tokens().items()
+           if isinstance(t, dict) and (_is_admin() or t.get('user') == me)]
+    out.sort(key=lambda t: (str(t['user']), str(t['created'])))
+    return jsonify({'tokens': out, 'user': me, 'admin': _is_admin()})
+
+
+@app.route('/api/tokens', methods=['POST'])
+def tokens_create():
+    """Mint a token for the CURRENT login. Interactive session only: a token
+    cannot mint tokens (containment), and password re-entry is deliberately
+    NOT required — logins that come in through SSO may not use theirs."""
+    if getattr(g, 'identity_token', None) or not session.get('user'):
+        return err('Only an interactive session can create API tokens', 403)
+    data = request.get_json(silent=True) or {}
+    name = _s(data.get('name')) or 'token'
+    if not RE_TOKEN_NAME.match(name):
+        return err('token name must be 1–48 printable characters')
+    tok = TOKEN_PREFIX + secrets.token_urlsafe(32)
+    rec = {'id': secrets.token_hex(6), 'user': g.identity_name, 'name': name,
+           'prefix': tok[:10], 'created': _now_iso()}
+    with _CFG_LOCK:
+        cfg = load_config()
+        cfg.setdefault('api_tokens', {})[token_hash(tok)] = rec
+        save_config(cfg)
+    g.audit_target = 'token:%s (%s)' % (rec['id'], name)
+    return jsonify({'success': True, 'token': tok, **_public_token(None, rec)})
+
+
+@app.route('/api/tokens/<tid>', methods=['DELETE'])
+def tokens_delete(tid):
+    """Revoke one token: your own, or anyone's if admin."""
+    with _CFG_LOCK:
+        cfg = load_config()
+        toks = cfg.get('api_tokens') or {}
+        hit = next((h for h, t in toks.items()
+                    if isinstance(t, dict) and t.get('id') == tid), None)
+        if hit is None:
+            return err('token not found', 404)
+        if toks[hit].get('user') != g.identity_name and not _is_admin():
+            return err('token not found', 404)   # not yours: invisible, not forbidden
+        owner, name = toks[hit].get('user'), toks[hit].get('name')
+        del toks[hit]
+        save_config(cfg)
+    _token_last_used.pop(tid, None)
+    g.audit_target = 'token:%s (%s, %s) revoked' % (tid, name, owner)
+    return jsonify({'success': True})
 
 
 # ─── Node registry ────────────────────────────────────────────────────
@@ -1004,6 +1138,9 @@ def users_delete(user):
         if _user_role(users[user]) == 'admin' and len(admins) <= 1:
             return err('cannot delete the last admin')
         del users[user]
+        toks = cfg.get('api_tokens') or {}
+        for h in [h for h, t in toks.items() if isinstance(t, dict) and t.get('user') == user]:
+            del toks[h]
         save_config(cfg)
     g.audit_target = 'user:%s (deleted)' % user
     return jsonify({'success': True})
@@ -1212,6 +1349,14 @@ def node_update(node_id):
         # check (dot, alerts, notifier, history sampling) is suspended until
         # it's re-enabled. The registry record itself is untouched.
         edits['disabled'] = bool(data['disabled'])
+        edits['disabled_until'] = None      # a plain pause/resume clears any window
+    if edits.get('disabled') and data.get('disabled_until'):
+        # Scheduled maintenance window: the monitor resumes the host itself
+        # once the timestamp passes (see expire_pauses in _build_fleet).
+        until, e = clean_until(data['disabled_until'])
+        if e:
+            return err(e)
+        edits['disabled_until'] = until
     if 'type' in data:
         # 'auto' un-pins (effective type reverts to type_auto); any other
         # cleaned label pins the manual override — a custom label becomes
@@ -1305,6 +1450,12 @@ def node_delete(node_id):
     with _health_lock:
         for k in [k for k in _health_since if k[0] == node_id]:
             del _health_since[k]
+    with _cert_expiry_lock:
+        _cert_expiry_cache.pop(node_id, None)
+    with _ACK_LOCK:   # its acknowledgements go with it
+        acks = load_acks()
+        if any(k.startswith(node_id + '|') for k in acks):
+            save_acks({k: a for k, a in acks.items() if not k.startswith(node_id + '|')})
     with _fleet_lock:
         _fleet_cache['ts'] = 0.0
     g.audit_target = target
@@ -1459,7 +1610,12 @@ def compute_rollup(results):
                 sec_hosts += 1
                 sec_total += u.get('security') or 0
         ck_bad = any(c.get('ok') is False for c in r.get('svc_checks') or [])
-        if n_alerts or down or zfs_bad or nas.get('pools_degraded') or r.get('stale') or ck_bad:
+        if 'health' in r or 'health_acked' in r:
+            # A built fleet carries its health list (acks already removed):
+            # that IS the degraded signal. Legacy/raw envelopes fall through.
+            if r.get('health'):
+                degraded += 1
+        elif n_alerts or down or zfs_bad or nas.get('pools_degraded') or r.get('stale') or ck_bad:
             degraded += 1
     return {'total': len(results), 'healthy': healthy, 'unreachable': unreachable,
             'disabled': disabled,
@@ -1502,12 +1658,68 @@ def _disabled_envelope(node):
     alerted on — the row renders grey ('paused'), not red."""
     out = adapters.base_envelope(node)
     out['disabled'] = True
+    out['disabled_until'] = node.get('disabled_until')
     out['error'] = 'monitoring disabled'
     return out
 
 
+PAUSE_MAX_DAYS = 90
+
+
+def clean_until(v, now=None):
+    """Validate a maintenance-window end → (ISO-8601 UTC string, None) or
+    (None, error). Must parse, lie in the future, and be ≤ PAUSE_MAX_DAYS
+    out (a window that never ends is what a plain Pause is for). Pure."""
+    now = now or datetime.now(timezone.utc)
+    if not isinstance(v, str) or not v.strip():
+        return None, 'disabled_until must be an ISO-8601 timestamp'
+    try:
+        t = datetime.fromisoformat(v.strip().replace('Z', '+00:00'))
+    except ValueError:
+        return None, 'disabled_until must be an ISO-8601 timestamp'
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    if t <= now:
+        return None, 'disabled_until must be in the future'
+    if (t - now).days > PAUSE_MAX_DAYS:
+        return None, 'disabled_until must be within %d days' % PAUSE_MAX_DAYS
+    return t.astimezone(timezone.utc).isoformat(timespec='seconds'), None
+
+
+def expire_pauses(nodes, now=None):
+    """Resume every host whose maintenance window has passed (mutates the
+    records). Returns the names resumed. A record with an unparseable
+    `disabled_until` is left paused (never silently resumed). Pure."""
+    now = now or datetime.now(timezone.utc)
+    resumed = []
+    for n in nodes:
+        u = n.get('disabled_until')
+        if not (n.get('disabled') and u):
+            continue
+        try:
+            t = datetime.fromisoformat(str(u).replace('Z', '+00:00'))
+        except ValueError:
+            continue
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        if t <= now:
+            n['disabled'] = False
+            n['disabled_until'] = None
+            resumed.append(n.get('name') or n.get('id'))
+    return resumed
+
+
 def _build_fleet():
-    nodes = load_nodes().get('nodes', [])
+    # Maintenance windows end here: the host is resumed BEFORE the fan-out
+    # so this same cycle polls it. Under _REG_LOCK like every registry RMW.
+    with _REG_LOCK:
+        reg = load_nodes()
+        resumed = expire_pauses(reg.get('nodes', []))
+        if resumed:
+            save_nodes(reg)
+            for name in resumed:
+                audit_line('MONITOR', '/monitor', '%s resumed (maintenance window ended)' % name, 200)
+    nodes = reg.get('nodes', [])
     active = [n for n in nodes if not n.get('disabled')]
     results = [_disabled_envelope(n) for n in nodes if n.get('disabled')]
     if active:
@@ -1552,12 +1764,18 @@ def _refresh_registry_from_results(seen):
 
 def _build_fleet_finish(results):
     _attach_svc_checks(results)   # pinned service checks → env, before health folds
+    with _cert_expiry_lock:
+        for r in results:
+            c = _cert_expiry_cache.get(r['id'])
+            if c and not r.get('disabled'):
+                r['cert_not_after'] = c['not_after']
     # Fold each host's warning+ conditions (failed services, degraded pools,
     # stale polls, alerts, unreachable — same set the notifier fires on) into
     # the envelope, with a first-seen timestamp per (host, condition) so the
     # Alerts tab can say "since when". The since-map is in-memory (resets on
     # restart) and shared with the monitor thread — guard it.
     now_iso = datetime.now().astimezone().isoformat(timespec='seconds')
+    acks = load_acks()
     with _health_lock:
         live = set()
         for r in results:
@@ -1566,8 +1784,13 @@ def _build_fleet_finish(results):
                 k = (r['id'], e['key'])
                 live.add(k)
                 e['since'] = _health_since.setdefault(k, now_iso)
+            # Acknowledged conditions leave `health` (dot, rollup, wallboard,
+            # notifier) and ride along as `health_acked` for the Alerts tab.
+            entries, acked = monitoring.split_acked(entries, acks, r['id'])
             if entries:
                 r['health'] = entries
+            if acked:
+                r['health_acked'] = acked
         # Anything not live is gone: cleared (a re-fire gets a fresh
         # timestamp) or the host itself was removed (the old `k[0] in ids`
         # guard kept a deleted host's keys forever).
@@ -1619,6 +1842,78 @@ def fleet_summary():
         age = time.time() - _fleet_cache['ts']
     return jsonify({**scoped_fleet(data, _scope()), 'cached': not built,
                     'cache_age': 0 if built else round(age, 1)})
+
+
+# ─── Acknowledgements ──────────────────────────────────────────────────
+_ACK_LOCK = threading.RLock()
+
+
+def load_acks():
+    d = load_json(ACKS_FILE, {})
+    return d if isinstance(d, dict) else {}
+
+
+def save_acks(acks):
+    write_json_atomic(ACKS_FILE, acks)
+
+
+def _bust_fleet():
+    with _fleet_lock:
+        _fleet_cache['ts'] = 0.0
+
+
+@app.route('/api/acks')
+def acks_list():
+    """Current acknowledgements (scoped: only hosts you can see)."""
+    reg = {n['id']: n for n in load_nodes().get('nodes', [])}
+    scope = _scope()
+    out = []
+    for k, a in load_acks().items():
+        hid, _, key = k.partition('|')
+        n = reg.get(hid)
+        if n is None or not scope_allows(scope, n):
+            continue
+        out.append({'host_id': hid, 'host': n['name'], 'key': key, **a})
+    return jsonify({'acks': out})
+
+
+@app.route('/api/acks', methods=['POST'])
+def acks_add():
+    """Acknowledge one condition on one host (operator+). `hours` snoozes
+    for that long; omitted = until the condition clears."""
+    data = request.get_json(silent=True) or {}
+    n = _find_node(_s(data.get('host_id')))
+    if not n:
+        return err('node not found', 404)
+    key = _s(data.get('key'))
+    if not re.match(r'^[a-z_]{1,32}\Z', key):
+        return err('invalid condition key')
+    rec, e = monitoring.clean_ack(data, g.identity_name)
+    if e:
+        return err(e)
+    with _ACK_LOCK:
+        acks = load_acks()
+        acks[monitoring.ack_key(n['id'], key)] = rec
+        save_acks(acks)
+    _bust_fleet()
+    g.audit_target = '%s ack %s%s' % (n['name'], key,
+                                      (' for %sh' % data.get('hours')) if rec['until'] else '')
+    return jsonify({'success': True, 'host_id': n['id'], 'key': key, **rec})
+
+
+@app.route('/api/acks/<node_id>/<key>', methods=['DELETE'])
+def acks_delete(node_id, key):
+    n = _find_node(node_id)
+    if not n:
+        return err('node not found', 404)
+    with _ACK_LOCK:
+        acks = load_acks()
+        if acks.pop(monitoring.ack_key(n['id'], key), None) is None:
+            return err('not acknowledged', 404)
+        save_acks(acks)
+    _bust_fleet()
+    g.audit_target = '%s unack %s' % (n['name'], key)
+    return jsonify({'success': True})
 
 
 # ─── Service checks: probe well-known services on the monitor cadence ──
@@ -1879,6 +2174,28 @@ def api_status():
                     'warming': data is None})
 
 
+@app.route('/metrics')
+def prometheus_metrics():
+    """Prometheus scrape of the fleet (any login — use an API token in the
+    scrape config's bearer_token). Serves the shared fleet cache ONLY, like
+    /api/status: a scrape never triggers a fan-out. Scoped logins get their
+    scoped fleet and only the checks they can see."""
+    with _fleet_lock:
+        data = _fleet_cache['data']
+    fleet = scoped_fleet(data, _scope()) if data else None
+    reg = load_nodes().get('nodes', [])
+    scope = _scope()
+    visible = {n['id'] for n in reg if scope_allows(scope, n)}
+    cks = [c for c in load_checks().get('checks', [])
+           if not c.get('node_id') or c['node_id'] in visible]
+    with _check_lock:
+        res = dict(_check_results)
+    names = {n['id']: n['name'] for n in reg}
+    body = metrics.render(fleet, cks, res, names, APP_VERSION)
+    return Response(body, content_type=metrics.CONTENT_TYPE,
+                    headers={'Cache-Control': 'no-store'})
+
+
 # ─── Notifications: monitor state transitions, POST to webhooks ────────
 # A background thread rebuilds the fleet every MONITOR_INTERVAL, diffs each
 # host's alertable conditions (monitoring.host_conditions) against the last
@@ -1986,6 +2303,7 @@ def _public_notify_config():
         hooks.append({'id': h.get('id'), 'name': h.get('name'),
                       'format': h.get('format', 'gchat'),
                       'min_severity': h.get('min_severity', 'warning'),
+                      'tags': list(h.get('tags') or []),
                       'url_display': _mask_url(h.get('url', ''))})
     return {'enabled': bool(cfg.get('enabled')), 'webhooks': hooks,
             'interval': tuning()['monitor_interval']}
@@ -2022,18 +2340,15 @@ def notifications_events():
                     'since_restart': True, 'interval': tuning()['monitor_interval']})
 
 
-def _dispatch(events):
-    """Send a batch of events to every enabled webhook that wants their
-    severity. Grouped into one message per webhook."""
+def _dispatch(events, tags_by_host=None):
+    """Send a batch of events to every enabled webhook that wants them
+    (severity floor + host-tag routing, see monitoring.hook_wants). Grouped
+    into one message per webhook."""
     cfg = notify_config()
     if not cfg.get('enabled') or not events:
         return
     for hook in cfg.get('webhooks', []):
-        floor = monitoring.SEVERITY.get(hook.get('min_severity', 'warning'), 1)
-        # recoveries always pass (so an all-clear isn't filtered out)
-        want = [e for e in events
-                if e['kind'] == 'recovered'
-                or monitoring.SEVERITY.get(e['severity'], 3) <= floor]
+        want = [e for e in events if monitoring.hook_wants(hook, e, tags_by_host)]
         if not want:
             continue
         title, text = monitoring.format_digest(want)
@@ -2049,13 +2364,27 @@ def _monitor_cycle(results):
     cooldown — the detail is the message, so a second alert landing under a key
     that is already up would otherwise never be reported."""
     snap = monitoring.snapshot_conditions(results)
-    present = {(hid, key) for hid, e in snap.items() for key in e['conditions']}
+    all_present = {(hid, key) for hid, e in snap.items() for key in e['conditions']}
+    # Acked conditions are not 'present' to the notifier — and an ack whose
+    # condition has cleared (or whose snooze lapsed) is dropped so a
+    # recurrence alerts again.
+    with _ACK_LOCK:
+        acks = load_acks()
+        gone = monitoring.prune_acks(acks, {monitoring.ack_key(h, k) for h, k in all_present})
+        if gone:
+            save_acks(acks)
+    acked = {(h, k) for h, k in all_present
+             if monitoring.ack_key(h, k) in acks}
+    present = all_present - acked
     # Paused hosts AND hosts no longer in the registry: a deleted unreachable
     # host used to "recover" on the next cycle — one last "reachable again"
     # webhook for a machine that had just been removed.
     paused = {r['id'] for r in results if r.get('disabled')}
     known = set(snap)
+    # Acked (host,key) pairs are dropped from tracking silently, like a paused
+    # host: acking must never fire 'recovered'.
     gone = lambda hid: hid in paused or hid not in known
+    gone_pk = lambda pk: gone(pk[0]) or pk in acked
     now = time.time()
     flap = tuning()['flap_cycles']
     fire, recover = [], []
@@ -2064,11 +2393,11 @@ def _monitor_cycle(results):
         # A paused host's conditions vanish (host_conditions returns {}), but
         # that must read as "stop tracking", not "recovered" — drop its state
         # silently so disabling never notifies and re-enabling starts fresh.
-        for pk in [pk for pk in _mon['active'] if gone(pk[0])]:
+        for pk in [pk for pk in _mon['active'] if gone_pk(pk)]:
             _mon['active'].discard(pk)
             _mon['detail'].pop(pk, None)
             _mon['last_fire'].pop(pk, None)
-        for pk in [pk for pk in streak if gone(pk[0])]:
+        for pk in [pk for pk in streak if gone_pk(pk)]:
             del streak[pk]
         # advance streaks
         for pk in present:
@@ -2119,10 +2448,11 @@ def _monitor_cycle(results):
                                            if was else label)})
                 _mon['active'].discard(pk)
     _record_events(fire + recover)
-    _dispatch(fire + recover)
+    _dispatch(fire + recover, {r['id']: r.get('tags') or [] for r in results if r.get('id')})
 
 
 _COND_LABEL = {'unreachable': 'reachable again', 'cert_changed': 'certificate re-pinned',
+               'cert_expiring': 'certificate renewed',
                'alerts': 'alerts cleared', 'pool_degraded': 'pools healthy',
                'cluster_unhealthy': 'cluster healthy', 'services_down': 'services back up',
                'check_failed': 'service checks passing',
@@ -2144,12 +2474,92 @@ def get_history():
     return _history
 
 
+# ─── TLS certificate expiry sweep ───────────────────────────────────────
+# Every CERT_CHECK_INTERVAL the monitor reads each https host's leaf cert
+# over a raw TLS socket (adapter-independent — the same connection the pin
+# capture uses) and remembers its notAfter; the fleet build stamps it onto
+# the envelope as `cert_not_after`, and monitoring.cert_condition turns it
+# into the `cert_expiring` condition (info ≤30d, warning ≤14d / expired).
+CERT_CHECK_INTERVAL = int(os.environ.get('CONTROLLER_CERT_CHECK_INTERVAL', str(6 * 3600)))
+_cert_expiry_cache = {}            # host_id → {'not_after': iso, 'checked': ts}
+_cert_expiry_lock = threading.Lock()
+_cert_sweep_at = [0.0]
+
+
+def _leaf_not_after(host, port):
+    """notAfter (ISO-8601 UTC) of the leaf certificate a host serves."""
+    ctx = ssl._create_unverified_context()
+    with socket.create_connection((host, port), timeout=adapters.NODE_TIMEOUT[0]) as sock:
+        with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+            der = ssock.getpeercert(binary_form=True)
+    cert = x509.load_der_x509_certificate(der)
+    exp = _cert_expiry(cert)
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    return exp.astimezone(timezone.utc).isoformat(timespec='seconds')
+
+
+def _sweep_cert_expiry(nodes, fetch=None, now=None):
+    """Refresh `_cert_expiry_cache` for every https, non-paused host. A host that
+    cannot be read keeps its last value (an outage is reported elsewhere).
+    Returns the ids refreshed."""
+    fetch = fetch or _leaf_not_after
+    now = now if now is not None else time.time()
+    todo = [n for n in nodes
+            if (n.get('base_url') or '').lower().startswith('https') and not n.get('disabled')]
+    ids = {n['id'] for n in nodes}
+    done = []
+
+    def one(n):
+        host, port = _split_host_port(n['base_url'])
+        return n['id'], fetch(host, port)
+
+    if todo:
+        with ThreadPoolExecutor(max_workers=FANOUT_WORKERS) as pool:
+            for fut in as_completed([pool.submit(one, n) for n in todo]):
+                try:
+                    hid, not_after = fut.result()
+                except Exception as e:   # noqa: BLE001 — one host never stops the sweep
+                    log.info('cert sweep: %s', e)
+                    continue
+                with _cert_expiry_lock:
+                    _cert_expiry_cache[hid] = {'not_after': not_after, 'checked': now}
+                done.append(hid)
+    with _cert_expiry_lock:   # forget removed hosts
+        for k in [k for k in _cert_expiry_cache if k not in ids]:
+            del _cert_expiry_cache[k]
+    return done
+
+
+def _maybe_sweep_certs(nodes):
+    if time.time() - _cert_sweep_at[0] < CERT_CHECK_INTERVAL:
+        return
+    _cert_sweep_at[0] = time.time()
+    try:
+        _sweep_cert_expiry(nodes)
+    except Exception as e:   # noqa: BLE001
+        print('cert sweep failed: %s' % e, flush=True)
+
+
+def _controller_cert_env():
+    """The controller's OWN serving certificate as a synthetic monitor
+    entity (like an unpinned check), so its expiry fires the notifier."""
+    if not TLS_ENABLED:
+        return []
+    info = cert_info()
+    if not info.get('present') or info.get('error') or not info.get('not_after'):
+        return []
+    return [{'id': 'controller', 'name': 'controller (this console)', 'ok': True,
+             'summary': {}, 'cert_not_after': info['not_after']}]
+
+
 def _monitor_loop():
     while True:
         try:
             _run_all_checks()   # before the refresh so envelopes fold fresh results
+            _maybe_sweep_certs(load_nodes().get('nodes', []))
             data, _ = _refresh_fleet()
-            _monitor_cycle(data['nodes'] + _check_monitor_envs())
+            _monitor_cycle(data['nodes'] + _check_monitor_envs() + _controller_cert_env())
             try:
                 # Paused hosts record no samples (a maintenance window must not
                 # tank the availability % or feed zeros into the forecasts).
@@ -2265,7 +2675,8 @@ def notifications_save():
             if sev not in monitoring.SEVERITY:
                 sev = 'warning'
             hooks.append({'id': hid, 'name': _s(h.get('name')) or 'webhook',
-                          'url': url, 'format': fmt, 'min_severity': sev})
+                          'url': url, 'format': fmt, 'min_severity': sev,
+                          'tags': clean_scope_tags(h.get('tags'))})
         cfg['notifications'] = {'enabled': bool(data.get('enabled')), 'webhooks': hooks}
         save_config(cfg)
     g.audit_target = 'notifications (%d webhook(s))' % len(hooks)
@@ -2677,11 +3088,16 @@ def cert_info(cert_path=None):
         return {'present': True, 'error': 'unreadable certificate'}
     fp = cert.fingerprint(hashes.SHA256()).hex()
     exp = _cert_expiry(cert)
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    not_after = exp.astimezone(timezone.utc).isoformat(timespec='seconds')
     return {
         'present': True, 'path': cert_path,
         'subject': cert.subject.rfc4514_string(),
         'issuer': cert.issuer.rfc4514_string(),
         'expires': exp.strftime('%Y-%m-%d %H:%M:%S UTC'),
+        'not_after': not_after,
+        'days_left': monitoring.cert_days_left(not_after),
         'self_signed': cert.subject == cert.issuer,
         'fingerprint_sha256': ':'.join(fp[i:i + 2] for i in range(0, len(fp), 2)),
     }
@@ -2777,6 +3193,97 @@ def validate_and_install_cert(cert_pem, key_pem):
     return True, ''
 
 
+# ─── Backup (encrypted bundle of the whole configuration set) ─────────
+def _state_paths():
+    """Logical backup member → this install's path (env-aware)."""
+    return {'controller-auth.json': AUTH_FILE, 'nodes.json': NODES_FILE,
+            'checks.json': CHECKS_FILE, 'acks.json': ACKS_FILE, 'sso.json': sso.STORE,
+            'certs/controller.crt': TLS_CERT, 'certs/controller.key': TLS_KEY}
+
+
+@app.route('/api/backup', methods=['POST'])
+def backup_download():
+    """Admin: download every config file as ONE passphrase-encrypted bundle
+    (auth incl. the Fernet key + users + tokens + webhooks, registry, checks,
+    SSO enrollment, TLS cert+key). Restore with `app.py restore` while the
+    controller is stopped."""
+    data = request.get_json(silent=True) or {}
+    pw = data.get('passphrase')
+    if not isinstance(pw, str) or len(pw) < backup.MIN_PASSPHRASE:
+        return err('passphrase must be at least %d characters' % backup.MIN_PASSPHRASE)
+    with _CFG_LOCK, _REG_LOCK:
+        files = backup.collect(_state_paths())
+    blob = backup.make_bundle(files, pw)
+    name = 'nexus-controller-backup-%s.ncb' % datetime.now().strftime('%Y%m%d-%H%M')
+    g.audit_target = 'backup (%d files)' % len(files)
+    return Response(blob, content_type='application/octet-stream',
+                    headers={'Content-Disposition': 'attachment; filename="%s"' % name,
+                             'Cache-Control': 'no-store'})
+
+
+def _backup_passphrase(confirm):
+    pw = os.environ.get('CONTROLLER_BACKUP_PASSPHRASE')
+    if pw:
+        return pw
+    import getpass
+    pw = getpass.getpass('Backup passphrase: ')
+    if confirm and pw != getpass.getpass('Confirm passphrase: '):
+        print('Passphrases do not match')
+        return None
+    return pw
+
+
+def cli_backup(argv):
+    """app.py backup <out.ncb>   (passphrase: CONTROLLER_BACKUP_PASSPHRASE or prompt)"""
+    if len(argv) < 3:
+        print('usage: app.py backup <out.ncb>')
+        return 2
+    pw = _backup_passphrase(confirm=True)
+    if pw is None:
+        return 1
+    try:
+        blob = backup.make_bundle(backup.collect(_state_paths()), pw)
+    except ValueError as e:
+        print(str(e))
+        return 1
+    fd = os.open(argv[2], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'wb') as f:
+        f.write(blob)
+    print('wrote %s (%s)' % (argv[2], ', '.join(backup.inspect_bundle(blob)['members'])))
+    return 0
+
+
+def cli_restore(argv):
+    """app.py restore <in.ncb> [--force]   — run with the controller STOPPED.
+    Refuses to overwrite existing state unless --force."""
+    args = [a for a in argv[2:] if not a.startswith('--')]
+    if not args:
+        print('usage: app.py restore <in.ncb> [--force]')
+        return 2
+    force = '--force' in argv
+    with open(args[0], 'rb') as f:
+        blob = f.read()
+    try:
+        info = backup.inspect_bundle(blob)
+        pw = _backup_passphrase(confirm=False)
+        files = backup.open_bundle(blob, pw)
+    except ValueError as e:
+        print(str(e))
+        return 1
+    try:
+        written = backup.restore(files, _state_paths(), force=force)
+    except FileExistsError as e:
+        print(str(e))
+        print('(add --force to overwrite; the controller must be stopped)')
+        return 1
+    print('restored backup from %s:' % info.get('created'))
+    for p in written:
+        print('  ' + p)
+    print('Start the controller. In Docker, chown the files to uid 10001 if you '
+          'restored from outside the container.')
+    return 0
+
+
 @app.route('/api/tls/info')
 def tls_info():
     info = cert_info()
@@ -2837,7 +3344,7 @@ def cli_set_password(argv):
 def main():
     cfg = ensure_bootstrap()
     app.secret_key = cfg['secret_key']
-    for f in (AUTH_FILE, NODES_FILE, CHECKS_FILE):
+    for f in (AUTH_FILE, NODES_FILE, CHECKS_FILE, ACKS_FILE):
         for n in sweep_stale_tmp(f):
             print('startup: removed stale temp file %s' % n, flush=True)
     if TLS_ENABLED:
@@ -2911,7 +3418,7 @@ def cli_cert_info(argv):
 if __name__ == '__main__':
     import sys
     _cmds = {'set-password': cli_set_password, 'install-cert': cli_install_cert,
-             'cert-info': cli_cert_info}
+             'cert-info': cli_cert_info, 'backup': cli_backup, 'restore': cli_restore}
     if len(sys.argv) > 1 and sys.argv[1] in _cmds:
         sys.exit(_cmds[sys.argv[1]](sys.argv))
     main()

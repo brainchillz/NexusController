@@ -133,7 +133,7 @@ def test_node_delete_evicts_cache_and_health_since(as_role):
 
 def test_monitor_cycle_drops_a_deleted_host_without_a_recovery_event(monkeypatch):
     sent = []
-    monkeypatch.setattr(A, '_dispatch', lambda evs: sent.extend(evs))
+    monkeypatch.setattr(A, '_dispatch', lambda evs, *a: sent.extend(evs))
     monkeypatch.setattr(A, '_record_events', lambda evs: None)
     monkeypatch.setattr(A, 'tuning', lambda: {'flap_cycles': 1, 'monitor_interval': 60,
                                               'check_timeout': 5})

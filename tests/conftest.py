@@ -8,6 +8,7 @@ _tmp = tempfile.mkdtemp(prefix='nexusctl-test-')
 os.environ.setdefault('CONTROLLER_AUTH_FILE', os.path.join(_tmp, 'controller-auth.json'))
 os.environ.setdefault('CONTROLLER_NODES_FILE', os.path.join(_tmp, 'nodes.json'))
 os.environ.setdefault('CONTROLLER_CHECKS_FILE', os.path.join(_tmp, 'checks.json'))
+os.environ.setdefault('CONTROLLER_ACKS_FILE', os.path.join(_tmp, 'acks.json'))
 os.environ.setdefault('CONTROLLER_AUDIT_FILE', os.path.join(_tmp, 'audit.log'))
 os.environ.setdefault('CONTROLLER_HISTORY_FILE', os.path.join(_tmp, 'history.db'))
 
@@ -47,6 +48,8 @@ def real_users():
     The SSO fixture's assertion subject is 'admin' — that record is deliberately
     an OPERATOR here so a test can prove the local record, not the assertion,
     decides the role."""
+    _app.app.secret_key = 'test-secret-key'   # session signing, whichever client a test builds
+    _app.app.config['TESTING'] = True
     path = _app.AUTH_FILE
     before = None
     try:

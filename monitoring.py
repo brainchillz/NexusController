@@ -4,6 +4,9 @@ those events + webhook bodies. No I/O, no threads → unit-tested; app.py owns
 the monitor loop, the webhook POST, and the config store.
 """
 
+import time
+from datetime import datetime, timezone
+
 # severity order (worst first) for sorting a digest
 SEVERITY = {'critical': 0, 'warning': 1, 'info': 2}
 
@@ -65,6 +68,9 @@ def host_conditions(env):
                                             f'{len(failed)} service checks failing: {names}')}
     if env.get('stale'):
         conds['stale'] = {'severity': 'warning', 'detail': 'background poll is stale'}
+    cert = cert_condition(env.get('cert_not_after'), env.get('_now'))
+    if cert:
+        conds['cert_expiring'] = cert
     if env.get('version_lag'):
         conds['version_lag'] = {'severity': 'info',
                                 'detail': f"behind fleet (newest v{env['version_lag']})"}
@@ -78,6 +84,42 @@ def host_conditions(env):
             'severity': 'info',
             'detail': f"{upd['security']} security update(s) pending"}
     return conds
+
+
+# TLS certificate expiry (the host's leaf cert, captured by the controller's
+# periodic sweep; the controller's own cert rides the same condition as a
+# synthetic monitor entity). The pin ignores validity, so an expired cert is
+# not an outage — it is a warning that browsers and other clients will balk.
+CERT_WARN_DAYS = 14
+CERT_INFO_DAYS = 30
+
+
+def cert_days_left(not_after, now=None):
+    """ISO-8601 notAfter → whole days left (negative = expired), or None."""
+    if not not_after:
+        return None
+    try:
+        t = datetime.fromisoformat(str(not_after).replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    return int((t - now).total_seconds() // 86400)
+
+
+def cert_condition(not_after, now=None):
+    """→ {'severity','detail'} when the cert is near/past expiry, else None."""
+    days = cert_days_left(not_after, now)
+    if days is None or days > CERT_INFO_DAYS:
+        return None
+    when = str(not_after)[:10]
+    if days < 0:
+        return {'severity': 'warning',
+                'detail': 'TLS certificate expired %d day(s) ago (%s)' % (-days, when)}
+    sev = 'warning' if days <= CERT_WARN_DAYS else 'info'
+    return {'severity': sev,
+            'detail': 'TLS certificate expires in %d day(s) (%s)' % (days, when)}
 
 
 # An alert line is one host's text, quoted into a digest that may carry several
@@ -157,6 +199,9 @@ def board_state(env):
         if err.lower().startswith('await'):
             # first-poll warmup after a (re)start — transient, not a failure
             return 'amber', ['awaiting first poll']
+        if env.get('health_acked') and not env.get('health'):
+            # a known outage someone acknowledged: quiet, but not green
+            return 'amber', ['acknowledged: ' + (err or 'unreachable')]
         return 'red', [err or 'unreachable']
     issues = [e['detail'] for e in env.get('health') or []]
     if issues:
@@ -264,3 +309,78 @@ def webhook_payload(fmt, title, text):
         return {'json': {'content': full[:1900]}}
     # 'json' / anything else: a general structured body
     return {'json': {'title': title, 'text': text}}
+
+
+# ─── Acknowledgements: quiet a KNOWN condition without pausing the host ──
+# acks = {"<host_id>|<key>": {'by', 'note', 'ts', 'until' (unix ts or None)}}.
+# An acked condition leaves `health` (dot / rollup / wallboard / notifier all
+# go quiet for it) and moves to `health_acked` so the Alerts tab can still
+# show it, muted. An ack without `until` lasts until the condition clears;
+# either way it is pruned once the condition is gone, so a RECURRENCE alerts
+# again — that is the difference from pausing the host.
+ACK_MAX_HOURS = 24 * 30
+
+
+def ack_key(host_id, key):
+    return '%s|%s' % (host_id, key)
+
+
+def clean_ack(data, by, now=None):
+    """Validate an ack request → (record, error). hours: None/0 = until the
+    condition clears; else a snooze that expires."""
+    now = now if now is not None else time.time()
+    hours = data.get('hours')
+    until = None
+    if hours not in (None, '', 0, '0'):
+        try:
+            hours = float(hours)
+        except (TypeError, ValueError):
+            return None, 'hours must be a number'
+        if not (0 < hours <= ACK_MAX_HOURS):
+            return None, 'hours must be between 0 and %d' % ACK_MAX_HOURS
+        until = now + hours * 3600
+    note = one_line(data.get('note') or '', 200)
+    return {'by': by, 'note': note, 'ts': int(now), 'until': int(until) if until else None}, None
+
+
+def split_acked(entries, acks, host_id, now=None):
+    """health entries → (live, acked). An expired snooze counts as live."""
+    now = now if now is not None else time.time()
+    live, acked = [], []
+    for e in entries:
+        a = acks.get(ack_key(host_id, e.get('key')))
+        if a and (a.get('until') is None or a['until'] > now):
+            acked.append({**e, 'ack': a})
+        else:
+            live.append(e)
+    return live, acked
+
+
+def prune_acks(acks, present, now=None):
+    """Drop acks whose condition is no longer present (resolved → a
+    recurrence must alert) or whose snooze has expired. `present` = the set
+    of ack_key()s currently firing. Returns the keys removed."""
+    now = now if now is not None else time.time()
+    gone = [k for k, a in acks.items()
+            if k not in present or (a.get('until') is not None and a['until'] <= now)]
+    for k in gone:
+        del acks[k]
+    return gone
+
+
+# ─── Webhook routing by host tag ─────────────────────────────────────────
+def hook_wants(hook, event, tags_by_host=None):
+    """Does this webhook want this event? Severity floor as before
+    (recoveries always pass), then tags: a hook with no tags takes
+    everything; a tagged hook takes events whose host carries ANY of its
+    tags (the same any-of rule as scopes and fleet actions). Events from
+    entities with no host tags — unpinned checks, the controller's own cert
+    — reach only untagged hooks. Pure."""
+    floor = SEVERITY.get(hook.get('min_severity', 'warning'), 1)
+    if event.get('kind') != 'recovered' and SEVERITY.get(event.get('severity'), 3) > floor:
+        return False
+    want = {t for t in (hook.get('tags') or []) if t}
+    if not want:
+        return True
+    have = set((tags_by_host or {}).get(event.get('host_id')) or [])
+    return bool(want & have)
