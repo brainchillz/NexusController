@@ -66,7 +66,7 @@ app = Flask(__name__, static_url_path='')
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 log = logging.getLogger('controller')
-APP_VERSION = '0.22.0'
+APP_VERSION = '0.22.1'
 
 
 def env_bool(name, default):

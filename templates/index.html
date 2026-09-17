@@ -486,7 +486,10 @@ document.addEventListener('keydown', e=>{
     }
   }
 });
-function showLogin(){show('app',false);show('login',true);stopPoll();}
+// Every route to the login card re-probes for SSO: the hint was only ever
+// fetched on the unauthenticated boot path, so a page loaded while signed in
+// showed a card WITHOUT the SSO button after Sign out (a reload fixed it).
+function showLogin(){show('app',false);show('login',true);stopPoll();ssoProbe();}
 function showApp(){ if(typeof pubEnd==='function') pubEnd(); show('login',false);show('app',true);}
 function hbytes(n){ n=Number(n)||0; const u=['B','K','M','G','T','P']; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;} return (i?n.toFixed(1):n)+u[i]; }
 
